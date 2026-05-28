@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+LANDMARK_NAMES = [
+    "THUMB_TIP", "INDEX_TIP", "MIDDLE_TIP", "RING_TIP", "PINKY_TIP",
+    "WRIST",
+    "THUMB_INT", "THUMB_DIST",
+    "INDEX_PROX", "INDEX_INT", "INDEX_DIST",
+    "MIDDLE_PROX", "MIDDLE_INT", "MIDDLE_DIST",
+    "RING_PROX", "RING_INT", "RING_DIST",
+    "PINKY_PROX", "PINKY_INT", "PINKY_DIST",
+    "PALM",
+]
+
+BONE_CONNECTIONS = [
+    [5, 6, 7, 0],
+    [5, 8, 9, 10, 1],
+    [5, 11, 12, 13, 2],
+    [5, 14, 15, 16, 3],
+    [5, 17, 18, 19, 4],
+]
+
+PALM_CONNECTIONS = [
+    [20, 5], [20, 8], [20, 11], [20, 14], [20, 17], [20, 7],
+]
+
+# Location of the user's emg2pose checkout (where calculate_hand_error.py lives).
+# Override with $EMG2POSE_VIS_DIR if installed elsewhere.
+_DEFAULT_EMG2POSE_VIS_DIR = (
+    "/home/chenglin/anuo_emg2pose/emg2pose/scripts/visualize_3d"
+)
+
+_CALC_CACHE: dict[str, object] = {}
+
+
+def _get_calculator(side: str):
+    # Note: emg2pose's right-hand init currently has a shape-mismatch bug in
+    # mirrored_hand_model (22-element joint mask applied to 21-element landmark
+    # tensor). We avoid it by always using a left-hand calculator and mirroring
+    # the X coordinate after FK for right-hand inputs (a hand is bilaterally
+    # symmetric up to X reflection in this kinematic model).
+    side = (side or "left").lower()
+    if side not in ("left", "right"):
+        side = "left"
+    if "left" in _CALC_CACHE:
+        return _CALC_CACHE["left"]
+    vis_dir = os.environ.get("EMG2POSE_VIS_DIR", _DEFAULT_EMG2POSE_VIS_DIR)
+    vis_dir = str(Path(vis_dir).resolve())
+    if vis_dir not in sys.path:
+        sys.path.insert(0, vis_dir)
+    from calculate_hand_error import HandPositionErrorCalculator  # type: ignore
+    calc = HandPositionErrorCalculator(device="cpu", side="left")
+    _CALC_CACHE["left"] = calc
+    return calc
+
+
+def angles_to_landmarks(angles20, side="left"):
+    """20 joint angles (rad) -> (21, 3) landmark positions in mm.
+
+    Uses emg2pose forward kinematics. The landmark order matches
+    LANDMARK_NAMES / BONE_CONNECTIONS (copied from the user's
+    visualize_hand_3d.py and consistent with emg2pose's angles_to_positions
+    output). For ``side='right'`` we mirror X after FK (see _get_calculator).
+    """
+    calc = _get_calculator(side)
+    a = np.asarray(angles20, dtype=np.float32).reshape(1, 20)
+    pos = np.asarray(calc.angles_to_positions(a))[0]
+    if (side or "left").lower() == "right":
+        pos = pos.copy()
+        pos[:, 0] *= -1.0
+    return pos
+
+
+def angles_batch_to_landmarks(angles_batch, side="left"):
+    """Batch version: (N, 20) -> (N, 21, 3) in mm. Single FK call."""
+    calc = _get_calculator(side)
+    a = np.asarray(angles_batch, dtype=np.float32).reshape(-1, 20)
+    pos = np.asarray(calc.angles_to_positions(a))
+    if (side or "left").lower() == "right":
+        pos = pos.copy()
+        pos[..., 0] *= -1.0
+    return pos
+
+
+def draw_hand(ax, landmarks, finger_color="steelblue", thumb_color="crimson"):
+    """Draw a hand skeleton on a 3D axis.
+
+    The thumb (first bone chain) is drawn in ``thumb_color`` and the four
+    fingers in ``finger_color`` so the thumb is easy to pick out; palm lines
+    are dotted gray.
+    """
+    L = np.asarray(landmarks)
+    for bi, bone in enumerate(BONE_CONNECTIONS):
+        col = thumb_color if bi == 0 else finger_color
+        ax.plot(L[bone, 0], L[bone, 1], L[bone, 2], c=col, lw=2.5)
+        ax.scatter(L[bone, 0], L[bone, 1], L[bone, 2], c=col, s=10)
+    for conn in PALM_CONNECTIONS:
+        ax.plot(L[conn, 0], L[conn, 1], L[conn, 2], c="gray", lw=0.8, ls=":")

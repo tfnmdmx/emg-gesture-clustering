@@ -1,0 +1,4 @@
+out_*
+work_*
+__pycache__
+.pytest_cache
