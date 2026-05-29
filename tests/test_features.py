@@ -1,6 +1,8 @@
 import numpy as np
 
-from emg_label.features import apex_pose_feature, zscore
+from emg_label.features import (
+    apex_index, apex_pose_feature, per_subject_center, per_subject_zscore,
+    zscore)
 
 
 def test_apex_pose_feature_picks_held_apex_not_movement():
@@ -12,6 +14,47 @@ def test_apex_pose_feature_picks_held_apex_not_movement():
     X[400:800] = np.array([1.0, -1.0, 0.5])   # held apex (large dev)
     feat = apex_pose_feature(X, 0, 1000, rest, fs=1000, win_ms=20, smooth_ms=10)
     assert np.allclose(feat, [1.0, -1.0, 0.5], atol=0.05)
+
+
+def test_apex_index_points_inside_held_apex():
+    rest = np.zeros(2)
+    X = np.zeros((1000, 2))
+    X[400:800] = np.array([1.0, 1.0])          # held apex region
+    ai = apex_index(X, 0, 1000, rest, fs=1000, smooth_ms=10)
+    assert 400 <= ai < 800
+
+
+def test_per_subject_center_removes_subject_offset():
+    # two subjects, same gesture shape but different additive offset.
+    base = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+    A = base + np.array([10.0, 10.0])          # subject A offset
+    B = base + np.array([-5.0, 3.0])           # subject B offset
+    X = np.vstack([A, B])
+    subs = np.array(["A", "A", "A", "B", "B", "B"])
+    Xc = per_subject_center(X, subs)
+    # after centering, both subjects collapse onto the same centered cloud
+    assert np.allclose(Xc[:3], Xc[3:], atol=1e-9)
+
+
+def test_per_subject_center_single_subject_is_global_demean():
+    X = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    subs = np.array(["A", "A", "A"])
+    Xc = per_subject_center(X, subs)
+    assert np.allclose(Xc, X - X.mean(axis=0))
+
+
+def test_per_subject_zscore_unit_variance_per_subject():
+    rng = np.random.default_rng(0)
+    A = rng.normal(5.0, 3.0, size=(50, 2))     # subject A: offset + wide scale
+    B = rng.normal(-2.0, 0.5, size=(50, 2))    # subject B: offset + tight scale
+    X = np.vstack([A, B])
+    subs = np.array(["A"] * 50 + ["B"] * 50)
+    Xz = per_subject_zscore(X, subs)
+    # each subject becomes zero-mean, unit-variance on every axis
+    assert np.allclose(Xz[:50].mean(axis=0), 0.0, atol=1e-9)
+    assert np.allclose(Xz[50:].mean(axis=0), 0.0, atol=1e-9)
+    assert np.allclose(Xz[:50].std(axis=0), 1.0, atol=1e-9)
+    assert np.allclose(Xz[50:].std(axis=0), 1.0, atol=1e-9)
 
 
 def test_apex_pose_feature_respects_window_end():

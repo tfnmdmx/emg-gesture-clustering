@@ -8,14 +8,16 @@ import numpy as np  # noqa: E402
 
 
 def plot_overview(emg, activity, segments, fs, out_path,
-                  enter_thr=None, exit_thr=None, labels=None):
+                  enter_thr=None, exit_thr=None, labels=None,
+                  apex_samples=None):
     n = len(activity)
     t = np.arange(n) / fs
     fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
     env = np.abs(np.asarray(emg)).mean(axis=1)
     axes[0].plot(t, env, lw=0.5)
     axes[0].set_ylabel("EMG |mean| (raw)")
-    axes[1].plot(t, np.asarray(activity), lw=0.8, color="k")
+    act = np.asarray(activity)
+    axes[1].plot(t, act, lw=0.8, color="k")
     axes[1].set_ylabel("EMG envelope")
     axes[1].set_xlabel("time (s)")
     if enter_thr is not None:
@@ -28,6 +30,17 @@ def plot_overview(emg, activity, segments, fs, out_path,
             ax.axvspan(s / fs, e / fs, color="green", alpha=0.15)
         lab = str(labels[idx]) if labels is not None else str(idx)
         axes[1].text((s + e) / 2 / fs, ymax * 0.9, lab, ha="center", fontsize=8)
+    # Apex = the held-pose frame used as the clustering feature (max joint
+    # deviation from rest, usually just after the EMG burst). Purple line on
+    # both axes + a marker on the envelope at that instant.
+    if apex_samples is not None:
+        for a in apex_samples:
+            ta = a / fs
+            for ax in axes:
+                ax.axvline(ta, color="purple", ls="--", lw=0.7, alpha=0.6)
+            ai = min(max(int(a), 0), n - 1)
+            axes[1].plot([ta], [act[ai]], marker="v", color="purple",
+                         markersize=5, zorder=6)
     fig.tight_layout()
     fig.savefig(out_path, dpi=100)
     plt.close(fig)

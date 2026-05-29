@@ -6,10 +6,12 @@
 #   ./pulse.sh pool   <batch|path> [...]   build work pool from processed_data batches
 #   ./pulse.sh segment                     stage 1: segment
 #   ./pulse.sh cluster [K]                  stage 2: cluster (K default 18; "auto" = silhouette)
+#   ./pulse.sh eval                         subject-invariance metrics (pooled runs)
 #   ./pulse.sh qc                           quality check: feature maps (+ gallery if exported)
 #   ./pulse.sh export                       stage 3: export labeled npz (+ build gallery)
 #   ./pulse.sh gallery                      build the per-label animation gallery (after export)
-#   ./pulse.sh prep   <batch|path> [...]    pool + segment + cluster + qc (everything pre-labeling)
+#   ./pulse.sh run                          segment + cluster + eval + qc (existing pool, no batches)
+#   ./pulse.sh prep   <batch|path> [...]    pool + segment + cluster + eval + qc (everything pre-labeling)
 #   ./pulse.sh status                       show what exists so far
 #   ./pulse.sh help
 #
@@ -33,6 +35,7 @@ else
 fi
 : "${K:=18}"
 : "${GROUP_BY:=subject-hand}"   # subject-hand (per subject+hand) | hand | all
+: "${SUBJECT_NORM:=none}"  # per-subject feature norm: none | center | zscore (pooled runs)
 : "${N_GALLERY:=3}"        # samples per label in the animation gallery
 # KMeans on this box over-subscribes threads without these caps.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
@@ -98,12 +101,20 @@ cmd_cluster() {
   [ -f "$OUT/segments.csv" ] || die "no $OUT/segments.csv. run: ./pulse.sh segment"
   local k="${1:-$K}"
   if [ "$k" = "auto" ]; then
-    say "stage 2: cluster (auto k via silhouette, group-by=$GROUP_BY)"
-    "$PY" cluster.py "$POOL" --out "$OUT" --group-by "$GROUP_BY"
+    say "stage 2: cluster (auto k via silhouette, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM)"
+    "$PY" cluster.py "$POOL" --out "$OUT" --group-by "$GROUP_BY" \
+      --subject-norm "$SUBJECT_NORM"
   else
-    say "stage 2: cluster (k=$k, group-by=$GROUP_BY)"
-    "$PY" cluster.py "$POOL" --out "$OUT" --k "$k" --group-by "$GROUP_BY"
+    say "stage 2: cluster (k=$k, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM)"
+    "$PY" cluster.py "$POOL" --out "$OUT" --k "$k" --group-by "$GROUP_BY" \
+      --subject-norm "$SUBJECT_NORM"
   fi
+}
+
+cmd_eval() {
+  [ -f "$OUT/segments_clustered.csv" ] || die "no clusters yet. run: ./pulse.sh cluster"
+  say "evaluation: subject-invariance metrics ($OUT/eval_metrics.csv, subject-norm=$SUBJECT_NORM)"
+  "$PY" evaluate.py "$POOL" --out "$OUT" --subject-norm "$SUBJECT_NORM"
 }
 
 cmd_qc() {
@@ -147,11 +158,17 @@ PYEOF
   cmd_gallery   # per-label animations now that segments/ exists
 }
 
-cmd_prep() {
-  cmd_pool "$@"
+cmd_run() {
+  [ -d "$POOL" ] || die "no pool. run: ./pulse.sh pool <batches...>"
   cmd_segment
   cmd_cluster "$K"
+  cmd_eval
   cmd_qc
+}
+
+cmd_prep() {
+  cmd_pool "$@"
+  cmd_run
   echo
   say "PRE-LABELING DONE. Next:"
   echo "  1. Look at  $OUT/clusters/*_hands.png  and  $OUT/feature_maps/*_features.png"
@@ -165,8 +182,8 @@ cmd_status() {
   echo "PY      = $PY"
   echo "POOL    = $POOL    ($(ls "$POOL"/*.npz 2>/dev/null | wc -l) files)"
   echo "OUT     = $OUT"
-  echo "K       = $K"
-  for f in segments.csv segments_clustered.csv labels_template.csv labels.csv; do
+  echo "K       = $K    GROUP_BY = $GROUP_BY    SUBJECT_NORM = $SUBJECT_NORM"
+  for f in segments.csv segments_clustered.csv eval_metrics.csv labels_template.csv labels.csv; do
     if [ -f "$OUT/$f" ]; then echo "  [x] $OUT/$f"; else echo "  [ ] $OUT/$f"; fi
   done
   [ -d "$OUT/segments" ] && echo "  [x] $OUT/segments/ ($(ls "$OUT/segments" 2>/dev/null | wc -l) labels, $(find "$OUT/segments" -name '*.npz' 2>/dev/null | wc -l) npz)"
@@ -182,6 +199,8 @@ case "$sub" in
   pool)    cmd_pool "$@";;
   segment) cmd_segment "$@";;
   cluster) cmd_cluster "$@";;
+  eval)    cmd_eval "$@";;
+  run)     cmd_run "$@";;
   qc)      cmd_qc "$@";;
   gallery) cmd_gallery "$@";;
   export)  cmd_export "$@";;

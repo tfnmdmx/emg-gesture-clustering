@@ -27,6 +27,14 @@ def main():
                          "everything). Note: pooling mixes calibration/mirror "
                          "differences, so KMeans may split by subject/hand "
                          "rather than gesture -- see docs/METHOD.md.")
+    ap.add_argument("--subject-norm", choices=["none", "center", "zscore"],
+                    default="none",
+                    help="per-subject feature normalization for pooled "
+                         "(--group-by all/hand) runs, to cut subject "
+                         "contamination: 'center' subtracts each subject's mean "
+                         "feature; 'zscore' also divides by each subject's std. "
+                         "No-op for single-subject groups. Cluster centroids "
+                         "still use the raw absolute pose for FK rendering.")
     args = ap.parse_args()
 
     k_min, k_max = (args.k, args.k) if args.k is not None else (args.k_min, args.k_max)
@@ -45,12 +53,13 @@ def main():
     template_rows = []
 
     for group, gdf in seg_df.groupby("group"):
-        feats, idxs = [], []
+        feats, idxs, subs = [], [], []
         # Load each source file once, extract all its segments' features,
         # then release it -- keeps memory flat across large file sets.
         for fname, fdf in gdf.groupby("source_file"):
             _, ja = io_utils.load_npz(os.path.join(args.input_dir, fname))
             rest = np.median(ja, axis=0)
+            subj = str(fname).split("__")[0]
             # The distinctive held pose is the apex of joint deviation in the
             # hold window after the burst, up to the next segment's start.
             fdf = fdf.sort_values("start_sample")
@@ -64,9 +73,13 @@ def main():
                 feats.append(features.apex_pose_feature(
                     ja, s, win_end, rest, cfg.fs))
                 idxs.append(order[j])
+                subs.append(subj)
             del ja
         X = np.array(feats)
-        Xz, _mean, _std = features.zscore(X)
+        # Cluster on per-subject normalized features when requested; keep raw X
+        # for the centroids below (FK rendering needs absolute joint angles).
+        Xc = features.apply_subject_norm(X, np.array(subs), args.subject_norm)
+        Xz, _mean, _std = features.zscore(Xc)
         labels, best_k = clustering.select_k_and_cluster(Xz, cfg.k_min, cfg.k_max)
         for ridx, lab in zip(idxs, labels):
             seg_df.at[ridx, "cluster_id"] = int(lab)

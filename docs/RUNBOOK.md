@@ -16,9 +16,9 @@ NAME=4users K=18 GROUP_BY=all ./pulse.sh prep fgw0917_0502_left ghd1108_0503_lef
 ## TL;DR(最常用)
 
 ```bash
-cd /home/chenglin/FM_PULSE/spilt
+cd /data/cl_data/action-clustering
 
-# 1) 一条命令:建池 + 切分 + 聚类(k=18) + 质检图
+# 1) 一条命令:建池 + 切分 + 聚类(k=18) + 评估 + 质检图
 ./pulse.sh prep fgw0917_0502_left fgw0917_0504_right
 
 # 2) 人工:看图命名
@@ -37,10 +37,12 @@ cd /home/chenglin/FM_PULSE/spilt
 ## 子命令一览
 
 ```
-./pulse.sh prep   <批次...>    建池+切分+聚类+质检,一步到位(标注前的全部)
+./pulse.sh prep   <批次...>    建池+切分+聚类+评估+质检,一步到位(标注前的全部)
+./pulse.sh run                 切分+聚类+评估+质检(池已建好,无需再给批次)
 ./pulse.sh pool   <批次...>    只建池(软链 + 打印分组)
 ./pulse.sh segment             阶段1 切分
 ./pulse.sh cluster [K]         阶段2 聚类(K 默认 18;写 auto = silhouette 自动选)
+./pulse.sh eval                被试无关性评估(pooled 运行;写 eval_metrics.csv)
 ./pulse.sh qc                  质检:特征图 + 3D 动画画廊
 ./pulse.sh export              阶段3 导出带标签 npz
 ./pulse.sh status              看当前进度(池/各产物存在与否)
@@ -58,6 +60,7 @@ cd /home/chenglin/FM_PULSE/spilt
 | `NAME`      | (空)                                      | 一键派生池/输出名(见下)                    |
 | `K`         | 18                                        | 聚类簇数                                   |
 | `GROUP_BY`  | `subject-hand`                          | 聚类粒度:`subject-hand`/`hand`/`all` |
+| `SUBJECT_NORM` | `none`                               | 按被试特征归一化:`none`/`center`/`zscore`(仅 pooled 有意义,见场景 F) |
 | `OUT`       | `out`                                   | 输出目录                                   |
 | `POOL`      | `work_pool`                             | 池目录                                     |
 | `N_GALLERY` | 3                                         | 动画画廊每类样本数                         |
@@ -134,6 +137,23 @@ GROUP_BY=hand ./pulse.sh cluster 18    # 只按左/右手分两组(跨被试合�
 > ⚠️ **为什么默认不这么做**:不同被试手型/关节标定不同、左右手是镜像。合在一起聚类,KMeans 往往**先按"谁的手/哪只手"分**,而不是按手势分——簇可能变成"某人的手"而非"某个手势"。
 > 全局聚类时:`labels_template.csv` 的 group 列会是 `all`(或 `left`/`right`);3D 手图在 `all` 模式下统一按左手渲染(右手簇会镜像不准,只作粗看)。先小规模看 `feature_maps` 的 silhouette 再决定是否当真用。
 
+### F. 被试无关实验:一条龙 + 按被试归一化 + 评估
+
+`GROUP_BY=all` 把所有人合聚时,KMeans 会被"个体身份"污染。`SUBJECT_NORM` 在聚类前对**每个被试的特征**做归一化以压低这种污染;`run` 一条龙跑完切分+聚类+评估+质检;`eval` 输出被试无关性指标。
+
+```bash
+cd /data/cl_data/action-clustering
+# 池已建好(work_pool_4users);一条龙:全局聚类 + 按被试 z-score + 评估
+POOL=work_pool_4users OUT=out_4users_zscore GROUP_BY=all SUBJECT_NORM=zscore ./pulse.sh run
+
+# 只想看指标 / 换归一化方式对比(无需重切):
+POOL=work_pool_4users OUT=out_4users         SUBJECT_NORM=none   ./pulse.sh eval   # 基线
+POOL=work_pool_4users OUT=out_4users_center  GROUP_BY=all SUBJECT_NORM=center ./pulse.sh run
+```
+
+`SUBJECT_NORM`:`center` 减各被试特征均值(去一阶矩,几乎消除*线性*被试可分性);`zscore` 再除各被试标准差(去对角二阶矩,进一步降按人聚)。归一化只作用于聚类特征,簇心仍用**原始绝对姿态**渲染 3D 手图;对单被试组为空操作。
+`eval` 读 `<OUT>/segments_clustered.csv` + 重算特征,写 `<OUT>/eval_metrics.csv`,报告:整体 silhouette、平均主导被试占比、被试泄漏(分类器预测"是谁"的准确率,越接近随机基线越好)、LOSO 迁移比。原理与实验结论见 [docs/汇报文档/多人单手聚类结果与分析.md](汇报文档/多人单手聚类结果与分析.md)。
+
 ---
 
 ## 人工标注(唯一的人工环节)
@@ -167,6 +187,7 @@ GROUP_BY=hand ./pulse.sh cluster 18    # 只按左/右手分两组(跨被试合�
 | ------- | ------------------------------------------------------------------------------------------------------------ |
 | segment | `out/segments.csv`、`out/overview/*.png`(EMG+包络+绿色段)                                                |
 | cluster | `out/segments_clustered.csv`、`out/labels_template.csv`、`out/clusters/<group>{,_hands}.png`           |
+| eval    | `out/eval_metrics.csv`(pooled 运行的被试无关性指标:silhouette/主导被试占比/被试泄漏/LOSO 迁移比),特征缓存 `out/eval_cache/` |
 | qc      | `out/feature_maps/<group>_features.png`(PCA/t-SNE/热图/silhouette)、`out/hand_anim/index.html`(动画画廊) |
 | export  | `out/segments/<label>/*.npz`、`out/labeled_overview/*.png`                                               |
 
@@ -203,7 +224,7 @@ $PY animate_segment.py   out/segments/<label>/<某.npz>
 
 ```bash
 PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
-cd /home/chenglin/FM_PULSE/spilt
+cd /data/cl_data/action-clustering
 mkdir -p work_pool && (cd work_pool && rm -f *.npz && \
   for d in fgw0917_0502_left fgw0917_0504_right; do \
     for f in /data/cl_data/ai-infra/processed_data/$d/*__*__*.npz; do ln -sf "$f" .; done; done)

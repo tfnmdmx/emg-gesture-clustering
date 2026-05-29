@@ -5,7 +5,9 @@ import csv
 import glob
 import os
 
-from emg_label import io_utils, plotting, segmentation
+import numpy as np
+
+from emg_label import features, io_utils, plotting, segmentation
 from emg_label.config import Config
 
 
@@ -37,7 +39,7 @@ def main():
     rows = []
     for path in paths:
         info = io_utils.parse_file_info(path)
-        emg, _ja = io_utils.load_npz(path)
+        emg, ja = io_utils.load_npz(path)
         segs, act, enter, exit_thr = segmentation.segment_emg(emg, cfg)
         for seg_idx, (s, e) in enumerate(segs):
             rows.append({
@@ -48,8 +50,19 @@ def main():
                 "end_sample": e,
                 "duration_s": round((e - s) / cfg.fs, 4),
             })
+        # Apex per segment (same definition the clustering feature uses): max
+        # joint deviation from rest within [start, next start) -- shown on the
+        # overview so the held-pose frame is visible against the EMG burst.
+        rest = np.median(ja, axis=0)
+        starts = [s for s, _ in segs]
+        apexes = []
+        for j, (s, e) in enumerate(segs):
+            win_end = (starts[j + 1] if j + 1 < len(segs)
+                       else min(len(ja), e + cfg.fs))
+            apexes.append(features.apex_index(ja, s, win_end, rest, cfg.fs))
         png = os.path.join(cfg.out_dir, "overview", info.stem + ".png")
-        plotting.plot_overview(emg, act, segs, cfg.fs, png, enter, exit_thr)
+        plotting.plot_overview(emg, act, segs, cfg.fs, png, enter, exit_thr,
+                               apex_samples=apexes)
         print(f"{os.path.basename(path)}: {len(segs)} segments")
 
     csv_path = os.path.join(cfg.out_dir, "segments.csv")
