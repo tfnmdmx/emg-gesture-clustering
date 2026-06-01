@@ -14,3 +14,15 @@ class Config:
     out_dir: str = "out"
     enter_thresh: float | None = None
     exit_thresh: float | None = None
+    # Pose-speed (joint-angle velocity) segmentation -- independent of EMG.
+    # Used to carve static_hold / transition_motion intervals and compose them
+    # into static-motion-static gesture clips for manual labelling.
+    pose_smooth_ms: float = 250.0
+    pose_pct: float = 35.0
+    pose_mad: float = 1.5
+    min_static_s: float = 0.35
+    min_motion_s: float = 0.20
+    merge_gap_s: float = 0.20
+    pre_static_s: float = 0.5
+    post_static_s: float = 0.5
+    pad_s: float = 0.05

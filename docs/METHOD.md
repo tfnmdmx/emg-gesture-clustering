@@ -1,396 +1,533 @@
-# 方法说明 — EMG 手势切分与聚类
+# 方法说明 — EMG 手势切分、聚类与真值集构建
 
-本文档详细解释切分/聚类的实现原理与数据规模,以当前 **fgw0917** 这次运行(k=18)为例给出真实数字。
-代码:[segmentation.py](../emg_label/segmentation.py) / [features.py](../emg_label/features.py) /
-[clustering.py](../emg_label/clustering.py) / [cluster.py](../cluster.py)。
+本文档解释切分/聚类/真值集构建的实现原理。当前流水线是**双信号、双产物**：
+
+- **EMG 通路**：肌电包络 + Otsu + 迟滞 → 一段对应一次肌肉爆发（burst）。聚类用。
+- **Pose 通路**：关节速度 + 鲁棒阈值 → static_hold / transition_motion → 组装为 `static→motion→static` clip。**真值集打标**用。
+- 两套段落输出到不同 CSV（`segments.csv` / `clips.csv`），并交叉引用；同时输出 `recordings.csv` 含每条录制的 QC 指标。
+
+代码：
+[emg_label/segmentation.py](../emg_label/segmentation.py) ·
+[emg_label/pose_segmentation.py](../emg_label/pose_segmentation.py) ·
+[emg_label/features.py](../emg_label/features.py) ·
+[emg_label/qc.py](../emg_label/qc.py) ·
+[emg_label/io_utils.py](../emg_label/io_utils.py) ·
+[emg_label/skeleton.py](../emg_label/skeleton.py) ·
+[segment.py](../segment.py) ·
+[cluster.py](../cluster.py) ·
+[export_clips.py](../export_clips.py)
 
 ---
 
 ## 0. 输入数据形态
 
-每个 `.npz`:
+支持**两种 npz 布局**，`io_utils.load_npz` 自动识别：
 
-| 字段             | shape   | 含义                                                       |
-| ---------------- | ------- | ---------------------------------------------------------- |
-| `emg`          | (T, 16) | 16 通道表面肌电,已滤波(40–850Hz 带通 + 50Hz 陷波),2000 Hz |
-| `joint_angles` | (T, 20) | 20 维关节角,**弧度**,已对齐到 EMG 时间轴             |
+### 0.1 处理后格式（旧）
+| 字段           | shape   | 含义                                            |
+|----------------|---------|-------------------------------------------------|
+| `emg`          | (T, 16) | 16 通道 EMG，已滤波，2000 Hz                    |
+| `joint_angles` | (T, 20) | 20 维关节角，弧度，**已对齐到 EMG 时间轴**      |
 
-逐样点同步(同一行的 emg 与 joint_angles 是同一时刻)。
+`emg` 与 `joint_angles` 必须等长，否则 raise（契约保护）。
 
-**当前 fgw0917（/data/cl_data/ai-infra/processed_data/fgw0917_0502_left /data/cl_data/ai-infra/processed_data/fgw0917_0504_right） 规模**:
+### 0.2 原始格式（reference 用的）
+| 字段                                | shape       | 说明                                |
+|-------------------------------------|-------------|-------------------------------------|
+| `emg`                               | (T_e, 16)   | 同上                                |
+| `manus_<hand>_ergonomics`           | (T_p, 20)   | 关节角，pose 时间轴（与 EMG 不同长）|
+| `manus_<hand>_skeleton`             | (T_p, 25, 7)| 25 关节 XYZ + 四元数（渲染用，可选）|
+| `manus_<hand>_timestamps_raw`       | (T_b,)      | 块级时间戳（稀疏，T_b ≪ T_p）       |
+| `record_t0` / `record_t1`           | scalar      | 录制起止时间                        |
 
-- 240 个文件,每个约 **119 秒** = 238,024 样点。
-- 原始样点总数 ≈ **5712 万** 行(57.1 M)。
-- 分成 2 个组:`fgw-0917-left`(120 文件)、`fgw-0917-right`(120 文件)。
+加载流程：
+1. 找 `manus_<hand>_ergonomics`（hand 由 `--meta` 或父目录名 `{date}-{hand}` 推出）；
+2. 用 `manus_*_timestamps_raw` + `record_t0/t1` 重建 `pose_t` 与 `emg_t`；
+3. 把 `pose_t` 按 `pose_t[-1] / emg_t[-1]` 缩放（吸收模态间时钟漂移）；
+4. 对 20 列分别 `np.interp(emg_t, pose_t, ja[:, d])` → 返回 (T_e, 16)+(T_e, 20)，下游零改动。
 
----
+骨骼数据通过 `io_utils.load_skeleton(path, hand)` 单独加载，同样对齐到 EMG 轴；用于 `export_clips.py` 的关键帧渲染（无 torch 依赖）。
 
-## 1. 16 通道包络是怎么算的
-
-切分不直接看 16 路原始信号,而是先把它们**压成一条一维"用力强度"曲线**,叫包络(envelope)。
-
-### 1.1 公式
-
-代码 [segmentation.py:7 `emg_envelope`](../emg_label/segmentation.py#L7):
-
-```python
-rect     = np.abs(emg).mean(axis=1)              # 步骤①②: 整流 + 跨通道平均 → (T,)
-win      = round(smooth_ms/1000 * fs)            # 150ms × 2000Hz = 300 样点
-activity = uniform_filter1d(rect, size=win)      # 步骤③: 滑动平均平滑 → (T,)
-```
-
-**三步**:
-
-1. **整流(rectify)**:`abs(emg)`。
-   原始 EMG 是围绕 0 上下振荡的交流信号(正负相间),直接平均会相互抵消≈0。取绝对值后,信号幅度变成恒正,反映"这一刻肌肉放电多强"。
-2. **跨 16 通道平均**:`.mean(axis=1)`,`(T,16) → (T,)`。
-   16 个电极贴在前臂不同位置,每路对不同肌群敏感。做某手势时通常多路同时活跃。取 16 路均值 = 把"整条前臂的总用力强度"汇成一条曲线。
-
-   - 用**均值**而非求和,数值不随通道数变化;用全 16 路而非挑几路,是因为手势顺序未知、不知道哪几路重要,全用最稳妥。
-3. **平滑(滑动平均)**:`uniform_filter1d(win=300)`。
-   整流后的曲线仍然毛刺很多(肌电是随机放电脉冲串)。用 150ms 窗口(=300 样点)做滑动平均,把高频毛刺抹平,留下"动作整体起伏"的慢包络。
-
-   - 150ms 是经验值:足够压住毛刺,又不会把 0.4s 量级的动作糊掉。`--smooth-ms` 可调。
-
-得到的 `activity` 曲线:做手势时隆起成峰,放松时回落到基线 —— 这就是 `overview/*.png` 下半张那条黑线。
-
-### 1.2 为什么这条曲线能用来切分
-
-关键性质:**肌肉一放松,包络就回到基线**,跟手当时摆成什么姿势无关。
-所以即使两个手势之间手没回到中性(比如从"比1"直接变"比2"),只要中间有一瞬放松,包络就会下凹,把两个动作分开。
+`fs=2000` 是 EMG 采样率，约定为整条流水线的统一时间网格。
 
 ---
 
-## 2. 切分原理 —— 双阈值迟滞检测
+## A. 本项目与 reference 的关系
 
-目标:在 `activity` 曲线上找出每一段"动作"的 `[起点, 终点]`。
+`reference/gesture_velocity_segmentation.py`（+ ipynb）**只做切分与可视化，不做聚类**——通读 723 行源码 + 985 行 notebook，无任何 `KMeans / sklearn / cluster` 代码。reference 的产出是带 `segment_type ∈ {static_hold, transition_motion, static_motion_static}` 的段落 DataFrame，给下游"做什么"是开放的。
 
-### 2.1 自动定阈值(Otsu)
+本项目**从 reference 借用**：
 
-代码 [segmentation.py:39 `auto_thresholds`](../emg_label/segmentation.py#L39):
+- pose-speed 切分（§3）含鲁棒阈值、static/motion 区间、smc clip 组装
+- 6 帧关键帧渲染思路（§8）
+- 数据源约定：默认只用 `/mnt/pose_data/`，跳过 `/mnt/force_data/`
 
-把整条 `activity` 的取值画成直方图,它天然是**双峰**的——一大堆低值(静息)、一小撮高值(动作)。
-**Otsu 法**自动在两峰之间找最佳分割谷 `t`(最大化类间方差),不用人手调阈值,也不在乎录制里动作占多大比例。
+本项目**额外有**：
 
-然后定**两个**阈值:
+- EMG burst 切分（§1, §2）—— reference 不切 EMG
+- 双信号交叉引用（§4）—— 双通路独有
+- 录制级 QC：EMG-pose lag、NaN 占比、`recordings.csv` 持久化（§5）
+- KMeans 聚类（§7）+ 按被试归一化（§7.2）
+- 结构化 CSV 输出 `segments.csv / clips.csv / recordings.csv`（§9）
 
-```python
-enter = t                                   # 进入阈(高)
-exit  = rest_center + 0.5*(t - rest_center) # 退出阈(低,在静息中位数和谷之间)
-```
+**算法差异点**单独说明：
 
-### 2.2 迟滞(hysteresis)扫描
-
-代码 [segmentation.py:55 `hysteresis_segments`](../emg_label/segmentation.py#L55):一个状态机,逐样点扫:
-
-```
-不在动作中, 且 activity ≥ enter  →  开始一段, 记 start
-在动作中,   且 activity < exit   →  结束这段, 收 (start, i)
-```
-
-**为什么要两个阈值(而不是一个)?**
-若只用单阈值,信号在阈值附近抖动时会被反复"跨上跨下",一个动作被切成好几段。
-迟滞:**进入要够高(enter)、退出要够低(exit)**,中间这段"缓冲区"里的抖动不会触发状态切换 → 一个动作=一段。这跟空调温控、施密特触发器是同一个原理。
-
-### 2.3 后处理过滤
-
-代码 [segmentation.py:72 `filter_segments`](../emg_label/segmentation.py#L72):
-
-- **合并**:相邻两段间隔 < `min_rest_gap_s`(0.2s)→ 视为同一动作中途的短暂下凹,合并。
-- **丢弃**:段长 < `min_action_s`(0.4s)→ 视为噪声毛刺,删掉。
-
-### 2.4 为什么不用关节角度切分(重要)
-
-另一个直觉方案:算"关节角到中性姿态的距离",距离大=在做动作。**这条路实测失败**:
-手势之间手往往不回中性(连续做不同手势),关节角距离一直很大,会把多个连续手势粘成一个超长段(实测最长 26 秒)。
-而 EMG 在每次放松时**一定**回基线,所以 EMG 包络能干净分隔。这是定下来不推翻的核心决策。
-
-### 2.5 当前 fgw 切分结果
-
-- 共切出 **6327 段**。
-- `fgw-0917-left`:3612 段,平均 30.1 段/文件(18–38)。
-- `fgw-0917-right`:2715 段,平均 22.6 段/文件(1–40)。
-- 段时长:中位 0.96s,均值 1.18s,范围 0.4–6.8s。
+- pose-speed 公式等价但实现细节不同（§3.1 末）
+- EMG 包络公式与 reference 完全一致（§1）
 
 ---
 
-## 3. 聚类
+## 1. EMG 包络（baseline-centered RMS）
 
-### 3.1 有监督还是无监督?——**完全无监督**
-
-整个流程**没有任何标签参与训练**:
-
-- 切分:纯信号处理(阈值检测),无学习。
-- 聚类:**KMeans,无监督**。它只看"哪些段的姿态彼此像",自动把相似的归成一堆,**不知道任何手势的名字**。
-- 选 k:用 silhouette(轮廓系数)这个**内部指标**(只衡量簇内紧/簇间散,不需要真值),也不是监督。
-
-**唯一的人工介入在聚类之后**:人看每一簇的代表姿态(3D 手图),给簇**起名字**(`labels.csv`)。这是"事后命名",不是"事前训练标签"。
-所以严格说这是 **无监督聚类 + 人工事后标注** 的半自动流程,不是分类器训练。
-
-### 3.2 聚类用的不是原始信号,是"姿态特征"
-
-每段不是直接拿 (段长×20) 的矩阵去聚——长度不一、且含移动过程。而是先压成**一个 20 维向量**,代表"这次手势定型时的姿态"。
-
-代码 [features.py:7 `apex_pose_feature`](../emg_label/features.py#L7):
+[`segmentation.py:7 emg_envelope`](../emg_label/segmentation.py#L7)：
 
 ```python
-# 保持窗口 = [本段 start, 下一段 start)   ← 段后的低肌电"保持期"
-seg  = joint_angles[start : next_start]
-dev  = 平滑( ‖seg - rest‖ )               # 每帧偏离中性姿态多远
-apex = argmax(dev)                         # 偏离最大那帧 = 姿态最到位的瞬间
-feature = median(seg[apex ± 50ms])         # 该帧附近 ±50ms 的中位姿态 → (20,)
+baseline = np.nanmedian(emg, axis=0, keepdims=True)   # 16 路各自的中位基线
+centered = emg - baseline
+rms      = np.sqrt(np.nanmean(centered**2, axis=1))   # 跨通道 RMS
+env      = uniform_filter1d(rms, size=round(0.150*fs))
 ```
 
-- `rest = median(整段录制的 joint_angles)` ≈ 中性手姿态。
-- **为什么取"段后保持期"而非段内?** EMG 段是"肌肉爆发=手正在移动到位"的过程;真正能区分手势的定型姿态出现在爆发**之后**的低肌电保持期。实测约 67% 手势的关节偏离峰值落在 EMG 段之后。
-- **为什么取 median 而非单帧?** 抗抖动/抗个别坏帧。
-- **这个特征只用原始 joint_angles,与 FK/emg2pose 无关** → 换精确 FK 不改变聚类结果。
+三步：
 
-### 3.3 是把所有切片一起聚,还是分块?——**分块(按"被试-手"分组),不是全局一锅**
+1. **去基线**：减每通道时间维中位数。原始 EMG 围绕 0 振荡，但通道间常有几 mV～几十 mV 的直流偏置（电极阻抗、放大器漂移）。直接整流会把偏置当成"始终在用力"。
+2. **跨通道 RMS**：`sqrt(mean(centered², axis=1))`。RMS 测量瞬时**激活方差**——肌电的物理量；同时对单通道尖峰不敏感（被求和均值平滑）。这是 reference 同款公式。
+3. **平滑**：150 ms uniform filter。压随机放电脉冲串的高频毛刺，保留动作整体起伏。
 
-这是你问的重点。**不是把 6327 段全丢进一个 KMeans**,而是:
-
-```
-按 group = "subject-hand" 分组,每组各自独立跑一次 KMeans
-```
-
-当前 fgw 分成 **2 组,各跑一次**:
-
-| 组             | 段数 → 特征矩阵 X | KMeans         |
-| -------------- | ------------------ | -------------- |
-| fgw-0917-left  | (3612, 20)         | 独立聚成 18 簇 |
-| fgw-0917-right | (2715, 20)         | 独立聚成 18 簇 |
-
-**为什么分组而不混聚?**
-不同被试的手型/关节标定不同;左右手是镜像关系。把它们混在一起,KMeans 会先按"谁的手/哪只手"分开,而不是按"什么手势"分开。按 (被试,手) 隔离后,组内才是同一只手做不同手势,聚类才在比手势。
-代码 [cluster.py:32](../cluster.py#L32) 的 `for group, gdf in seg_df.groupby("group")` 就是这个分块循环。
-
-> 多被试时,你这次的 240 文件→2 组;若把更多被试 pool 进来,会自动变成更多组,每组各自聚类。`--k 18` 目前对所有组用同一个 k。
-
-### 3.4 KMeans + 选 k
-
-代码 [clustering.py:8 `select_k_and_cluster`](../emg_label/clustering.py#L8):
-
-```python
-Xz = zscore(X)                              # 20 维各自标准化(去量纲)
-# 你传了 --k 18 → 直接 k=18;不传则在 [k_min,k_max] 扫 silhouette 自动选
-labels = KMeans(n_clusters=18, n_init=10).fit_predict(Xz)
-```
-
-- **zscore**:20 个关节角量程不同(有的关节活动范围大、有的小)。不标准化的话 KMeans 的欧氏距离会被大量程关节主导。标准化后每维等权。
-- **KMeans 干什么**:在 20 维空间里找 18 个簇心,把每段分到最近的簇心,反复迭代到稳定。`n_init=10` 跑 10 个随机初值取最好,避免落到坏的局部最优。
-- **k 怎么定**:你这次手动定 18。不指定时用 **silhouette** 在 12–30 范围逐个 k 试、取分数最高的(分数 = 簇内紧致且簇间分离的程度)。
-  - **为什么 k 宁大勿小**:过度聚类可恢复(同一手势被拆成两簇 → 标注时填相同名字就合并);欠聚类不可恢复(两个不同手势并进一簇 → 没法再分开)。实测姿态可分性上限约 17 簇,真实手势约 24 个,部分姿态太相似。
-
-### 3.5 聚类后产物
-
-- 每簇算 20 维质心 `centroid` + 段数 `count`。
-- `clusters/<group>_hands.png`:把质心喂 **emg2pose 正向运动学** 渲染成 3D 手骨架(供人命名;FK 只用于画图,不进聚类)。
-- `labels_template.csv`:每 `(group, cluster_id)` 一行,等人填 `label`。
-
-**当前 fgw 聚类结果**:
-
-- fgw-0917-left:18 簇,簇大小 59–364(均值 201)。
-- fgw-0917-right:18 簇,簇大小 73–234(均值 151)。
+关键性质：肌肉一放松，env 就回基线；不依赖手的姿态是否回中性，**连续不同手势之间只要有一瞬放松就能切开**——这是 EMG 包络比"关节角到中性距离"切分更优的原因（关节距离在连续手势间一直很高，会把多个动作粘成一段）。
 
 ---
 
-## 4. 数据规模流转一览(fgw0917, k=18)
+## 2. EMG burst 切分 — Otsu + 迟滞 + 鲁棒兜底
+
+目标：在 env 上找出每次"动作"的 `[start, end)`。
+
+### 2.1 自动阈值
+
+[`segmentation.py:43 auto_thresholds`](../emg_label/segmentation.py#L43)：
+
+```python
+t       = otsu(env)                           # 双峰间的最佳分割谷
+enter   = t                                   # 进入阈（高）
+exit    = rest_center + 0.5*(t - rest_center) # 退出阈（在静息中位和谷之间）
+```
+
+env 直方图天然双峰（一大堆静息低值 + 一小撮动作高值），Otsu 最大化类间方差自动定谷。
+
+**鲁棒兜底**：当 Otsu 退化（`enter ≤ exit`，近常值信号或单峰），自动退到 MAD：
+
+```python
+enter = median + 1.5 * 1.4826 * MAD
+exit  = median + 0.5 * 1.4826 * MAD
+```
+
+这条 fallback 杜绝"整文件被静默返 0 段"——真值集场景里不能有这种沉默丢弃。
+
+### 2.2 迟滞扫描
+
+[`segmentation.py:65 hysteresis_segments`](../emg_label/segmentation.py#L65)：
 
 ```
-240 文件 × 238k 样点      原始: ~5712 万行 (emg 16ch + joint 20维)
-        │  切分(每文件独立)
+非动作中 & env ≥ enter → 开启一段，记 start
+动作中 & env <  exit  → 关闭，收 (start, i)
+```
+
+两个阈值（而非一个）的理由：单阈值会让阈值附近的抖动反复跨越，把一个动作切成几段。enter > exit 之间是"缓冲区"，抖动不触发状态切换。与施密特触发器同原理。
+
+### 2.3 后处理
+
+[`segmentation.py:82 filter_segments`](../emg_label/segmentation.py#L82)：
+
+- **合并**：相邻段间隔 < `min_rest_gap_s`（默认 0.2 s）→ 视作动作中途的瞬时下凹，合并。
+- **丢弃**：段长 < `min_action_s`（默认 0.4 s）→ 视作噪声毛刺，删掉。
+
+### 2.4 hold 窗口（聚类要用）
+
+[`segmentation.py:87 hold_windows`](../emg_label/segmentation.py#L87)：每个 burst 之后的低肌电"持姿期"边界——`hold_end = next_burst_start`（末段为 `min(n, end + fs)`）。写到 `segments.csv` 的 `hold_end_sample` 列，供聚类阶段直接取，不用下游再重算。
+
+每段 apex（`apex_sample` 列）= `[start, hold_end)` 内最大关节偏离帧；既是聚类特征锚点，也供 overview 图标红线。
+
+---
+
+## 3. Pose-speed 切分 — 真值集打标的天然单元
+
+EMG burst 切的是"用力的瞬间"，但**人能识别的稳定姿态在 hold 期**。reference 的思路：直接在关节速度信号上切，并把"持姿→运动→持姿"组成一个 clip——这就是打标的天然单元。
+
+代码 [emg_label/pose_segmentation.py](../emg_label/pose_segmentation.py)。
+
+### 3.1 pose-speed 信号
+
+把 20 维关节角变化压成一条标量"运动强度"曲线，类似 EMG 包络但测量的是手在不在动而非手在不在用力。
+
+代码 [`pose_segmentation.py:7 pose_speed`](../emg_label/pose_segmentation.py#L7) 五步：
+
+```
+joint_angles (T, 20)
+        │
+        ▼  np.diff(axis=0)               ① 相邻帧关节角差，shape = (T-1, 20)
+        │
+        ▼  np.linalg.norm(axis=1)        ② 20 维差向量的长度，shape = (T-1,)
+        │                                  "20 个关节这一步整体动了多远"
+        ▼  * fs                          ③ 换算每秒变化率（rad/s）
+        │
+        ▼  concat([delta[0]], delta)     ④ 首帧补 delta[0]，长度恢复 T
+        │
+        ▼  uniform_filter1d(size=0.25s)  ⑤ 平滑抹高频抖动，留下动作整体起伏
+        │
         ▼
-6327 段                   每段一个 [start,end];仅记录索引,不复制数据
-        │  特征(每段 → apex 保持姿态)
-        ▼
-2 个特征矩阵              left (3612,20) / right (2715,20)
-        │  分组 KMeans(每组独立, k=18)
-        ▼
-2×18 = 36 簇             每簇一个 20 维质心
-        │  人工命名 + 导出(每段切片落盘)
-        ▼
-36 个标签目录, 6327 npz   每个 = 一段 emg/joint_angles 切片 + 溯源元数据
+pose_speed (T,)
 ```
+
+- **L2 范数取代 maxima**：用 `‖d ja‖` 而不是单关节最大变化，是因为很多手势靠多个关节联动（捏指 = 拇指+食指同动）；范数把"20 维空间里走了多远"汇成一个数。
+- **`* fs` 等价于 `/ dt`**：单位是 rad/s，跨录制可比较。
+- **250 ms 平滑窗口**：reference 的默认值，足够压住手指抖动、又不会糊掉 0.2 s 量级的快速动作。
+
+**Manus 偶尔遮挡丢帧 → NaN**：`np.errstate(invalid='ignore')` 静音 `np.diff` 的 NaN 抛 warning；NaN 区域因 `NaN <= threshold == False` 落入 motion 候选（安全默认：未知段不晋升为静态）。`min_motion_s` filter 会把孤立的 NaN 噪声块筛掉。
+
+#### 与 reference 的实现差异
+
+| 维度       | reference                              | 当前实现                       |
+|------------|----------------------------------------|--------------------------------|
+| 分母 dt    | `np.diff(pose_t)` 真实时间差，坏值补 median | 固定 `1/fs`（假定等间隔）      |
+| NaN        | `nan_to_num → 0`（NaN 区变 static 候选）| 保留 NaN（变 motion 候选）     |
+| 平滑函数   | `np.convolve('same')`                  | `scipy.uniform_filter1d('nearest')` |
+| 窗口长度   | `0.25s / median_dt` 个样本             | `round(0.25s * fs)` 个样本     |
+
+**为什么差异不影响结果**：
+
+- **dt 来源**：`io_utils.load_npz` 已经把 pose 重采样到等间隔 EMG 轴，所以 `* fs` 严格等价于 reference 在重采样后的 `/diff(pose_t)`。
+- **NaN 哲学**：reference 假设"未知 → 静止"，我们假设"未知 → 运动"。我们选后者是因为真值集场景里**漏切真手势比误切伪段更糟**。两者在数值上都会被 `min_motion_s` / `min_static_s` 滤掉孤立噪声块，差异仅出现在长 NaN 区段——这种录制本就该被 `pose_nan_frac` QC 列剔除（§5.2）。
+- **卷积 vs uniform_filter1d**：窗口相同、边界处理细节略不同，结果可视化级一致。
+
+### 3.2 鲁棒阈值
+
+[`pose_segmentation.py:21 robust_threshold`](../emg_label/pose_segmentation.py#L21)：
+
+```
+threshold = max( P35(speed), median(speed) + 1.5 * 1.4826 * MAD(speed) )
+```
+
+不假设双峰，对各种 duty-cycle 都稳健。可调参数：`pose_pct`（默认 35）、`pose_mad`（默认 1.5），与 reference 一致。
+
+### 3.3 static / motion 区间
+
+[`pose_segmentation.py:60 static_motion_intervals`](../emg_label/pose_segmentation.py#L60)：
+
+- **static**：`speed ≤ threshold` 持续 ≥ `min_static_s`（默认 0.35 s）的区段。
+- **motion**：相邻 static 之间（含头尾）至少 `min_motion_s`（默认 0.20 s）的间隙。
+- 顺序：先按 `min_sec` 过滤、再按 `merge_gap_s`（默认 0.20 s）合并相邻幸存者（与 reference 一致）。
+
+### 3.4 组装 clip（static-motion-static）
+
+[`pose_segmentation.py:82 build_smc_clips`](../emg_label/pose_segmentation.py#L82)：
+
+遍历有序的 (static, motion, static) 三元组：
+
+```
+clip_start = max(0, max(static_in.start, motion.start - pre_static_s) - pad_s)
+clip_end   = min(N, min(static_out.end,  motion.end   + post_static_s) + pad_s)
+```
+
+- `pre_static_s` / `post_static_s`（默认 0.5 s）：把每侧静态期裁短到这个上限。长持姿不会让 clip 失控膨胀。
+- `pad_s`（默认 0.05 s）：两端再加一点缓冲，给标注员留余量。
+
+每个 clip 携带 6 个时间点：`clip_start, static_in_start, static_in_end, motion_start, motion_end, static_out_start, static_out_end, clip_end`，加 apex（`static_out` 内偏离最大帧）。
+
+### 3.5 burst ↔ clip 交叉引用
+
+两个切分器（EMG 和 pose）独立工作，互不知道对方的结论。把两套段落按**时间重叠最多**做配对，写到两份 CSV 里：
+
+- `segments.csv.matched_clip_id` — 该 burst 对应哪个 clip（`-1` = 无匹配）
+- `clips.csv.matched_emg_seg_idx` — 该 clip 对应哪个 burst（`-1` = EMG 没切出来）
+
+代码 [`pose_segmentation.py:139 match_*`](../emg_label/pose_segmentation.py#L139)。
+
+**为什么要做这件事**：两套对不上的位置就是有问题的位置，三档解读：
+
+| 情况                                         | 含义                                                         | 处理                                     |
+|----------------------------------------------|--------------------------------------------------------------|------------------------------------------|
+| 互相匹配                                     | 高置信度手势：两个独立证据都确认                             | 直接进真值集                             |
+| `matched_clip_id == -1`（EMG 有、pose 没）   | 等长发力（手没动只在使劲）？或 EMG 噪声伪段？                | 人工复核                                 |
+| `matched_emg_seg_idx == -1`（pose 有、EMG 没）| 缓慢轻柔手势 EMG 没明显波动？或 EMG 阈值定太高？             | **优先复核**——往往是 EMG 单方案的真漏切 |
+
+**实例**：本机 `jm-0503/20260423-left/20260423_132054` 这条录制切出 **1 个 burst vs 21 个 clip，其中 20 个 clip-only**——说明这条录制如果只用 EMG，会基本上漏个干净；交叉引用立刻把"该看哪 20 段"标得清清楚楚。
+
+### 3.6 EMG 包络 vs pose-speed 对比
+
+两者各自看到了手势的不同侧面，组合用比任何一种单跑都靠谱：
+
+| 维度                         | EMG 包络                                       | pose-speed                              |
+|------------------------------|------------------------------------------------|-----------------------------------------|
+| 公式                         | `sqrt(mean((emg - 中位基线)², axis=1))` + 平滑 | `‖d ja / dt‖` + 平滑                    |
+| 测量的物理量                 | 肌肉激活方差（用力大小）                       | 关节角变化率（手在动多快）              |
+| 静息时                       | 回基线                                         | 接近 0                                  |
+| **持姿时（用力维持姿势）**   | **仍然高**（肌肉在维持）                       | **0**（关节没动）                       |
+| **等长发力**（按力传感器）   | **高**                                         | **0**（手没动）                         |
+| **缓慢被动张开**（轻柔手势） | 弱信号，可能漏切                               | **能检测到**                            |
+| 阈值方法                     | Otsu（双峰）+ MAD fallback                     | `max(P35, median + 1.5·MAD)`（单边）    |
+| 切出来的单元                 | burst（用力的一段）                            | static → motion → static → 组装为 clip  |
+| 在双信号中的角色             | 找"有没有发力"                                 | 找"有没有动"                            |
+
+**关键观察**：两者在持姿期表现相反——EMG 在维持姿势时仍然高（肌肉在保持），pose-speed 早就 0 了。这恰恰是组合使用的物理基础：单看任意一种都有大类盲区，两者一起几乎涵盖所有"手势状态"。
 
 ---
 
-## 5. 聚类之后:质量检查(特征图)
+## 4. 每段 QC 列
 
-聚类是无监督的,命名前先确认"这 k 个簇是否真的可分、k 选得是否合理"。
-工具:[plot_cluster_features.py](../plot_cluster_features.py),用**与 cluster.py 完全一致**的 apex 特征,逐组画四面板图到 `<out>/feature_maps/<group>_features.png`。
+每个 burst / clip 都附带 QC 指标，供按需筛选：
 
-```bash
-OMP_NUM_THREADS=4 python plot_cluster_features.py work_pool_fgw --out out_fgw
-# 特征缓存到 out_fgw/feature_cache/<group>.npz,重跑秒出;改 k 后加 --force;嫌慢加 --no-tsne
-```
+| 列                                                  | 解释                                                   |
+|-----------------------------------------------------|--------------------------------------------------------|
+| `emg_rms`                                           | 该区间 RMS（去基线之前的原始尺度）                     |
+| `envelope_peak`                                     | 该区间 env 峰值                                        |
+| `pose_range`                                        | `‖max(ja) - min(ja)‖`（关节偏移范围）                  |
+| `mean_pose_speed` / `max_pose_speed`（仅 clip）     | 该区间速度统计                                         |
+| `duration_s` / `motion_duration_s`（仅 clip）       | 时长                                                   |
 
-四个面板:
-
-1. **PCA 2D 散点**:20 维线性降到 2D,点=段、色=簇、星=质心。标题里的百分比是前两个主成分占的方差;若只占 ~57%,平面上簇会重叠——是投影损失,不代表不可分。
-2. **t-SNE 2D 散点**:非线性降维,**更能反映真实分离度**。簇若一团团分开,说明在原 20 维空间确实可分。
-3. **质心热图**(k 簇 × 20 关节,z-score):红=该关节比平均更伸、蓝=更屈。两行相似 = 两簇姿态接近(可能该合并);某列在各簇间反差大 = 该关节是区分手势的主力。
-4. **簇大小 + 轮廓系数**:彩柱=样本数,灰柱=该簇平均 silhouette(越高越紧致独立;红虚线=0,负值说明该簇样本更靠近别的簇)。
-
-**关键数字 — 整体 silhouette**:衡量整体聚类质量(-1~1,>0.3 算有合理结构)。
-当前 k=18:`fgw-0917-left=0.389`、`fgw-0917-right=0.374`。
-**怎么用它选 k**:改 `--k` 重跑 cluster.py 再跑本脚本,看整体 silhouette 升降;但记住"欠聚类不可恢复",所以即使大 k 的 silhouette 略低,也宁可偏大(靠命名时合并)。
+典型用法：`clips[(envelope_peak < 5) & (pose_range < 0.5)]` 一行过滤微弱伪段。
 
 ---
 
-## 6. 人工标注:给簇起名(labels.csv)
+## 5. 录制级 QC — EMG-pose lag + NaN 占比
 
-这是流程里**唯一**的人工环节,也是无监督聚类转成"带手势名数据集"的关键一步。
+新模块 [emg_label/qc.py](../emg_label/qc.py)，写到 `recordings.csv`（每录制一行）。
 
-### 6.1 模板与填写
+### 5.1 EMG-pose lag
 
-cluster.py 已生成 `out/labels_template.csv`,每 `(group, cluster_id)` 一行:
-
-```
-group,cluster_id,count,label
-fgw-0917-left,0,281,          ← label 列待填
-fgw-0917-left,1,292,
-...
-```
-
-操作:
-
-```bash
-cp out_fgw/labels_template.csv out_fgw/labels.csv
-# 编辑 labels.csv,只改 label 列;不要动 group/cluster_id/count
-```
-
-### 6.2 看什么来决定名字
-
-对照三类可视化(同一 `cluster_id` 在三处一一对应):
-
-- `out/clusters/<group>_hands.png` — 每簇质心的 3D 手姿态(**主依据**)。
-- `out/clusters/<group>.png` — 每簇质心的 20 维条形图。
-- `out/hand_anim/index.html` — 每簇前几个样本的动画(判断簇内是否一致,见 §8)。
-
-### 6.3 命名语义(三条规则,由 export.py 决定)
-
-代码 [export.py:35](../export.py#L35) 把 `(group, cluster_id) → label` 建成映射,导出时按 label 归档:
-
-1. **起任意名**:`fist`/`pinch_index`/`one`/`open` 等,自由。
-2. **同名合并**:同一手势被拆成多个簇 → 多行填**相同**名字 → 导出时落进同一目录,自动合并。这就是"过聚类可恢复"的兑现方式。
-3. **空白丢弃**:label 留空的簇,导出阶段**跳过**(代码里 `if not label: continue`)。可先只标确定的,存疑簇留空,之后再补。
-
-> 注意:命名是**事后**给簇贴名,不是给模型喂监督标签;整个聚类没用到任何标签。
-
----
-
-## 7. 导出:落地带标签的单段数据集(export.py)
-
-```bash
-python export.py work_pool_fgw --out out_fgw          # 默认读 out_fgw/labels.csv
-# 或 --labels /path/to/labels.csv
-```
-
-### 7.1 做了什么
-
-代码 [export.py:45](../export.py#L45) 按源文件逐个处理(用完即释放,内存恒定):
+互相关 EMG 包络与 pose-speed，找最高相关对应的偏移：
 
 ```python
-for fname in 源文件:
-    for 该文件每段:
-        label = lab_map[(group, cluster_id)]
-        if not label: continue                  # 空标签跳过
-        np.savez(segments/<label>/<命名>.npz,
-                 emg[s:e], joint_angles[s:e],   # 切片 = EMG 爆发段 [s,e)
-                 label, source_file, group, seg_idx,
-                 start_sample, end_sample, fs, cluster_id)
-    画 labeled_overview/<file>.png               # 只画已标注的段
+lag_s, corr = qc.estimate_emg_pose_lag(env, pose_speed, fs,
+                                        max_lag_s=1.0, min_corr=0.05)
 ```
 
-### 7.2 产物结构
+约定：**lag > 0 = EMG 领先 pose**。生理上肌电应在动作前 50–300 ms 触发，所以健康范围 `(0, 0.4]` s。
 
+`qc.lag_status(lag)` 分四档：
+- `ok` — 在 (0, 0.4] s
+- `early` — < 0（EMG 滞后动作；通常对齐 bug）
+- `late` — > 0.4（漂移或弱信号伪峰）
+- `nan` — 信号无效（全 NaN、近常值、最佳相关低于 `min_corr`）
+
+NaN 鲁棒：内部把 NaN 替换为 0（z-score 后），全 NaN 切片直接返 NaN；`np.errstate` 静音 numpy 抛出的 invalid warning。
+
+### 5.2 NaN 占比
+
+`pose_nan_frac` / `emg_nan_frac` = 任一通道为 NaN 的样本占比。原始 Manus 偶有遮挡丢帧；`pose_nan_frac > 0.1` 的录制基本上是被插值"造"出来的，不要进真值集。
+
+### 5.3 recordings.csv schema
+
+| 列                                                                                  | 说明                                                   |
+|-------------------------------------------------------------------------------------|--------------------------------------------------------|
+| `source_file, source_path, group, subject, hand`                                    | 溯源                                                   |
+| `n_samples, duration_s`                                                             | 规模                                                   |
+| `n_bursts, n_clips, n_burst_only, n_clip_only`                                      | 双信号产出与分歧                                       |
+| `emg_pose_lag_s, emg_pose_corr, lag_flag`                                           | 时序 QC                                                |
+| `pose_nan_frac, emg_nan_frac`                                                       | 完整性 QC                                              |
+| `enter_thresh, exit_thresh, pose_thresh`                                            | 阈值快照（复盘用）                                     |
+
+典型筛选：
+
+```python
+import pandas as pd
+r = pd.read_csv("out/recordings.csv")
+clean = r[(r.lag_flag == "ok") & (r.pose_nan_frac < 0.01)]   # 进真值集
+review = r[r.lag_flag.isin(["early", "late"])]               # 人工复核
 ```
-out_fgw/
-├── segments/<label>/                            训练用数据集
-│   └── <label>__<subj>-<hand>__<原stem>__seg<i>.npz
-└── labeled_overview/<stem>.png                  每源文件一张核对图(仅画已标注段)
-```
-
-单个 npz 内容:
-
-| 键                                                                         | 内容                                                |
-| -------------------------------------------------------------------------- | --------------------------------------------------- |
-| `emg`                                                                    | (seg_len,16) 该段 EMG 切片                          |
-| `joint_angles`                                                           | (seg_len,20) 同长关节角(弧度)                       |
-| `label` / `cluster_id` / `group`                                     | 手势名 / 原簇号 / 被试-手                           |
-| `source_file` / `seg_idx` / `start_sample` / `end_sample` / `fs` | 完整溯源:来自哪个原始文件的哪一段、对应原始样点区间 |
-
-文件名本身就编码了 `标签/被试-手/源文件/段号`,不读内容也能溯源。
-
-### 7.3 切片范围(重要约定)
-
-导出的是 **EMG 爆发段 `[start, end)`**(overview 里的绿色span),**不含**后面的保持期。
-
-- 这是先前确认的范围定义。
-- 聚类特征虽然在"爆发段 + 后续保持期"窗口里取 apex,但**导出只切爆发段**——两者范围不同,别混淆。
-- 若训练需要保持期姿态,改 [export.py](../export.py) 里的 `s,e` 切片范围(把 `e` 往后延到下一段起点)。
-
-### 7.4 自检
-
-- 终端末行 `Exported N labeled segments`。**N=0** → labels.csv 的 label 列全空,或表头/group/cluster_id 对不上 segments_clustered.csv。
-- `ls out_fgw/segments/` 看手势目录;`ls out_fgw/segments/<label> | wc -l` 是该手势样本数。
-- 抽查 `labeled_overview/*.png`:标签文字应压在对应 EMG 爆发上。
 
 ---
 
-## 8. 可视化核对工具(命名前/后都可用)
+## 6. 聚类特征：hold 窗口里的 apex 姿态
 
-三个脚本,从粗到细核对切分与聚类质量。
+### 6.1 为什么聚类只用 joint_angles，EMG 完全不参与
 
-### 8.1 单段静态图 — [visualize_segment.py](../visualize_segment.py)
+聚类问的是 "**哪些段是同一个手势**"。回答这问题的是手摆成什么形状，而不是用力多大：
 
-一段 npz → 一张 PNG,四面板:16 通道 EMG(堆叠)、EMG 包络、20 维关节角、3 帧 3D 手姿(start/apex/end)。
+- 同一个"比 1"，用力做和轻轻做，EMG 形状完全不同；但贴的标签应该是同一个手势。
+- EMG 的形状还受太多无关因素影响：当天皮肤汗、电极位置略有偏移、肌肉疲劳……
+- joint_angles 直接描述了"手摆成什么形状"——同一手势在不同时间、不同力度做，关节角都差不多。**这才是手势的身份证**。
 
-```bash
-python visualize_segment.py out_fgw/segments/left-0/<某.npz> -o /tmp/x.png
+所以分工：
+
+| 信号           | 在切分阶段          | 在聚类阶段     | 在 QC 阶段          |
+|----------------|---------------------|----------------|---------------------|
+| EMG            | 切 burst            | **不用**       | 算 EMG-pose lag     |
+| pose-speed     | 切 static/motion → clip | **不用**   | 间接（lag 的另一端） |
+| joint_angles   | 算 pose-speed 的源  | **特征向量来源** | 算 pose_nan_frac    |
+
+聚类**不用** EMG 段切片，而是用每段"持姿期"里的代表性姿态向量——下面 §6.2 是具体怎么取的。
+
+### 6.2 apex 姿态特征
+
+代码 [features.py:27 `apex_pose_feature`](../emg_label/features.py#L27)：
+
+```python
+# hold 窗口 = [start, hold_end_sample)  ← 从 segments.csv 直接读，不再重算
+dev    = smooth(‖ja - rest‖)            # 每帧偏离中性多远
+apex   = argmax(dev)                    # 最到位的瞬间
+feature = median(ja[apex ± 50ms])       # 该帧附近 ±50ms 的中位姿态 → (20,)
 ```
 
-用途:细看某一段的信号与姿态对不对。注意它的 apex 只在爆发段内搜,与聚类的 apex(含保持期)不同(§3.2)。
-
-### 8.2 单段 3D 动画 — [animate_segment.py](../animate_segment.py)
-
-一段 npz → 交互式 plotly HTML(可旋转/缩放/拖时间轴/播放),看手势成型。
-输出路径:`<out_root>/<subdir>/<label>/<stem>.html`(out_root 自动从 npz 路径推导,subdir 默认 `hand_anim`)。
-
-```bash
-python animate_segment.py out_fgw/segments/left-0/<某.npz> --subdir hand_anim --max-frames 80 --fps 30
-```
-
-五指按色区分,坐标轴固定成立方体(等比例)。2540 帧默认下采样到 80 帧。
-
-### 8.3 批量画廊 + 索引页 — [build_anim_gallery.py](../build_anim_gallery.py)
-
-对每个标签取前 N 段各生成动画,并写一个总索引 `<out>/hand_anim/index.html`(按组分表,每类列出 N 个样本链接 + 时长 + 来源)。
-
-```bash
-python build_anim_gallery.py --out-root out_fgw --n 3 --clean
-# 打开 out_fgw/hand_anim/index.html 逐类核对
-```
-
-**核对要点**:同一类的 N 个样本动画应是同一个手势。若某类 N 个差别大 → 该簇不纯(k 可能偏小,或该手势姿态分散),提示标注时需谨慎或回头调 k。
+- `rest = median(整条录制的 joint_angles)` ≈ 中性手姿态。
+- **为什么取 hold 而非段内？** EMG burst 是"肌肉爆发=手正在移动到位"的过程；真正能区分手势的定型姿态在爆发**之后**的低肌电持姿期。
+- **median 而非单帧**：抗抖动、抗坏帧。
+- **这个特征只用 joint_angles**，与 FK/emg2pose 无关。
 
 ---
 
-## 9. 完整工作流与迭代
+## 7. 聚类（无监督 + 事后命名）
+
+整个聚类**没有任何标签参与训练**：
+
+- 切分纯信号处理（阈值检测）。
+- 聚类是 **KMeans**，只看"哪些段的姿态向量彼此像"。
+- 选 k 用 **silhouette**（内部指标，不需要真值）。
+- 唯一人工介入：聚类**之后**看每簇代表姿态给簇起名（`labels.csv`）。
+
+### 7.1 分组：每个 (被试,手) 各跑一次 KMeans
+
+```python
+for group, gdf in seg_df.groupby("group"):    # group = "subject-hand"
+    X  = [apex_pose_feature(...) for seg in gdf]
+    Xz = zscore(X)
+    labels = KMeans(n_clusters=k, n_init=10).fit_predict(Xz)
+```
+
+为什么分组：不同被试手型/标定不同，左右手是镜像。混在一起 KMeans 会先按"谁的手"分。
+
+### 7.2 跨被试合聚 + 按被试归一化
+
+`cluster.py --group-by all` 把所有人合到一个 KMeans；用 `--subject-norm zscore` 在聚类前对**每个被试的特征**去均值除标准差，压低"个体身份"对距离的污染。归一化只作用于聚类特征，**簇心仍用原始绝对姿态**渲染 3D 手图。详见 [docs/汇报文档/多人单手聚类结果与分析.md](汇报文档/多人单手聚类结果与分析.md)。
+
+### 7.3 K 怎么定 + 过/欠聚类
+
+- 手动 `--k 18`，或不传走 silhouette 在 `[k_min, k_max]` 扫。
+- **K 宁大勿小**：过聚类（同一手势拆两簇）可恢复——标注时填相同名字即合并；欠聚类（两手势并一簇）不可恢复。
+
+---
+
+## 8. 真值集构建工作流（推荐主路径）
 
 ```
-segment.py ──► cluster.py ──► plot_cluster_features.py   (看 silhouette / t-SNE 判 k)
-                   │                build_anim_gallery.py  (逐类看动画判簇纯度)
-                   ▼
-            〔人工填 labels.csv:命名 / 同名合并 / 空白丢弃〕
-                   ▼
-              export.py ──► segments/<label>/*.npz + labeled_overview/*.png
+segment.py ──► segments.csv (burst)
+            ├► clips.csv    (clip = static-motion-static，打标单元)
+            └► recordings.csv (lag / NaN / 阈值快照)
+
+      ↓ 按 lag_flag、pose_nan_frac 筛 recordings.csv
+
+export_clips.py ──► clips_export/<key>.npz   (每个 clip 一个切片)
+                ├► clips_export/<key>.png   (6 帧关键帧)
+                └► clips_export/index.html  (浏览页 + QC 摘要 + matched_burst 标红)
+
+      ↓ 人浏览 index.html，在 clips.csv 填 gesture_label 列
+
+→ clips_labeled.csv  (真值集)
 ```
 
-**迭代准则**:
+每个 clip 的 6 帧 PNG = `clip_start → pre-motion → motion 1/3 → motion 2/3 → apex → clip_end`，足够标注员一眼辨识手势。
 
-- 切分不满意 → 调 segment.py 的阈值/时长参数,重跑全链。
-- 簇不满意(太碎/太糊)→ 改 cluster.py 的 `--k` 重跑 cluster + 两个检查脚本;`segments.csv` 不变无需重切。
-- k 宁大勿小:欠聚类(两手势并一簇)不可恢复;过聚类靠命名时同名合并即可恢复。
-- 命名只影响 export,改 labels.csv 后单独重跑 export.py 即可。
+### 8.1 6 帧渲染的两条路径
+
+[export_clips.py:_render_keyframes_*](../export_clips.py)：
+
+1. **skeleton 路径（首选，无 torch）**：raw npz 含 `manus_*_skeleton`（25 关节 XYZ+四元数），直接画 XYZ 连线。[emg_label/skeleton.py](../emg_label/skeleton.py) 提供连接表和 `draw_skeleton(ax, xyz)`。生产环境无 torch 也能出图。
+2. **emg2pose FK 路径（fallback）**：处理后数据无 skeleton，从 joint_angles 走 FK 渲染（需要 torch）。
+
+策略：每条录制优先 skeleton，缺则回 FK；FK 首次失败后整轮跑禁用 FK，不再无谓尝试。
+
+---
+
+## 9. 输出 schema 速查
+
+### 9.1 `segments.csv`（每个 EMG burst 一行）
+
+| 列                                                                                       | 含义                                          |
+|------------------------------------------------------------------------------------------|-----------------------------------------------|
+| `source_file, source_path, group, seg_idx`                                               | 溯源                                          |
+| `start_sample, end_sample`                                                               | burst 区间                                    |
+| `hold_end_sample`                                                                        | hold 窗口终点（聚类直接读）                   |
+| `apex_sample`                                                                            | hold 内最大偏离帧                             |
+| `duration_s, emg_rms, envelope_peak, pose_range`                                         | QC                                            |
+| `matched_clip_id`                                                                        | 该 burst 对应的 clip（-1 = 无）               |
+
+### 9.2 `clips.csv`（每个 pose clip 一行 — 打标单元）
+
+| 列                                                                                                                                       | 含义                                            |
+|------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|
+| `source_file, source_path, group, subject, hand, clip_id`                                                                                | 溯源                                            |
+| `clip_start_sample, clip_end_sample`                                                                                                     | 完整 clip 区间（含 pad）                        |
+| `static_in_start/end_sample, motion_start/end_sample, static_out_start/end_sample`                                                       | 子结构                                          |
+| `apex_sample`                                                                                                                            | static_out 内最稳帧                             |
+| `duration_s, motion_duration_s, emg_rms, envelope_peak, mean_pose_speed, max_pose_speed, pose_range`                                     | QC                                              |
+| `matched_emg_seg_idx`                                                                                                                    | 该 clip 对应的 burst（-1 = EMG 漏切）           |
+| `gesture_label`                                                                                                                          | **空，等人填**                                  |
+
+### 9.3 `recordings.csv`（每条录制一行）
+
+见 §5.3。
+
+### 9.4 `segments_clustered.csv`（聚类后）
+
+= `segments.csv` + `cluster_id` 列。供 `export.py` 按 (group, cluster_id) → label 映射归档。
+
+### 9.5 单段导出 npz（`export.py`）
+
+| 键                                                                                              | 内容                                                 |
+|-------------------------------------------------------------------------------------------------|------------------------------------------------------|
+| `emg, joint_angles`                                                                             | (seg_len, 16)+(seg_len, 20) 该 burst 切片            |
+| `label, cluster_id, group, source_file, seg_idx, start_sample, end_sample, fs`                  | 标注与溯源                                           |
+
+### 9.6 单 clip 导出 npz（`export_clips.py`）
+
+| 键                                                                                                                              | 内容                                                   |
+|---------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------|
+| `emg, joint_angles`                                                                                                             | (clip_len, 16)+(clip_len, 20) 完整 clip 切片           |
+| `fs, clip_start, clip_end`                                                                                                      | 时间锚点                                               |
+| `static_in_start/end, motion_start/end, static_out_start/end, apex`                                                             | 子结构（绝对 sample 索引）                             |
+| `source_file, group, subject, hand, clip_id, matched_emg_seg_idx`                                                               | 溯源                                                   |
+
+兼容 `visualize_segment.py` 做单段深度可视化。
+
+---
+
+## 10. 完整流水线全景
+
+```
+                              ┌─ raw_npz (/mnt/pose_data/...)
+                              │     manus_<hand>_ergonomics + manus_<hand>_skeleton
+                              ├─ processed_npz (joint_angles 已对齐)
+                              │
+io_utils.load_npz             │   ← 自动识别 + 对齐 pose 到 EMG 轴
+                              ▼
+                  ┌───────────┴───────────┐
+                  │                       │
+        ┌─ EMG 通路 ─┐         ┌─── pose 通路 ───┐
+        │  envelope  │         │   pose_speed     │
+        │  Otsu+迟滞 │         │   robust_thresh  │
+        │  filter    │         │   static/motion  │
+        │  hold/apex │         │   smc_clip       │
+        └────┬───────┘         └────────┬─────────┘
+             │                          │
+             │  ←─── burst ↔ clip 匹配 ───→
+             │                          │
+             ▼                          ▼
+       segments.csv               clips.csv  ←──── 打标 gesture_label
+             │                          │
+             │ (聚类路径)               │ (真值集路径)
+             ▼                          ▼
+     cluster.py → KMeans         export_clips.py
+             │                          │
+             ▼                          ▼
+     segments_clustered.csv      clips_export/*.npz + *.png + index.html
+             │                          │
+   填 labels.csv 命名簇             浏览 index.html 填 clips.csv
+             │                          │
+             ▼                          ▼
+     export.py → segments/<label>/*    clips_labeled.csv (= 真值集)
+                                     ┌────────────────────────────┐
+                                     │ recordings.csv （全局 QC） │
+                                     │ lag_flag, pose_nan_frac    │
+                                     └────────────────────────────┘
+```
+
+具体命令、参数、典型场景见 [RUNBOOK.md](RUNBOOK.md)。

@@ -11,7 +11,19 @@ def test_emg_envelope_high_during_action():
     env = emg_envelope(emg, fs=1000, smooth_ms=20.0)
     assert env.shape == (1000,)
     assert env[500] > env[100]          # burst > baseline
-    assert env.min() >= 0.0             # rectified envelope is non-negative
+    assert env.min() >= 0.0             # RMS envelope is non-negative
+
+
+def test_emg_envelope_baseline_immune_to_channel_dc():
+    # Two synthetic signals: identical AC content, second has a big per-channel
+    # DC offset. The baseline-centered RMS envelope should produce nearly
+    # identical traces (rectified-mean would not -- that's the regression).
+    rng = np.random.default_rng(7)
+    base = rng.normal(0, 1.0, size=(2000, 16))
+    drift = (np.arange(16) * 50.0).astype(np.float64)  # per-channel DC, huge
+    env_clean = emg_envelope(base, fs=1000, smooth_ms=20.0)
+    env_drifted = emg_envelope(base + drift, fs=1000, smooth_ms=20.0)
+    assert np.allclose(env_clean, env_drifted, atol=0.05)
 
 
 from emg_label.segmentation import auto_thresholds
@@ -24,6 +36,17 @@ def test_auto_thresholds_enter_above_exit():
     enter, exit_thr = auto_thresholds(act)
     assert enter > exit_thr
     assert exit_thr > np.median(act)
+
+
+def test_auto_thresholds_fallback_on_otsu_degeneracy():
+    # Near-uniform signal with a sparse outlier mass: Otsu's valley collapses
+    # because the rest-side median sits at/above the valley. The MAD-based
+    # fallback must still produce enter > exit so the segmenter can run.
+    base = 1.0
+    act = np.full(5000, base, dtype=float)
+    act[1000:1010] = base + 5.0  # rare outlier burst
+    enter, exit_thr = auto_thresholds(act)
+    assert enter > exit_thr
 
 
 def test_auto_thresholds_robust_to_high_duty_cycle():
@@ -61,6 +84,29 @@ def test_filter_merges_close_segments():
     segs = [(0, 500), (550, 1000)]
     out = filter_segments(segs, fs=1000, min_action_s=0.1, min_rest_gap_s=0.2)
     assert out == [(0, 1000)]
+
+
+from emg_label.segmentation import hold_windows
+
+
+def test_hold_windows_next_burst_for_inner_segments():
+    # hold of segment j ends at the start of segment j+1, no matter how long
+    # the gap between burst end and the next burst is.
+    segs = [(10, 20), (30, 40), (60, 80)]
+    ends = hold_windows(segs, n_samples=1000, tail_samples=50)
+    assert ends == [30, 60, min(1000, 80 + 50)]
+
+
+def test_hold_windows_last_segment_uses_tail_or_signal_end():
+    # last hold extends tail_samples past the burst end, capped by n_samples.
+    long_tail = hold_windows([(100, 200)], n_samples=1000, tail_samples=50)
+    assert long_tail == [250]
+    capped = hold_windows([(100, 200)], n_samples=210, tail_samples=50)
+    assert capped == [210]
+
+
+def test_hold_windows_empty():
+    assert hold_windows([], n_samples=100, tail_samples=10) == []
 
 
 from emg_label.config import Config

@@ -27,6 +27,7 @@ import numpy as np  # noqa: E402
 from scipy.ndimage import uniform_filter1d  # noqa: E402
 
 from emg_label.hand3d import angles_to_landmarks, draw_hand  # noqa: E402
+from emg_label.segmentation import emg_envelope  # noqa: E402
 
 
 def _side_from_meta(d, fallback="left") -> str:
@@ -66,9 +67,8 @@ def visualize(npz_path: str, out_path: str, side: str | None = None):
     t = np.arange(T) / fs
     apex = _apex_frame(ja, fs)
 
-    # Envelope = mean rectified EMG, lightly smoothed (matches segmentation).
-    env = uniform_filter1d(np.abs(emg).mean(axis=1),
-                           size=max(1, int(0.05 * fs)), mode="nearest")
+    # Envelope = baseline-centered RMS across channels (matches segmentation).
+    env = emg_envelope(emg, fs=fs, smooth_ms=50.0)
 
     fig = plt.figure(figsize=(16, 9))
     gs = fig.add_gridspec(3, 3, width_ratios=[2, 2, 1.6],
@@ -94,7 +94,7 @@ def visualize(npz_path: str, out_path: str, side: str | None = None):
     ax_env.axvline(apex / fs, color="r", ls="--", lw=0.8,
                    label=f"apex @ {apex / fs:.2f}s")
     ax_env.set_ylabel("EMG |mean| env")
-    ax_env.set_title("EMG envelope (rectified mean of 16 ch)", fontsize=10)
+    ax_env.set_title("EMG envelope (baseline-centered RMS of 16 ch)", fontsize=10)
     ax_env.set_xlim(0, t[-1])
     ax_env.legend(fontsize=8, loc="upper right")
 

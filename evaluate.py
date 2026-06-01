@@ -51,25 +51,20 @@ def _subject(source_file: str) -> str:
 def _group_features(input_dir, gdf, fs):
     """Recompute (X, cluster_ids, subjects) for one group, aligned row-for-row.
 
-    Mirrors cluster.py / plot_cluster_features.py exactly: the hold window runs
-    from a segment's start to the next segment's start (or end+fs for the last),
-    and the feature is the apex pose within it.
+    Mirrors cluster.py / plot_cluster_features.py exactly: reads each segment's
+    precomputed hold-window end and takes the apex pose within it.
     """
     feats, cids, subs = [], [], []
     for fname, fdf in gdf.groupby("source_file"):
         _, ja = io_utils.load_npz(os.path.join(input_dir, fname))
         rest = np.median(ja, axis=0)
         fdf = fdf.sort_values("start_sample")
-        starts = [int(v) for v in fdf["start_sample"].tolist()]
-        ends = [int(v) for v in fdf["end_sample"].tolist()]
-        clusters = [int(v) for v in fdf["cluster_id"].tolist()]
         subj = _subject(fname)
-        for j in range(len(starts)):
-            s = starts[j]
-            win_end = (starts[j + 1] if j + 1 < len(starts)
-                       else min(len(ja), ends[j] + fs))
-            feats.append(features.apex_pose_feature(ja, s, win_end, rest, fs))
-            cids.append(clusters[j])
+        for _, row in fdf.iterrows():
+            s = int(row["start_sample"])
+            he = int(row["hold_end_sample"])
+            feats.append(features.apex_pose_feature(ja, s, he, rest, fs))
+            cids.append(int(row["cluster_id"]))
             subs.append(subj)
         del ja
     return np.asarray(feats), np.asarray(cids), np.asarray(subs)

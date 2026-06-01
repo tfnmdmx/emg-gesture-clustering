@@ -5,18 +5,24 @@ from scipy.ndimage import uniform_filter1d
 
 
 def emg_envelope(emg, fs: int, smooth_ms: float = 150.0):
-    """Smoothed rectified EMG envelope (mean |emg| across channels).
+    """Baseline-centered RMS EMG envelope (reference's robust formulation).
 
-    This is the action/rest signal: it rises during a gesture's muscle
-    activity and falls back to baseline when the muscle relaxes between
-    gestures -- even when the hand pose has not yet returned to neutral.
-    That makes it separate consecutive non-neutral gestures cleanly, which
-    a joint-angle distance-from-rest signal cannot.
+    Per-channel baseline (median across time) is subtracted first so the
+    envelope is immune to channel DC drift; then RMS across channels measures
+    instantaneous muscle activation variance (the physiologically meaningful
+    quantity). Smoothed by a uniform window for segmentation use.
+
+    Rises during a gesture's muscle activity and falls back to baseline when
+    the muscle relaxes between gestures -- even when the hand pose has not
+    yet returned to neutral, which is what lets it separate consecutive
+    non-neutral gestures cleanly (a joint-angle distance-from-rest cannot).
     """
-    e = np.asarray(emg, dtype=float)
-    rect = np.abs(e).mean(axis=1)
+    e = np.asarray(emg, dtype=np.float64)
+    baseline = np.nanmedian(e, axis=0, keepdims=True)
+    centered = e - baseline
+    rms = np.sqrt(np.nanmean(np.square(centered), axis=1))
     win = max(1, int(round(smooth_ms / 1000.0 * fs)))
-    return uniform_filter1d(rect, size=win, mode="nearest")
+    return uniform_filter1d(rms, size=win, mode="nearest")
 
 
 def _otsu_threshold(x, nbins: int = 256) -> float:
@@ -41,7 +47,10 @@ def auto_thresholds(activity):
 
     Robust to how much of the recording is action: enter = Otsu valley,
     exit = halfway between the rest-mode center and the valley (so the
-    detector exits cleanly back into rest without flickering).
+    detector exits cleanly back into rest without flickering). Falls back
+    to ``median + 1.5 * 1.4826 * MAD`` when Otsu collapses (e.g. near-uniform
+    signal) so the segmenter never silently returns zero segments on a usable
+    recording.
     """
     a = np.asarray(activity, dtype=float)
     t = _otsu_threshold(a)
@@ -49,6 +58,14 @@ def auto_thresholds(activity):
     rest_center = float(np.median(rest)) if rest.size else float(a.min())
     enter = float(t)
     exit_thr = float(rest_center + 0.5 * (t - rest_center))
+    if enter <= exit_thr:
+        # Otsu degenerate: rest_center sits at/above the valley. Use a robust
+        # outlier-style threshold instead -- single-mode safe.
+        median = float(np.median(a))
+        mad_sigma = 1.4826 * float(np.median(np.abs(a - median)))
+        if mad_sigma > 0:
+            enter = median + 1.5 * mad_sigma
+            exit_thr = median + 0.5 * mad_sigma
     return enter, exit_thr
 
 
@@ -82,6 +99,24 @@ def filter_segments(segments, fs: int, min_action_s: float = 0.4,
         else:
             merged.append([s, e])
     return [(s, e) for s, e in merged if (e - s) >= min_action]
+
+
+def hold_windows(segments, n_samples: int, tail_samples: int):
+    """Hold-window end (exclusive) per burst segment.
+
+    The burst is the muscle activation; the *hold* is the low-EMG interval
+    after it, when the gesture pose is actually formed and held. Hold runs
+    from a burst's end up to the next burst's start. For the last segment,
+    it extends ``tail_samples`` past the end (or to the signal end).
+    """
+    n = len(segments)
+    ends = []
+    for j, (_, e) in enumerate(segments):
+        if j + 1 < n:
+            ends.append(int(segments[j + 1][0]))
+        else:
+            ends.append(int(min(n_samples, e + tail_samples)))
+    return ends
 
 
 def segment_emg(emg, config):

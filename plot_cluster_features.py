@@ -39,15 +39,11 @@ def _group_features(input_dir, gdf, fs):
         _, ja = io_utils.load_npz(os.path.join(input_dir, fname))
         rest = np.median(ja, axis=0)
         fdf = fdf.sort_values("start_sample")
-        starts = [int(v) for v in fdf["start_sample"].tolist()]
-        ends = [int(v) for v in fdf["end_sample"].tolist()]
-        clusters = [int(v) for v in fdf["cluster_id"].tolist()]
-        for j in range(len(starts)):
-            s = starts[j]
-            win_end = (starts[j + 1] if j + 1 < len(starts)
-                       else min(len(ja), ends[j] + fs))
-            feats.append(features.apex_pose_feature(ja, s, win_end, rest, fs))
-            cids.append(clusters[j])
+        for _, row in fdf.iterrows():
+            s = int(row["start_sample"])
+            he = int(row["hold_end_sample"])
+            feats.append(features.apex_pose_feature(ja, s, he, rest, fs))
+            cids.append(int(row["cluster_id"]))
         del ja
     return np.asarray(feats), np.asarray(cids)
 

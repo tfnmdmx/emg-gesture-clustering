@@ -46,6 +46,69 @@ def plot_overview(emg, activity, segments, fs, out_path,
     plt.close(fig)
 
 
+def plot_overview_dual(emg, env, pose_speed, fs, out_path,
+                       burst_segments=None, clips=None,
+                       enter_thr=None, exit_thr=None, pose_thr=None,
+                       apex_samples=None):
+    """Three-row overview for ground-truth QA: EMG raw, EMG envelope, pose speed.
+
+    Burst (EMG) segments overlay in green; pose-derived clips overlay in
+    orange (clip span) with a darker orange band for the motion sub-window.
+    Disagreement between the two segmenters is visible at a glance: any green
+    band without an orange one (or vice versa) flags a candidate for manual
+    review when building the labelled test set.
+    """
+    n = len(env)
+    t = np.arange(n) / fs
+    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
+
+    raw = np.abs(np.asarray(emg)).mean(axis=1)
+    axes[0].plot(t, raw, lw=0.5)
+    axes[0].set_ylabel("EMG |mean| (raw)")
+
+    axes[1].plot(t, np.asarray(env), lw=0.8, color="k")
+    axes[1].set_ylabel("EMG envelope")
+    if enter_thr is not None:
+        axes[1].axhline(enter_thr, color="r", ls="--", lw=0.8)
+    if exit_thr is not None:
+        axes[1].axhline(exit_thr, color="orange", ls="--", lw=0.8)
+
+    axes[2].plot(t, np.asarray(pose_speed), lw=0.8, color="navy")
+    axes[2].set_ylabel("pose speed (rad/s)")
+    axes[2].set_xlabel("time (s)")
+    if pose_thr is not None:
+        axes[2].axhline(pose_thr, color="r", ls="--", lw=0.8)
+
+    if burst_segments:
+        for idx, (s, e) in enumerate(burst_segments):
+            for ax in axes:
+                ax.axvspan(s / fs, e / fs, color="green", alpha=0.13)
+            axes[1].text((s + e) / 2 / fs, axes[1].get_ylim()[1] * 0.9,
+                         f"b{idx}", ha="center", fontsize=7, color="darkgreen")
+
+    if clips:
+        for c in clips:
+            for ax in axes:
+                ax.axvspan(c["clip_start"] / fs, c["clip_end"] / fs,
+                           color="orange", alpha=0.10)
+            axes[2].axvspan(c["motion_start"] / fs, c["motion_end"] / fs,
+                            color="orange", alpha=0.30)
+            axes[2].text((c["clip_start"] + c["clip_end"]) / 2 / fs,
+                         axes[2].get_ylim()[1] * 0.9,
+                         f"c{c['clip_id']}", ha="center", fontsize=7,
+                         color="darkorange")
+
+    if apex_samples is not None:
+        for a in apex_samples:
+            ta = a / fs
+            for ax in axes:
+                ax.axvline(ta, color="purple", ls="--", lw=0.6, alpha=0.55)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=100)
+    plt.close(fig)
+
+
 def plot_cluster_preview(centroids, counts, ids, out_path):
     k = len(centroids)
     ncol = 4

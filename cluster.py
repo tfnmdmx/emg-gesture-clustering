@@ -61,18 +61,14 @@ def main():
             rest = np.median(ja, axis=0)
             subj = str(fname).split("__")[0]
             # The distinctive held pose is the apex of joint deviation in the
-            # hold window after the burst, up to the next segment's start.
+            # hold window after the burst -- precomputed in segment.py.
             fdf = fdf.sort_values("start_sample")
-            starts = [int(v) for v in fdf["start_sample"].tolist()]
-            ends = [int(v) for v in fdf["end_sample"].tolist()]
-            order = list(fdf.index)
-            for j in range(len(order)):
-                s = starts[j]
-                win_end = (starts[j + 1] if j + 1 < len(starts)
-                           else min(len(ja), ends[j] + cfg.fs))
+            for ridx, row in fdf.iterrows():
+                s = int(row["start_sample"])
+                he = int(row["hold_end_sample"])
                 feats.append(features.apex_pose_feature(
-                    ja, s, win_end, rest, cfg.fs))
-                idxs.append(order[j])
+                    ja, s, he, rest, cfg.fs))
+                idxs.append(ridx)
                 subs.append(subj)
             del ja
         X = np.array(feats)
