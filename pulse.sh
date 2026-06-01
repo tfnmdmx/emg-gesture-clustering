@@ -1,18 +1,28 @@
 #!/usr/bin/env bash
-# pulse.sh -- one entry point for the EMG gesture segment/cluster/export pipeline.
-# Handles the conda python, OMP thread caps, pool building, and stage chaining,
-# so you don't have to remember any of it. See RUNBOOK.md.
+# pulse.sh -- one entry point for the EMG gesture pipeline. See RUNBOOK.md.
 #
+# Two flows -- pick by data shape:
+#
+# A. RAW data -> ground-truth clip gallery (path A in RUNBOOK):
+#   ./pulse.sh raw       <meta.csv | raw-dir>   segment + QC filter + clip gallery (chained)
+#   ./pulse.sh raw-segment <meta.csv | raw-dir> stage 1 only (raw input)
+#   ./pulse.sh raw-qc                            write recordings_keep.csv (informational subset)
+#   ./pulse.sh raw-export                        stage 3 only: per-clip npz/png + index.html
+#   ./pulse.sh raw-status                        show raw-flow progress
+#
+# B. PROCESSED data -> unsupervised cluster -> labeled npz (path B in RUNBOOK):
 #   ./pulse.sh pool   <batch|path> [...]   build work pool from processed_data batches
 #   ./pulse.sh segment                     stage 1: segment
-#   ./pulse.sh cluster [K]                  stage 2: cluster (K default 18; "auto" = silhouette)
-#   ./pulse.sh eval                         subject-invariance metrics (pooled runs)
-#   ./pulse.sh qc                           quality check: feature maps (+ gallery if exported)
-#   ./pulse.sh export                       stage 3: export labeled npz (+ build gallery)
-#   ./pulse.sh gallery                      build the per-label animation gallery (after export)
-#   ./pulse.sh run                          segment + cluster + eval + qc (existing pool, no batches)
-#   ./pulse.sh prep   <batch|path> [...]    pool + segment + cluster + eval + qc (everything pre-labeling)
-#   ./pulse.sh status                       show what exists so far
+#   ./pulse.sh cluster [K]                 stage 2: cluster (K default 18; "auto" = silhouette)
+#   ./pulse.sh eval                        subject-invariance metrics (pooled runs)
+#   ./pulse.sh qc                          quality check: feature maps (+ gallery if exported)
+#   ./pulse.sh export                      stage 3: export labeled npz (+ build gallery)
+#   ./pulse.sh gallery                     build the per-label animation gallery (after export)
+#   ./pulse.sh run                         segment + cluster + eval + qc (existing pool, no batches)
+#   ./pulse.sh prep   <batch|path> [...]   pool + segment + cluster + eval + qc (everything pre-labeling)
+#
+# Shared:
+#   ./pulse.sh status                      show flow-B progress
 #   ./pulse.sh help
 #
 # Config (override by exporting before calling, e.g. `OUT=out2 ./pulse.sh ...`):
@@ -38,6 +48,16 @@ fi
 : "${SUBJECT_NORM:=none}"  # per-subject feature norm: none | center | zscore (pooled runs)
 : "${N_GALLERY:=3}"        # samples per label in the animation gallery
 : "${WORKERS:=1}"          # segment.py multiprocessing workers (one per recording)
+
+# --- flow-A (raw data -> ground-truth) defaults ----------------------------
+: "${RAW_OUT:=out_pose}"           # output dir for raw-data flow
+: "${RAW_LAG_FLAGS:=ok}"           # recordings.lag_flag values to keep (comma-sep)
+: "${RAW_NAN_MAX:=0.01}"           # max pose_nan_frac to keep in recordings_keep.csv
+: "${SUBJECT:=}"                   # filter segment.py to one subject (--only-subject)
+: "${ONLY_HAND:=}"                 # filter segment.py to one hand (left|right)
+: "${NO_OVERVIEW:=0}"              # set to 1 to skip overview.png in segment.py
+: "${RAW_LIMIT:=}"                 # cap clips per source in export_clips.py
+: "${RAW_NO_PNG:=0}"               # set to 1 to skip keyframe PNG rendering
 # KMeans on this box over-subscribes threads without these caps.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
@@ -190,6 +210,114 @@ cmd_status() {
   [ -d "$OUT/segments" ] && echo "  [x] $OUT/segments/ ($(ls "$OUT/segments" 2>/dev/null | wc -l) labels, $(find "$OUT/segments" -name '*.npz' 2>/dev/null | wc -l) npz)"
 }
 
+# ---------- flow A (raw data -> ground-truth clip gallery) -----------------
+
+# Resolve the raw-flow input arg. We accept either a sample_meta.csv path or
+# a directory tree of raw npz; downstream segment.py picks the right entry
+# point based on which flag we set.
+_raw_input_to_args() {
+  local arg="$1"
+  if [ -f "$arg" ] && [[ "$arg" == *.csv ]]; then
+    echo "--meta $arg"
+  elif [ -d "$arg" ]; then
+    echo "$arg --recursive"
+  else
+    die "raw input must be a sample_meta CSV or a raw-data directory: $arg"
+  fi
+}
+
+# Build the optional-flag tail shared by raw_segment and raw_export.
+_raw_seg_extra() {
+  local extra=""
+  [ -n "$SUBJECT" ] && extra="$extra --only-subject $SUBJECT"
+  [ -n "$ONLY_HAND" ] && extra="$extra --only-hand $ONLY_HAND"
+  [ "$NO_OVERVIEW" = "1" ] && extra="$extra --no-overview"
+  echo "$extra"
+}
+
+cmd_raw_segment() {
+  [ "$#" -ge 1 ] || die "raw-segment needs <meta.csv | raw-dir>"
+  local args
+  args=$(_raw_input_to_args "$1")
+  local extra
+  extra=$(_raw_seg_extra)
+  say "stage 1 (raw): segment ($1 -> $RAW_OUT, workers=$WORKERS$extra)"
+  # shellcheck disable=SC2086
+  "$PY" segment.py $args --out "$RAW_OUT" --workers "$WORKERS" $extra
+}
+
+# Write recordings_keep.csv = subset that passes (lag_flag in $RAW_LAG_FLAGS,
+# pose_nan_frac < $RAW_NAN_MAX). Purely informational; export_clips.py still
+# reads the full clips.csv. The user decides whether to label clips from the
+# rejected recordings (typically: no).
+cmd_raw_qc() {
+  [ -f "$RAW_OUT/recordings.csv" ] || die "no $RAW_OUT/recordings.csv. run: ./pulse.sh raw-segment <input>"
+  say "QC filter: lag_flag in ($RAW_LAG_FLAGS), pose_nan_frac < $RAW_NAN_MAX"
+  "$PY" - "$RAW_OUT" "$RAW_LAG_FLAGS" "$RAW_NAN_MAX" <<'PYEOF'
+import os, sys, pandas as pd
+out_dir, flags_raw, nan_max = sys.argv[1], sys.argv[2], float(sys.argv[3])
+flags = [s.strip() for s in flags_raw.split(",") if s.strip()]
+r = pd.read_csv(os.path.join(out_dir, "recordings.csv"))
+mask = r["lag_flag"].isin(flags) & (r["pose_nan_frac"] < nan_max)
+keep = r[mask]
+keep_path = os.path.join(out_dir, "recordings_keep.csv")
+keep.to_csv(keep_path, index=False)
+print(f"keep {len(keep)}/{len(r)} recordings -> {keep_path}")
+# Bonus: per-flag breakdown so the user sees what was dropped.
+print("\nbreakdown:")
+print(r["lag_flag"].value_counts().to_string())
+print(f"\npose_nan_frac>={nan_max}: {(r['pose_nan_frac']>=nan_max).sum()} recordings")
+PYEOF
+}
+
+cmd_raw_export() {
+  [ -f "$RAW_OUT/clips.csv" ] || die "no $RAW_OUT/clips.csv. run: ./pulse.sh raw-segment <input>"
+  local extra=""
+  [ -n "$RAW_LIMIT" ] && extra="$extra --limit $RAW_LIMIT"
+  [ "$RAW_NO_PNG" = "1" ] && extra="$extra --no-png"
+  say "stage 3 (raw): export clips ($RAW_OUT/clips_export/$extra)"
+  # shellcheck disable=SC2086
+  "$PY" export_clips.py --out "$RAW_OUT" $extra
+}
+
+cmd_raw() {
+  [ "$#" -ge 1 ] || die "raw needs <meta.csv | raw-dir>. e.g. ./pulse.sh raw reference/sample_meta.csv"
+  cmd_raw_segment "$1"
+  cmd_raw_qc
+  cmd_raw_export
+  echo
+  say "RAW PIPELINE DONE. Next:"
+  echo "  1. Open $RAW_OUT/clips_export/index.html in a browser"
+  echo "  2. Fill 'gesture_label' column in $RAW_OUT/clips.csv while scanning keyframes"
+  echo "  3. (Optional) drop clips whose recording isn't in $RAW_OUT/recordings_keep.csv"
+}
+
+cmd_raw_status() {
+  echo "PY        = $PY"
+  echo "RAW_OUT   = $RAW_OUT"
+  echo "WORKERS   = $WORKERS    SUBJECT=$SUBJECT    ONLY_HAND=$ONLY_HAND"
+  echo "QC keep   = lag_flag in ($RAW_LAG_FLAGS), pose_nan_frac<$RAW_NAN_MAX"
+  for f in segments.csv clips.csv recordings.csv recordings_keep.csv; do
+    if [ -f "$RAW_OUT/$f" ]; then
+      local n; n=$(($(wc -l < "$RAW_OUT/$f") - 1))
+      echo "  [x] $RAW_OUT/$f  ($n rows)"
+    else
+      echo "  [ ] $RAW_OUT/$f"
+    fi
+  done
+  if [ -d "$RAW_OUT/shards" ]; then
+    local nshard; nshard=$(find "$RAW_OUT/shards" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    echo "  [x] $RAW_OUT/shards/  ($nshard recordings)"
+  fi
+  if [ -d "$RAW_OUT/clips_export" ]; then
+    local nnpz; nnpz=$(ls "$RAW_OUT/clips_export"/*.npz 2>/dev/null | wc -l)
+    local npng; npng=$(ls "$RAW_OUT/clips_export"/*.png 2>/dev/null | wc -l)
+    echo "  [x] $RAW_OUT/clips_export/  ($nnpz npz, $npng png)"
+    [ -f "$RAW_OUT/clips_export/index.html" ] && \
+      echo "      browse: $RAW_OUT/clips_export/index.html"
+  fi
+}
+
 cmd_help() {
   # Print the leading comment block (usage), stopping at the first code line.
   awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
@@ -197,6 +325,13 @@ cmd_help() {
 
 sub="${1:-help}"; shift || true
 case "$sub" in
+  # flow A: raw -> ground-truth clip gallery
+  raw)         cmd_raw "$@";;
+  raw-segment) cmd_raw_segment "$@";;
+  raw-qc)      cmd_raw_qc "$@";;
+  raw-export)  cmd_raw_export "$@";;
+  raw-status)  cmd_raw_status "$@";;
+  # flow B: processed -> cluster -> labeled npz
   pool)    cmd_pool "$@";;
   segment) cmd_segment "$@";;
   cluster) cmd_cluster "$@";;

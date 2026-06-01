@@ -15,13 +15,56 @@
 
 ## A. 真值集构建（主路径）
 
-### A.1 三步走
+### A.1 一条龙（推荐）
 
 ```bash
 cd /data/cl_data/action-clustering
 
-# 1) 切分：双信号 + QC + 自动跳过 force_data
-python segment.py --meta reference/sample_meta.csv --out out_pose
+# 最常见：meta CSV 喂入 + 并行 8
+WORKERS=8 ./pulse.sh raw reference/sample_meta.csv
+
+# 或：直接喂原始数据根（按 {subject}/{date-hand}/{stamp}.npz 递归）
+WORKERS=8 ./pulse.sh raw /mnt/pose_data/emg2pose/data
+```
+
+`./pulse.sh raw` 内部按顺序跑 `raw-segment → raw-qc → raw-export`：
+
+| 子步骤 | 产物 |
+|--------|------|
+| `raw-segment` | `out_pose/shards/{stem}/*` + 顶层 `segments.csv / clips.csv / recordings.csv` + `features/{stem}.npz` |
+| `raw-qc` | `out_pose/recordings_keep.csv`（lag_flag=ok & pose_nan_frac<0.01 的子集） |
+| `raw-export` | `out_pose/clips_export/<key>.{npz,png}` + `index.html`（增量刷新） |
+
+跑完打开 `out_pose/clips_export/index.html` 浏览关键帧，往 `out_pose/clips.csv` 的 `gesture_label` 列填手势名即可。
+
+### A.1.1 三步分开跑（与一条龙等价）
+
+```bash
+WORKERS=8 ./pulse.sh raw-segment reference/sample_meta.csv   # 仅 stage 1
+./pulse.sh raw-qc                                            # 仅 QC 过滤
+./pulse.sh raw-export                                        # 仅 stage 3 关键帧
+./pulse.sh raw-status                                        # 看进度
+```
+
+### A.1.2 可调环境变量（raw 流）
+
+| 变量 | 默认 | 含义 |
+|------|------|------|
+| `RAW_OUT` | `out_pose` | 输出目录 |
+| `WORKERS` | `1` | segment 并行 worker 数（每条录制独立进程） |
+| `SUBJECT` | 空 | 只处理指定 subject（透传 `--only-subject`） |
+| `ONLY_HAND` | 空 | 只处理 `left` 或 `right`（透传 `--only-hand`） |
+| `NO_OVERVIEW` | `0` | 设 `1` 跳过 `overview.png` 渲染（提速） |
+| `RAW_LAG_FLAGS` | `ok` | QC 保留的 lag_flag（逗号分隔，可加 `early`/`late`） |
+| `RAW_NAN_MAX` | `0.01` | QC `pose_nan_frac` 上限 |
+| `RAW_LIMIT` | 空 | 每个 source_file 限制导出 clip 数（采样查看） |
+| `RAW_NO_PNG` | `0` | 设 `1` 跳过关键帧 PNG（无 torch 时用） |
+
+### A.1.3 裸命令等价（不想用 wrapper）
+
+```bash
+# 1) 切分（含 features 缓存 + shard 落盘 + 顶层 csv 汇总）
+python segment.py --meta reference/sample_meta.csv --out out_pose --workers 8
 
 # 2) 按 QC 过滤可信子集（lag 健康 + NaN 占比低）
 python -c "
@@ -34,9 +77,6 @@ keep.to_csv('out_pose/recordings_keep.csv', index=False)
 
 # 3) 导出 clip 切片 + 6 帧关键帧 + HTML 浏览页
 python export_clips.py --out out_pose
-# → 打开 out_pose/clips_export/index.html，浏览每个 clip 的关键帧
-# → 在 out_pose/clips.csv 的 gesture_label 列填上手势名
-# → clips.csv 就是你的真值集
 ```
 
 ### A.2 数据源三种喂法
