@@ -60,7 +60,8 @@ def build(out_root, subdir, n, max_frames, fps, clean):
 
     # entries[group] = list of {label, samples=[{stem, rel, meta}]}
     entries = {}
-    total_html = 0
+    total_html = n_cached = 0
+    index_path = os.path.join(anim_root, "index.html")
     for label in labels:
         files = sorted(glob.glob(os.path.join(seg_root, label, "*.npz")))[:n]
         if not files:
@@ -73,8 +74,14 @@ def build(out_root, subdir, n, max_frames, fps, clean):
         for npz in files:
             stem = os.path.splitext(os.path.basename(npz))[0]
             out_path = os.path.join(out_dir, stem + ".html")
-            animate(npz, out_path, max_frames=max_frames, fps=fps)
-            total_html += 1
+            # Skip-detection: HTML already rendered -> reuse it. The animate
+            # output is a deterministic function of the input npz, so an
+            # existing file is the same artifact a fresh run would produce.
+            if os.path.isfile(out_path) and not clean:
+                n_cached += 1
+            else:
+                animate(npz, out_path, max_frames=max_frames, fps=fps)
+                total_html += 1
             m = _meta(npz)
             samples.append({
                 "stem": stem,
@@ -83,10 +90,12 @@ def build(out_root, subdir, n, max_frames, fps, clean):
             })
         grp = samples[0]["meta"]["group"]
         entries.setdefault(grp, []).append({"label": label, "samples": samples})
+        # Refresh index after each label so a long run is browsable mid-way.
+        _write_index(index_path, entries, n)
 
-    index_path = os.path.join(anim_root, "index.html")
     _write_index(index_path, entries, n)
-    print(f"\nWrote {total_html} animation HTMLs across {len(labels)} labels")
+    print(f"\nWrote {total_html} animation HTMLs ({n_cached} cached) "
+          f"across {len(labels)} labels")
     print(f"Index: {index_path}")
 
 

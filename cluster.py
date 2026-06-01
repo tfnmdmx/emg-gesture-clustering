@@ -51,26 +51,54 @@ def main():
 
     seg_df["cluster_id"] = -1
     template_rows = []
+    features_dir = os.path.join(cfg.out_dir, "features")
+    cache_hit = cache_miss = 0
 
     for group, gdf in seg_df.groupby("group"):
         feats, idxs, subs = [], [], []
-        # Load each source file once, extract all its segments' features,
-        # then release it -- keeps memory flat across large file sets.
+        # Per-source feature extraction. Prefer the cache that segment.py
+        # writes under out/features/{stem}.npz -- apex_pose_feature is a
+        # deterministic function of (joint_angles, start, hold_end, rest, fs),
+        # so cached and recomputed values are bit-identical.
         for fname, fdf in gdf.groupby("source_file"):
-            _, ja = io_utils.load_npz(os.path.join(args.input_dir, fname))
-            rest = np.median(ja, axis=0)
             subj = str(fname).split("__")[0]
-            # The distinctive held pose is the apex of joint deviation in the
-            # hold window after the burst -- precomputed in segment.py.
             fdf = fdf.sort_values("start_sample")
+            stem = str(fname)
+            if stem.endswith(".npz"):
+                stem = stem[:-4]
+            cache_path = os.path.join(features_dir, stem + ".npz")
+            if os.path.isfile(cache_path):
+                d = np.load(cache_path)
+                feat_by_seg = {int(k): v
+                               for k, v in zip(d["seg_idx"], d["feature"])}
+                missing = [int(r["seg_idx"]) for _, r in fdf.iterrows()
+                           if int(r["seg_idx"]) not in feat_by_seg]
+                if missing:
+                    # Stale cache (e.g. params changed) -> recompute this file.
+                    print(f"features stale for {fname} "
+                          f"({len(missing)} seg_idx missing); recomputing")
+                    feat_by_seg = None
+                else:
+                    cache_hit += 1
+            else:
+                feat_by_seg = None
+
+            if feat_by_seg is None:
+                _, ja = io_utils.load_npz(os.path.join(args.input_dir, fname))
+                rest = np.median(ja, axis=0)
+                feat_by_seg = {}
+                for _, row in fdf.iterrows():
+                    s = int(row["start_sample"])
+                    he = int(row["hold_end_sample"])
+                    feat_by_seg[int(row["seg_idx"])] = (
+                        features.apex_pose_feature(ja, s, he, rest, cfg.fs))
+                del ja
+                cache_miss += 1
+
             for ridx, row in fdf.iterrows():
-                s = int(row["start_sample"])
-                he = int(row["hold_end_sample"])
-                feats.append(features.apex_pose_feature(
-                    ja, s, he, rest, cfg.fs))
+                feats.append(feat_by_seg[int(row["seg_idx"])])
                 idxs.append(ridx)
                 subs.append(subj)
-            del ja
         X = np.array(feats)
         # Cluster on per-subject normalized features when requested; keep raw X
         # for the centroids below (FK rendering needs absolute joint angles).
@@ -100,6 +128,7 @@ def main():
     seg_df.to_csv(os.path.join(cfg.out_dir, "segments_clustered.csv"), index=False)
     pd.DataFrame(template_rows).to_csv(
         os.path.join(cfg.out_dir, "labels_template.csv"), index=False)
+    print(f"features cache: {cache_hit} hit, {cache_miss} miss")
     print("Wrote segments_clustered.csv and labels_template.csv")
     print(f"-> Fill the 'label' column in {cfg.out_dir}/labels_template.csv "
           f"and save as {cfg.out_dir}/labels.csv")

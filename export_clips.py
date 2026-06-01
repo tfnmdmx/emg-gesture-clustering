@@ -171,6 +171,9 @@ def main():
                     help="skip keyframe rendering (no torch needed)")
     ap.add_argument("--limit", type=int, default=None,
                     help="export at most N clips per source file (for sampling)")
+    ap.add_argument("--force", action="store_true",
+                    help="re-export clips even if their .npz (+ .png unless "
+                         "--no-png) already exist under clips_export/.")
     args = ap.parse_args()
 
     clips_path = os.path.join(args.out, "clips.csv")
@@ -184,9 +187,10 @@ def main():
     os.makedirs(export_dir, exist_ok=True)
 
     n_npz = n_png = 0
-    n_png_failed = 0
+    n_png_failed = n_npz_cached = n_png_cached = 0
     entries_by_source: dict[str, list] = {}
     png_disabled = args.no_png
+    index_path = os.path.join(export_dir, "index.html")
 
     fk_disabled = png_disabled  # FK fallback gets disabled separately on torch failure
     for source_file, gdf in df.groupby("source_file"):
@@ -203,46 +207,89 @@ def main():
         hand = str(row0.get("hand", "")).strip() or None
         info = io_utils.parse_file_info(src_path)
         side = hand or info.hand or "left"
-        emg, ja = io_utils.load_npz(src_path, hand=side)
-        skel = None if png_disabled else io_utils.load_skeleton(src_path, hand=side)
 
         rows = gdf if args.limit is None else gdf.head(args.limit)
+
+        # Skip-detection: from the clips.csv row derive {key}, then check
+        # whether {key}.npz (+ {key}.png unless png-disabled) already exist.
+        # Defer the heavy load_npz / load_skeleton until at least one row of
+        # this source actually needs (re)processing -- a fully-cached source
+        # then costs zero IO.
+        def _row_done(row):
+            key = _clip_key(info.stem, row["clip_id"])
+            npz_done = os.path.isfile(os.path.join(export_dir, key + ".npz"))
+            png_done = (png_disabled
+                        or os.path.isfile(
+                            os.path.join(export_dir, key + ".png")))
+            return npz_done and png_done
+
+        needs_work = (args.force
+                      or any(not _row_done(r) for _, r in rows.iterrows()))
+
+        emg = ja = skel = None
+        if needs_work:
+            emg, ja = io_utils.load_npz(src_path, hand=side)
+            skel = (None if png_disabled
+                    else io_utils.load_skeleton(src_path, hand=side))
+
+        n_new = n_cached = 0
         for _, row in rows.iterrows():
             key = _clip_key(info.stem, row["clip_id"])
+            npz_out = os.path.join(export_dir, key + ".npz")
+            png_out = os.path.join(export_dir, key + ".png")
+            npz_exists = os.path.isfile(npz_out)
+            png_exists = os.path.isfile(png_out)
+
+            cached = (not args.force) and npz_exists and (
+                png_disabled or png_exists)
+            if cached:
+                n_cached += 1
+                n_npz_cached += 1
+                if png_exists and not png_disabled:
+                    n_png_cached += 1
+                entries_by_source.setdefault(source_file, []).append({
+                    "key": key, "row": row,
+                    "png_rel": (key + ".png") if (
+                        not png_disabled and png_exists) else None,
+                    "npz_rel": key + ".npz",
+                })
+                continue
+
             cs = int(row["clip_start_sample"])
             ce = int(row["clip_end_sample"])
             n_clip = ce - cs
 
             # --- Write the slice ------------------------------------------
-            npz_out = os.path.join(export_dir, key + ".npz")
-            np.savez(
-                npz_out,
-                emg=emg[cs:ce], joint_angles=ja[cs:ce],
-                fs=int(args.fs),
-                clip_start=cs, clip_end=ce,
-                static_in_start=int(row["static_in_start_sample"]),
-                static_in_end=int(row["static_in_end_sample"]),
-                motion_start=int(row["motion_start_sample"]),
-                motion_end=int(row["motion_end_sample"]),
-                static_out_start=int(row["static_out_start_sample"]),
-                static_out_end=int(row["static_out_end_sample"]),
-                apex=int(row["apex_sample"]),
-                source_file=str(source_file),
-                group=str(row["group"]),
-                subject=str(row.get("subject", "")),
-                hand=str(row.get("hand", side)),
-                clip_id=int(row["clip_id"]),
-                matched_emg_seg_idx=int(row.get("matched_emg_seg_idx", -1)),
-            )
-            n_npz += 1
+            if args.force or not npz_exists:
+                tmp = npz_out + "._tmp_.npz"
+                np.savez(
+                    tmp,
+                    emg=emg[cs:ce], joint_angles=ja[cs:ce],
+                    fs=int(args.fs),
+                    clip_start=cs, clip_end=ce,
+                    static_in_start=int(row["static_in_start_sample"]),
+                    static_in_end=int(row["static_in_end_sample"]),
+                    motion_start=int(row["motion_start_sample"]),
+                    motion_end=int(row["motion_end_sample"]),
+                    static_out_start=int(row["static_out_start_sample"]),
+                    static_out_end=int(row["static_out_end_sample"]),
+                    apex=int(row["apex_sample"]),
+                    source_file=str(source_file),
+                    group=str(row["group"]),
+                    subject=str(row.get("subject", "")),
+                    hand=str(row.get("hand", side)),
+                    clip_id=int(row["clip_id"]),
+                    matched_emg_seg_idx=int(row.get("matched_emg_seg_idx", -1)),
+                )
+                os.replace(tmp, npz_out)
+                n_npz += 1
 
             # --- Render keyframes ----------------------------------------
             # Skeleton-based rendering (raw Manus XYZ) is preferred -- no
             # torch needed and matches reference's visualization. FK fallback
             # handles processed data where only joint_angles is present.
-            png_out = os.path.join(export_dir, key + ".png")
-            png_made = False
-            if not png_disabled:
+            png_made = png_exists  # keep cached PNG if we didn't redo it
+            if not png_disabled and (args.force or not png_exists):
                 rel = _keyframe_indices(row, n_clip)
                 titles = [
                     f"clip_start (0.00s)",
@@ -252,41 +299,54 @@ def main():
                     f"apex ({rel[4] / args.fs:.2f}s)",
                     f"clip_end ({rel[5] / args.fs:.2f}s)",
                 ]
+                tmp_png = png_out + ".tmp.png"
                 try:
                     if skel is not None:
                         _render_keyframes_skeleton(
-                            png_out, skel[cs:ce], rel, titles)
+                            tmp_png, skel[cs:ce], rel, titles)
                     elif not fk_disabled:
                         _render_keyframes_fk(
-                            png_out, ja[cs:ce], rel, titles, side)
+                            tmp_png, ja[cs:ce], rel, titles, side)
                     else:
                         raise RuntimeError("no renderer available")
+                    os.replace(tmp_png, png_out)
                     n_png += 1
                     png_made = True
                 except ModuleNotFoundError as ex:
-                    # FK path needs torch; skeleton path doesn't. If FK is
-                    # what failed, disable it for the rest of the run.
+                    if os.path.exists(tmp_png):
+                        os.remove(tmp_png)
                     print(f"WARN: keyframe FK unavailable ({ex}); "
-                          f"disabling FK fallback for remaining clips. "
-                          f"Use raw Manus data (with manus_*_skeleton) to get "
-                          f"PNGs without torch.")
+                          f"disabling FK fallback for remaining clips.")
                     fk_disabled = True
                 except Exception as ex:
+                    if os.path.exists(tmp_png):
+                        os.remove(tmp_png)
                     n_png_failed += 1
                     print(f"WARN: keyframe render failed for {key}: {ex}")
 
+            n_new += 1
             entries_by_source.setdefault(source_file, []).append({
                 "key": key, "row": row,
                 "png_rel": (key + ".png") if png_made else None,
                 "npz_rel": key + ".npz",
             })
-        del emg, ja
-        print(f"{source_file}: exported {len(rows)} clips")
+        if emg is not None:
+            del emg, ja
+        if n_cached and not n_new:
+            print(f"{source_file}: {n_cached} cached (all)")
+        elif n_cached:
+            print(f"{source_file}: exported {n_new} clips, {n_cached} cached")
+        else:
+            print(f"{source_file}: exported {n_new} clips")
 
-    index_path = os.path.join(export_dir, "index.html")
+        # Stream index.html so the gallery is browsable mid-run.
+        _write_index(index_path, entries_by_source, args.fs)
+
     _write_index(index_path, entries_by_source, args.fs)
     print()
-    print(f"Wrote {n_npz} npz, {n_png} PNGs ({n_png_failed} failed) to {export_dir}")
+    print(f"Wrote {n_npz} npz ({n_npz_cached} cached), "
+          f"{n_png} PNGs ({n_png_cached} cached, {n_png_failed} failed) "
+          f"to {export_dir}")
     print(f"Open {index_path} and fill `gesture_label` in {clips_path}")
 
 

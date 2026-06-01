@@ -32,19 +32,44 @@ from sklearn.metrics import silhouette_samples  # noqa: E402
 from emg_label import features, io_utils  # noqa: E402
 
 
-def _group_features(input_dir, gdf, fs):
-    """Recompute (X, cluster_ids) for one group -- identical to cluster.py."""
+def _group_features(input_dir, gdf, fs, features_dir=None):
+    """Recompute (X, cluster_ids) for one group -- identical to cluster.py.
+
+    Prefers the per-recording cache that segment.py writes to
+    ``<out>/features/{stem}.npz`` (deterministic, bit-identical). Falls back
+    to reloading the npz and recomputing apex features when the cache is
+    absent or stale.
+    """
     feats, cids = [], []
     for fname, fdf in gdf.groupby("source_file"):
-        _, ja = io_utils.load_npz(os.path.join(input_dir, fname))
-        rest = np.median(ja, axis=0)
         fdf = fdf.sort_values("start_sample")
+        stem = str(fname)
+        if stem.endswith(".npz"):
+            stem = stem[:-4]
+        cache_path = (os.path.join(features_dir, stem + ".npz")
+                      if features_dir else None)
+        feat_by_seg = None
+        if cache_path and os.path.isfile(cache_path):
+            d = np.load(cache_path)
+            feat_by_seg = {int(k): v
+                           for k, v in zip(d["seg_idx"], d["feature"])}
+            missing = [int(r["seg_idx"]) for _, r in fdf.iterrows()
+                       if int(r["seg_idx"]) not in feat_by_seg]
+            if missing:
+                feat_by_seg = None
+        if feat_by_seg is None:
+            _, ja = io_utils.load_npz(os.path.join(input_dir, fname))
+            rest = np.median(ja, axis=0)
+            feat_by_seg = {}
+            for _, row in fdf.iterrows():
+                s = int(row["start_sample"])
+                he = int(row["hold_end_sample"])
+                feat_by_seg[int(row["seg_idx"])] = (
+                    features.apex_pose_feature(ja, s, he, rest, fs))
+            del ja
         for _, row in fdf.iterrows():
-            s = int(row["start_sample"])
-            he = int(row["hold_end_sample"])
-            feats.append(features.apex_pose_feature(ja, s, he, rest, fs))
+            feats.append(feat_by_seg[int(row["seg_idx"])])
             cids.append(int(row["cluster_id"]))
-        del ja
     return np.asarray(feats), np.asarray(cids)
 
 
@@ -158,10 +183,15 @@ def main():
     clu = pd.read_csv(os.path.join(args.out, "segments_clustered.csv"))
     fmap_dir = os.path.join(args.out, "feature_maps")
     cache_dir = os.path.join(args.out, "feature_cache")
+    features_dir = os.path.join(args.out, "features")
     os.makedirs(fmap_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
 
     for group, gdf in clu.groupby("group"):
+        out_path = os.path.join(fmap_dir, f"{group}_features.png")
+        if os.path.exists(out_path) and not args.force:
+            print(f"[{group}] CACHED {out_path}")
+            continue
         cache = os.path.join(cache_dir, f"{group}.npz")
         if os.path.exists(cache) and not args.force:
             z = np.load(cache)
@@ -169,9 +199,9 @@ def main():
             print(f"[{group}] loaded cached features {X.shape}")
         else:
             print(f"[{group}] computing features ...")
-            X, cids = _group_features(args.input_dir, gdf, args.fs)
+            X, cids = _group_features(args.input_dir, gdf, args.fs,
+                                      features_dir=features_dir)
             np.savez(cache, X=X, cids=cids)
-        out_path = os.path.join(fmap_dir, f"{group}_features.png")
         plot_group(group, X, cids, out_path, do_tsne=not args.no_tsne)
 
 
