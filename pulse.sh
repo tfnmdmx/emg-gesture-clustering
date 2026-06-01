@@ -37,6 +37,7 @@ fi
 : "${GROUP_BY:=subject-hand}"   # subject-hand (per subject+hand) | hand | all
 : "${SUBJECT_NORM:=none}"  # per-subject feature norm: none | center | zscore (pooled runs)
 : "${N_GALLERY:=3}"        # samples per label in the animation gallery
+: "${WORKERS:=1}"          # segment.py multiprocessing workers (one per recording)
 # KMeans on this box over-subscribes threads without these caps.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
@@ -93,8 +94,8 @@ PYEOF
 
 cmd_segment() {
   [ -d "$POOL" ] || die "no pool. run: ./pulse.sh pool <batches...>"
-  say "stage 1: segment ($POOL -> $OUT)"
-  "$PY" segment.py "$POOL" --out "$OUT"
+  say "stage 1: segment ($POOL -> $OUT, workers=$WORKERS)"
+  "$PY" segment.py "$POOL" --out "$OUT" --workers "$WORKERS"
 }
 
 cmd_cluster() {

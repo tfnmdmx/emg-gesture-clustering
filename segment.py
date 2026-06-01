@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import glob
 import os
 
@@ -369,6 +370,11 @@ def main():
                          "(local rerun).")
     ap.add_argument("--only-hand", choices=["left", "right"], default=None,
                     help="process only recordings with this hand.")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel worker processes (one per recording). "
+                         "Each recording is fully independent so this scales "
+                         "near-linearly until disk IO saturates. Default 1 "
+                         "(sequential).")
     args = ap.parse_args()
 
     cfg = Config(
@@ -419,24 +425,60 @@ def main():
         print("No work after --only-* filters.")
         return
 
+    # Pre-filter cached shards so workers never spawn for already-done items
+    # (each pool worker startup costs ~50-100ms; not worth paying for a no-op).
+    todo = []
     n_cached = n_done = n_skip = 0
     for path, info in work:
-        # Shard-level skip: recording.csv is the commit-point sentinel from a
-        # prior successful run. --force bypasses it.
         if not args.force and shard_complete(cfg.out_dir, info.stem):
             print(f"CACHED {info.stem}")
             n_cached += 1
-            continue
-        ok = process_one(path, info, cfg,
-                         write_overview=not args.no_overview)
-        if ok:
-            n_done += 1
         else:
-            n_skip += 1
+            todo.append((path, info))
+
+    write_overview = not args.no_overview
+    if todo and args.workers > 1:
+        # multiprocessing: process_one is fully self-contained -- it only
+        # reads cfg/info/path and writes to shards/{stem}/ + features/{stem}.npz
+        # -- so workers never contend for the same output paths. cfg is a
+        # frozen-ish dataclass (picklable); FileInfo is too.
+        from multiprocessing import Pool
+        worker_fn = functools.partial(
+            _worker, cfg=cfg, write_overview=write_overview)
+        with Pool(args.workers) as pool:
+            for ok in pool.imap_unordered(worker_fn, todo):
+                if ok:
+                    n_done += 1
+                else:
+                    n_skip += 1
+    else:
+        for path, info in todo:
+            ok = process_one(path, info, cfg,
+                             write_overview=write_overview)
+            if ok:
+                n_done += 1
+            else:
+                n_skip += 1
+
     print(f"\nshards: {n_done} new, {n_cached} cached, {n_skip} skipped "
           f"({n_done + n_cached + n_skip} total)")
 
     rebuild_index(cfg.out_dir)
+
+
+def _worker(item, cfg, write_overview):
+    """multiprocessing.Pool entry. Top-level so it pickles cleanly."""
+    # Cap intra-process BLAS threading when we're running many workers --
+    # otherwise N workers x OMP_NUM_THREADS easily oversubscribes the box.
+    # threadpoolctl is best-effort; numpy's already initialised when fork()s
+    # inherit it, so env vars set here wouldn't take effect.
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+    except ImportError:
+        pass
+    path, info = item
+    return process_one(path, info, cfg, write_overview=write_overview)
 
 
 if __name__ == "__main__":
