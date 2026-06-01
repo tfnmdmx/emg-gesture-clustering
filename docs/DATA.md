@@ -123,7 +123,21 @@
 - 多人单手：fgw0917 L160、pkj0309 L246、wjh0111 L126、wyl0101 L191
 - 多人多手：以上四人 L + R（fgw R100、pkj R120、wjh R189、wyl R120）
 
-### 4.1 跑某一组（池已建好，跳过 pool 步骤）
+### 4.1 多人左手扩展池（被试数缩放：4 → 6 → 全部）
+
+为研究"被试数增加对跨人聚类的影响"，在左手上另切两个规模递增的池。同样**只保留纯 `left`**（排除 `v33/v71/flat` 变体与无手别文件）。
+
+| 数据组 | 池目录 | 被试 | 文件数 |
+|---|---|---|--:|
+| 4 人左手 | `work_pool_4users` | fgw0917, ghd1108, hzy1217, lsh0126 | 429（主实验，见汇报文档） |
+| 6 人左手 | `work_pool_6users_left` | 上述 4 人 + myy0129, wxg0901 | 1678 |
+| 全部左手 | `work_pool_all_left` | 23 名有纯左手数据的被试全部 | 3024 |
+
+- **嵌套设计**：6 人池 = 主实验 4 人集的超集（再加文件量最大的 myy0129、wxg0901），可直接做 4→6→全部 的规模对比。
+- 全部左手池含 23 名被试（每人纯左手文件数见 §2 / `data_summary.csv`）。
+- 这两个池的成员清单同样写入 [../data_groups.csv](../data_groups.csv)（group = `6users_left` / `all_left`）。
+
+### 4.2 跑某一组（池已建好，跳过 pool 步骤）
 
 ```bash
 # 例：多人单手，k=18
@@ -141,9 +155,9 @@ POOL=work_pool_multi_single OUT=out_multi_single ./pulse.sh qc
   ```
 - `hand`：跨被试按左/右手合池（双手组研究左右手时用）。
 
-### 4.2 重建数据组池
+### 4.3 重建数据组池
 
-四个池是按 §1 规则从 `data_inventory.csv` 筛选（纯 left/right、排除变体）后 symlink 而成。改动成员口径后重跑生成脚本即可覆盖各 `work_pool_*` 与 `data_groups.csv`。
+所有数据组池都是按 §1 规则从 `data_inventory.csv` 筛选（纯 left/right、排除变体与无手别）后 symlink 而成。改动成员口径后重跑生成脚本即可覆盖各 `work_pool_*` 与 `data_groups.csv`。
 
 ---
 
