@@ -143,12 +143,13 @@ GROUP_BY=hand ./pulse.sh cluster 18    # 只按左/右手分两组(跨被试合�
 
 ```bash
 cd /data/cl_data/action-clustering
-# 池已建好(work_pool_4users);一条龙:全局聚类 + 按被试 z-score + 评估
-POOL=work_pool_4users OUT=out_4users_zscore GROUP_BY=all SUBJECT_NORM=zscore ./pulse.sh run
+# 旧池/输出已归档到 old_data/(见示例);直接用归档跑或先重建一个新池均可。
+# 一条龙:全局聚类 + 按被试 z-score + 评估(写到一个新输出,不动归档)
+POOL=old_data/work_pool_4users OUT=out_4users_zscore GROUP_BY=all SUBJECT_NORM=zscore ./pulse.sh run
 
 # 只想看指标 / 换归一化方式对比(无需重切):
-POOL=work_pool_4users OUT=out_4users         SUBJECT_NORM=none   ./pulse.sh eval   # 基线
-POOL=work_pool_4users OUT=out_4users_center  GROUP_BY=all SUBJECT_NORM=center ./pulse.sh run
+POOL=old_data/work_pool_4users OUT=old_data/out_4users SUBJECT_NORM=none ./pulse.sh eval   # 基线
+POOL=old_data/work_pool_4users OUT=out_4users_center  GROUP_BY=all SUBJECT_NORM=center ./pulse.sh run
 ```
 
 `SUBJECT_NORM`:`center` 减各被试特征均值(去一阶矩,几乎消除*线性*被试可分性);`zscore` 再除各被试标准差(去对角二阶矩,进一步降按人聚)。归一化只作用于聚类特征,簇心仍用**原始绝对姿态**渲染 3D 手图;对单被试组为空操作。
