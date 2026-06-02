@@ -1,0 +1,103 @@
+<!doctype html><meta charset=utf-8><title>Clip 打标</title>
+<script src="/plotly.min.js"></script>
+<style>
+  body{font-family:-apple-system,Segoe UI,sans-serif;margin:0;color:#222;height:100vh;display:flex;flex-direction:column}
+  #top{display:flex;gap:14px;align-items:center;padding:8px 14px;background:#f4f4f4;border-bottom:1px solid #ddd;font-size:13px;flex-wrap:wrap}
+  #main{flex:1;display:flex;min-height:0}
+  #list{width:320px;overflow:auto;border-right:1px solid #eee;font-size:12px}
+  #list .folder{padding:5px 8px;background:#eef1f4;border-bottom:1px solid #e0e0e0;cursor:pointer;font-weight:600;position:sticky;top:0;word-break:break-all}
+  #list .folder small{font-weight:400;color:#666}
+  #list .folder.fdone{color:#2e7d32}
+  #list .folder.freview small{color:#c62828}
+  #list .row{padding:4px 10px 4px 22px;border-bottom:1px solid #f4f4f4;cursor:pointer;line-height:1.3;word-break:break-all}
+  #list .row small{color:#888}
+  .cdot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle;border:1px solid #bbb;background:transparent}
+  .cdot.c1{background:#f5a623;border-color:#f5a623}
+  .cdot.c2{background:#2e7d32;border-color:#2e7d32}
+  .folder small .cdone{color:#2e7d32}
+  #list .row.sel{background:#e8f0fe}
+  #list .row.done{border-left:4px solid #2e7d32}
+  #list .row.review{border-left:4px solid #c62828}
+  #list .row.todo{border-left:4px solid #ccc}
+  #center{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}
+  #viz{display:flex;gap:10px;align-items:flex-start}
+  #ovwrap{position:relative;flex:1;min-width:0;cursor:pointer}
+  #ovimg{width:100%;display:block;border:1px solid #ddd}
+  #ovhead{position:absolute;top:0;bottom:0;width:2px;background:#1a73e8;pointer-events:none}
+  #handwrap{position:relative;width:340px;flex:none}
+  #hand{width:100%;height:340px;border:1px solid #eee}
+  #handprog{position:absolute;left:0;right:0;top:0;height:16px;background:rgba(0,0,0,.08);display:none;z-index:2}
+  #handprog.on{display:block}
+  #handprogfill{height:100%;width:0;background:#1a73e8;transition:width .25s}
+  #handprog.done #handprogfill{background:#2e7d32}
+  #handproglabel{position:absolute;left:6px;top:0;height:16px;line-height:16px;font-size:10px;color:#222}
+  #transport{display:flex;align-items:center;gap:10px;font-size:13px}
+  #transport #scrub{flex:1}
+  #play{width:38px;font-size:15px;cursor:pointer}
+  #segchips{display:flex;flex-wrap:wrap;gap:6px;padding-top:4px;border-top:1px solid #eee}
+  .seg{padding:3px 9px;border-radius:12px;font-size:12px;cursor:pointer;border:2px solid transparent;background:#9e9e9e;color:#fff;user-select:none}
+  .seg.done{background:#2e7d32}
+  .seg.review{border-color:#c62828}
+  .seg.cur{outline:3px solid #1a73e8;outline-offset:1px}
+  #bottom{border-top:1px solid #ddd;background:#fafafa;padding:8px 14px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;font-size:13px}
+  #bottom .field{display:flex;flex-direction:column;gap:2px}
+  #bottom input{padding:6px;font-size:14px}
+  #label{width:220px} #note{width:200px}
+  .btn{padding:7px 12px;cursor:pointer}
+  .chip{display:inline-block;background:#eee;border-radius:10px;padding:1px 8px;margin:1px;font-size:11px}
+  .warn{color:#c62828;font-weight:600}
+  .qc{color:#555;font-size:12px;line-height:1.5}
+</style>
+<div id=top>
+  <span id=progress>0/0</span>
+  <label>录制 <select id=filter>
+    <option value=all>全部</option>
+    <option value=todo selected>未标完</option>
+    <option value=review>有复核</option>
+    <option value=done>已标完</option>
+  </select></label>
+  <input id=search placeholder="搜索 subject/stem" style="width:150px">
+  <label>排序 <select id=sort>
+    <option value=review>复核优先</option>
+    <option value=order>原序</option>
+  </select></label>
+  <label>labeler <input id=labeler style="width:90px" value=""></label>
+  <button class=btn id=export>导出 clips_labeled.csv</button>
+  <span id=msg></span>
+</div>
+<div id=main>
+  <div id=list></div>
+  <div id=center>
+    <div id=viz>
+      <div id=ovwrap>
+        <img id=ovimg alt="overview">
+        <div id=ovhead></div>
+      </div>
+      <div id=handwrap>
+        <div id=handprog><div id=handprogfill></div><span id=handproglabel></span></div>
+        <div id=hand></div>
+      </div>
+    </div>
+    <div id=transport>
+      <button id=play>▶</button>
+      <input type=range id=scrub min=0 max=1000 value=0>
+      <span id=tread>0.00 / 0.00s</span>
+      <label>速度 <select id=pbspeed>
+        <option value=0.5>0.5×</option>
+        <option value=1 selected>1×</option>
+        <option value=2>2×</option>
+      </select></label>
+    </div>
+    <div id=segchips></div>
+  </div>
+</div>
+<div id=bottom>
+  <div id=meta class=qc></div>
+  <div class=field><label>gesture_label</label>
+    <input id=label list=labellist autocomplete=off><datalist id=labellist></datalist></div>
+  <div class=field><label>note</label><input id=note autocomplete=off></div>
+  <button class=btn id=save>保存并下一个 ⏎</button>
+  <button class=btn id=skip>跳过(丢弃)</button>
+  <div class=qc><div id=hotkeys>⏎ 保存并下一个 · ↑↓ 切换段 · 空格 播放/暂停 · 1-9 套用常用标签</div><div id=common></div></div>
+</div>
+<script src="/app.js"></script>

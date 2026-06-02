@@ -107,42 +107,49 @@ def plot_overview_dual(env, pose_speed, fs, out_path,
             for ax in axes[:2]:
                 ax.axvline(ta, color="purple", ls="--", lw=0.6, alpha=0.55)
 
-    # --- Row 2: kept (matched) segments numbered s1, s2, ... ----------------
+    # --- Row 2: ALL clips (top, s1..sN in time order = labelling chips) and
+    #            ALL bursts (bottom, b0..). Matched clips get a darker, edged
+    #            span; clip-only / burst-only ones still appear (faint / green).
     ax_m = axes[2]
-    ax_m.set_ylabel("kept segments")
+    ax_m.set_ylabel("clips / bursts")
     ax_m.set_xlabel("time (s)")
     ax_m.set_ylim(0, 1)
     ax_m.set_yticks([])
     ax_m.set_xlim(0, n / fs)
     ax_m.axhline(0.5, color="lightgray", lw=0.5, zorder=0)
 
-    if clips and clip_to_burst is not None and burst_segments:
-        # Pair up matched (clip, burst) in clip-order, drop unmatched, then
-        # re-sort by clip start so s1..sN reads left-to-right in time.
-        matched = []
+    n_c = n_b = 0
+    if clips:
+        order = []
         for ci, c in enumerate(clips):
-            bi = int(clip_to_burst[ci])
-            if bi < 0 or bi >= len(burst_segments):
-                continue
-            matched.append((c["clip_start"], c, burst_segments[bi]))
-        matched.sort(key=lambda x: x[0])
-
-        for s_idx, (_, c, (bs, be)) in enumerate(matched, start=1):
-            # Clip span (orange) -- the full labelling window.
+            bi = int(clip_to_burst[ci]) if clip_to_burst is not None else -1
+            matched = bool(burst_segments) and 0 <= bi < len(burst_segments)
+            order.append((c["clip_start"], c, matched))
+        order.sort(key=lambda x: x[0])
+        show_lab = len(order) <= 40        # skip labels when too dense to read
+        for s_idx, (_, c, matched) in enumerate(order, start=1):
             ax_m.axvspan(c["clip_start"] / fs, c["clip_end"] / fs,
-                         ymin=0.55, ymax=0.95, color="orange", alpha=0.45)
-            # Burst span (green) -- the EMG-side support that confirms it.
-            ax_m.axvspan(bs / fs, be / fs,
-                         ymin=0.10, ymax=0.45, color="green", alpha=0.45)
-            mid = (c["clip_start"] + c["clip_end"]) / 2 / fs
-            ax_m.text(mid, 0.5, f"s{s_idx}", ha="center", va="center",
-                      fontsize=8, fontweight="bold", color="black",
-                      bbox=dict(boxstyle="round,pad=0.15",
-                                fc="white", ec="gray", lw=0.5, alpha=0.85))
-        ax_m.set_title(f"{len(matched)} matched segments "
-                       f"(burst ∩ clip)", fontsize=9, loc="left")
-    else:
-        ax_m.set_title("no matched segments", fontsize=9, loc="left")
+                         ymin=0.55, ymax=0.95, color="orange",
+                         alpha=0.45 if matched else 0.18,
+                         ec="darkorange" if matched else "none", lw=0.6)
+            if show_lab:
+                ax_m.text((c["clip_start"] + c["clip_end"]) / 2 / fs, 0.75,
+                          f"s{s_idx}", ha="center", va="center", fontsize=7,
+                          fontweight="bold", color="black",
+                          bbox=dict(boxstyle="round,pad=0.1", fc="white",
+                                    ec="gray", lw=0.4, alpha=0.85))
+        n_c = len(order)
+    if burst_segments:
+        show_b = len(burst_segments) <= 40
+        for b_idx, (bs, be) in enumerate(burst_segments):
+            ax_m.axvspan(bs / fs, be / fs, ymin=0.05, ymax=0.45,
+                         color="green", alpha=0.35)
+            if show_b:
+                ax_m.text((bs + be) / 2 / fs, 0.25, f"b{b_idx}", ha="center",
+                          va="center", fontsize=6, color="darkgreen")
+        n_b = len(burst_segments)
+    ax_m.set_title(f"{n_c} clips (s1..s{n_c}) / {n_b} bursts "
+                   f"(darker = burst∩clip matched)", fontsize=9, loc="left")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=100)

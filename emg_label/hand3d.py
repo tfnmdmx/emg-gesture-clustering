@@ -59,16 +59,28 @@ def _get_calculator(side: str):
     return calc
 
 
+def _to_radians(a):
+    """Manus ``*_ergonomics`` joint angles are in DEGREES (range ~±60); emg2pose
+    FK expects RADIANS. Feeding degrees twists the fingers into a blob. Convert
+    when the values clearly look like degrees (|angle| > 2π somewhere); leave
+    genuine radian inputs (e.g. emg2pose's own joint_angles) untouched."""
+    finite = a[np.isfinite(a)]
+    if finite.size and float(np.max(np.abs(finite))) > 2 * np.pi:
+        return a * (np.pi / 180.0)
+    return a
+
+
 def angles_to_landmarks(angles20, side="left"):
-    """20 joint angles (rad) -> (21, 3) landmark positions in mm.
+    """20 joint angles -> (21, 3) landmark positions in mm.
 
     Uses emg2pose forward kinematics. The landmark order matches
     LANDMARK_NAMES / BONE_CONNECTIONS (copied from the user's
     visualize_hand_3d.py and consistent with emg2pose's angles_to_positions
     output). For ``side='right'`` we mirror X after FK (see _get_calculator).
+    Degree inputs (Manus ergonomics) are auto-converted to radians.
     """
     calc = _get_calculator(side)
-    a = np.asarray(angles20, dtype=np.float32).reshape(1, 20)
+    a = _to_radians(np.asarray(angles20, dtype=np.float32).reshape(1, 20))
     pos = np.asarray(calc.angles_to_positions(a))[0]
     if (side or "left").lower() == "right":
         pos = pos.copy()
@@ -77,9 +89,10 @@ def angles_to_landmarks(angles20, side="left"):
 
 
 def angles_batch_to_landmarks(angles_batch, side="left"):
-    """Batch version: (N, 20) -> (N, 21, 3) in mm. Single FK call."""
+    """Batch version: (N, 20) -> (N, 21, 3) in mm. Single FK call.
+    Degree inputs (Manus ergonomics) are auto-converted to radians."""
     calc = _get_calculator(side)
-    a = np.asarray(angles_batch, dtype=np.float32).reshape(-1, 20)
+    a = _to_radians(np.asarray(angles_batch, dtype=np.float32).reshape(-1, 20))
     pos = np.asarray(calc.angles_to_positions(a))
     if (side or "left").lower() == "right":
         pos = pos.copy()

@@ -9,6 +9,8 @@
 #   ./pulse.sh raw-qc                            write recordings_keep.csv (informational subset)
 #   ./pulse.sh raw-export                        stage 3 only: per-clip npz/png + index.html
 #   ./pulse.sh raw-status                        show raw-flow progress
+#   ./pulse.sh label                             interactive web UI to hand-label clips (writes labels.csv)
+#   ./pulse.sh label-prewarm                     pre-render hand-frame cache (WORKERS=N) so first open is instant
 #
 # B. PROCESSED data -> unsupervised cluster -> labeled npz (path B in RUNBOOK):
 #   ./pulse.sh pool   <batch|path> [...]   build work pool from processed_data batches
@@ -318,6 +320,18 @@ cmd_raw_status() {
   fi
 }
 
+cmd_label() {
+  : "${PORT:=8000}" ; : "${HOST:=127.0.0.1}"
+  say "interactive labelling UI: $RAW_OUT -> http://$HOST:$PORT"
+  exec "$PY" label_server.py --out "$RAW_OUT" --host "$HOST" --port "$PORT"
+}
+
+cmd_label_prewarm() {
+  : "${WORKERS:=4}"
+  say "prewarm hand-frame cache for $RAW_OUT (workers=$WORKERS)"
+  exec "$PY" prewarm_hands.py --out "$RAW_OUT" --workers "$WORKERS" "$@"
+}
+
 cmd_help() {
   # Print the leading comment block (usage), stopping at the first code line.
   awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
@@ -331,6 +345,8 @@ case "$sub" in
   raw-qc)      cmd_raw_qc "$@";;
   raw-export)  cmd_raw_export "$@";;
   raw-status)  cmd_raw_status "$@";;
+  label)         cmd_label "$@";;
+  label-prewarm) cmd_label_prewarm "$@";;
   # flow B: processed -> cluster -> labeled npz
   pool)    cmd_pool "$@";;
   segment) cmd_segment "$@";;
