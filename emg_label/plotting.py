@@ -46,63 +46,103 @@ def plot_overview(emg, activity, segments, fs, out_path,
     plt.close(fig)
 
 
-def plot_overview_dual(emg, env, pose_speed, fs, out_path,
+def plot_overview_dual(env, pose_speed, fs, out_path,
                        burst_segments=None, clips=None,
+                       clip_to_burst=None,
                        enter_thr=None, exit_thr=None, pose_thr=None,
                        apex_samples=None):
-    """Three-row overview for ground-truth QA: EMG raw, EMG envelope, pose speed.
+    """Three-row overview for ground-truth QA.
 
-    Burst (EMG) segments overlay in green; pose-derived clips overlay in
-    orange (clip span) with a darker orange band for the motion sub-window.
-    Disagreement between the two segmenters is visible at a glance: any green
-    band without an orange one (or vice versa) flags a candidate for manual
-    review when building the labelled test set.
+    Row 0: EMG envelope + burst spans (green, labelled b{idx}).
+    Row 1: pose speed + clip spans (orange, labelled c{clip_id}); the motion
+           sub-window inside each clip is filled darker.
+    Row 2: matched ("kept") segments only -- clips with a paired EMG burst
+           (clip_to_burst[i] >= 0). Each kept segment is a vertical stack of
+           the orange clip span + the green burst span, numbered s1, s2, ...
+           in time order. This is the high-confidence subset both segmenters
+           agree on -- the primary ground-truth candidate set.
+
+    Disagreement still surfaces in rows 0/1: a green band without an orange
+    one (or vice versa) flags a manual-review candidate, and is absent from
+    row 2 by construction.
     """
     n = len(env)
     t = np.arange(n) / fs
     fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
 
-    raw = np.abs(np.asarray(emg)).mean(axis=1)
-    axes[0].plot(t, raw, lw=0.5)
-    axes[0].set_ylabel("EMG |mean| (raw)")
-
-    axes[1].plot(t, np.asarray(env), lw=0.8, color="k")
-    axes[1].set_ylabel("EMG envelope")
+    axes[0].plot(t, np.asarray(env), lw=0.8, color="k")
+    axes[0].set_ylabel("EMG envelope")
     if enter_thr is not None:
-        axes[1].axhline(enter_thr, color="r", ls="--", lw=0.8)
+        axes[0].axhline(enter_thr, color="r", ls="--", lw=0.8)
     if exit_thr is not None:
-        axes[1].axhline(exit_thr, color="orange", ls="--", lw=0.8)
+        axes[0].axhline(exit_thr, color="orange", ls="--", lw=0.8)
 
-    axes[2].plot(t, np.asarray(pose_speed), lw=0.8, color="navy")
-    axes[2].set_ylabel("pose speed (rad/s)")
-    axes[2].set_xlabel("time (s)")
+    axes[1].plot(t, np.asarray(pose_speed), lw=0.8, color="navy")
+    axes[1].set_ylabel("pose speed (rad/s)")
     if pose_thr is not None:
-        axes[2].axhline(pose_thr, color="r", ls="--", lw=0.8)
+        axes[1].axhline(pose_thr, color="r", ls="--", lw=0.8)
 
     if burst_segments:
         for idx, (s, e) in enumerate(burst_segments):
-            for ax in axes:
+            for ax in axes[:2]:
                 ax.axvspan(s / fs, e / fs, color="green", alpha=0.13)
-            axes[1].text((s + e) / 2 / fs, axes[1].get_ylim()[1] * 0.9,
+            axes[0].text((s + e) / 2 / fs, axes[0].get_ylim()[1] * 0.9,
                          f"b{idx}", ha="center", fontsize=7, color="darkgreen")
 
     if clips:
         for c in clips:
-            for ax in axes:
+            for ax in axes[:2]:
                 ax.axvspan(c["clip_start"] / fs, c["clip_end"] / fs,
                            color="orange", alpha=0.10)
-            axes[2].axvspan(c["motion_start"] / fs, c["motion_end"] / fs,
+            axes[1].axvspan(c["motion_start"] / fs, c["motion_end"] / fs,
                             color="orange", alpha=0.30)
-            axes[2].text((c["clip_start"] + c["clip_end"]) / 2 / fs,
-                         axes[2].get_ylim()[1] * 0.9,
+            axes[1].text((c["clip_start"] + c["clip_end"]) / 2 / fs,
+                         axes[1].get_ylim()[1] * 0.9,
                          f"c{c['clip_id']}", ha="center", fontsize=7,
                          color="darkorange")
 
     if apex_samples is not None:
         for a in apex_samples:
             ta = a / fs
-            for ax in axes:
+            for ax in axes[:2]:
                 ax.axvline(ta, color="purple", ls="--", lw=0.6, alpha=0.55)
+
+    # --- Row 2: kept (matched) segments numbered s1, s2, ... ----------------
+    ax_m = axes[2]
+    ax_m.set_ylabel("kept segments")
+    ax_m.set_xlabel("time (s)")
+    ax_m.set_ylim(0, 1)
+    ax_m.set_yticks([])
+    ax_m.set_xlim(0, n / fs)
+    ax_m.axhline(0.5, color="lightgray", lw=0.5, zorder=0)
+
+    if clips and clip_to_burst is not None and burst_segments:
+        # Pair up matched (clip, burst) in clip-order, drop unmatched, then
+        # re-sort by clip start so s1..sN reads left-to-right in time.
+        matched = []
+        for ci, c in enumerate(clips):
+            bi = int(clip_to_burst[ci])
+            if bi < 0 or bi >= len(burst_segments):
+                continue
+            matched.append((c["clip_start"], c, burst_segments[bi]))
+        matched.sort(key=lambda x: x[0])
+
+        for s_idx, (_, c, (bs, be)) in enumerate(matched, start=1):
+            # Clip span (orange) -- the full labelling window.
+            ax_m.axvspan(c["clip_start"] / fs, c["clip_end"] / fs,
+                         ymin=0.55, ymax=0.95, color="orange", alpha=0.45)
+            # Burst span (green) -- the EMG-side support that confirms it.
+            ax_m.axvspan(bs / fs, be / fs,
+                         ymin=0.10, ymax=0.45, color="green", alpha=0.45)
+            mid = (c["clip_start"] + c["clip_end"]) / 2 / fs
+            ax_m.text(mid, 0.5, f"s{s_idx}", ha="center", va="center",
+                      fontsize=8, fontweight="bold", color="black",
+                      bbox=dict(boxstyle="round,pad=0.15",
+                                fc="white", ec="gray", lw=0.5, alpha=0.85))
+        ax_m.set_title(f"{len(matched)} matched segments "
+                       f"(burst ∩ clip)", fontsize=9, loc="left")
+    else:
+        ax_m.set_title("no matched segments", fontsize=9, loc="left")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=100)

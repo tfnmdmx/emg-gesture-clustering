@@ -121,10 +121,13 @@ def process_one(path: str, info, cfg: Config,
         return False
     try:
         emg, ja = io_utils.load_npz(path, hand=info.hand)
-    except (KeyError, ValueError) as ex:
-        # Raw session dirs contain non-sample npz (norm_stats.npz etc.) and
-        # broken recordings -- skip rather than abort a long run.
-        print(f"SKIP {os.path.basename(path)}: {ex}")
+    except Exception as ex:
+        # Wide net: KeyError/ValueError (non-sample npz like norm_stats.npz,
+        # bad shape), UnpicklingError + BadZipFile + EOFError (truncated or
+        # zero-filled file -- seen on /mnt/pose_data over flaky NFS), OSError
+        # (transient FS errors). One bad recording must not abort a parallel
+        # run; log the full path so the user can inspect/delete after.
+        print(f"SKIP {info.stem} ({type(ex).__name__}: {ex}) path={path}")
         return False
     n = len(emg)
 
@@ -271,8 +274,9 @@ def process_one(path: str, info, cfg: Config,
     if write_overview:
         _atomic_plot_overview(
             paths["overview"],
-            emg=emg, env=env, pose_speed=spd, fs=cfg.fs,
+            env=env, pose_speed=spd, fs=cfg.fs,
             burst_segments=segs, clips=clips,
+            clip_to_burst=clip_to_burst,
             enter_thr=enter, exit_thr=exit_thr, pose_thr=pose_thr,
             apex_samples=burst_apexes,
         )
@@ -467,7 +471,13 @@ def main():
 
 
 def _worker(item, cfg, write_overview):
-    """multiprocessing.Pool entry. Top-level so it pickles cleanly."""
+    """multiprocessing.Pool entry. Top-level so it pickles cleanly.
+
+    Catches *any* unexpected exception so one rogue recording can't kill the
+    whole pool (Pool.imap_unordered re-raises and shuts down on first miss).
+    process_one already catches file-load errors; this is the belt-and-braces
+    for anything else (matplotlib memory hiccup, numpy ufunc edge case).
+    """
     # Cap intra-process BLAS threading when we're running many workers --
     # otherwise N workers x OMP_NUM_THREADS easily oversubscribes the box.
     # threadpoolctl is best-effort; numpy's already initialised when fork()s
@@ -478,7 +488,13 @@ def _worker(item, cfg, write_overview):
     except ImportError:
         pass
     path, info = item
-    return process_one(path, info, cfg, write_overview=write_overview)
+    try:
+        return process_one(path, info, cfg, write_overview=write_overview)
+    except Exception as ex:
+        import traceback
+        print(f"WORKER ERROR {info.stem} ({type(ex).__name__}: {ex}) "
+              f"path={path}\n{traceback.format_exc()}")
+        return False
 
 
 if __name__ == "__main__":
