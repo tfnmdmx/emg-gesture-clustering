@@ -1,5 +1,7 @@
 <!doctype html><meta charset=utf-8><title>Clip 打标</title>
-<script src="/plotly.min.js"></script>
+<!-- defer: 4.5MB plotly must NOT block first paint (over a slow VSCode tunnel a
+     render-blocking <head> script leaves the page blank until it finishes). -->
+<script defer src="/plotly.min.js"></script>
 <style>
   body{font-family:-apple-system,Segoe UI,sans-serif;margin:0;color:#222;height:100vh;display:flex;flex-direction:column}
   #top{display:flex;gap:14px;align-items:center;padding:8px 14px;background:#f4f4f4;border-bottom:1px solid #ddd;font-size:13px;flex-wrap:wrap}
@@ -19,6 +21,7 @@
   #list .row.done{border-left:4px solid #2e7d32}
   #list .row.review{border-left:4px solid #c62828}
   #list .row.todo{border-left:4px solid #ccc}
+  #list .row.recinvalid{border-left:4px solid #444;text-decoration:line-through;opacity:.55}
   #center{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}
   #viz{display:flex;gap:10px;align-items:flex-start}
   #ovwrap{position:relative;flex:1;min-width:0;cursor:pointer}
@@ -37,6 +40,7 @@
   #segchips{display:flex;flex-wrap:wrap;gap:6px;padding-top:4px;border-top:1px solid #eee}
   .seg{padding:3px 9px;border-radius:12px;font-size:12px;cursor:pointer;border:2px solid transparent;background:#9e9e9e;color:#fff;user-select:none}
   .seg.done{background:#2e7d32}
+  .seg.invalid{background:#444;text-decoration:line-through;opacity:.75}
   .seg.review{border-color:#c62828}
   .seg.cur{outline:3px solid #1a73e8;outline-offset:1px}
   #bottom{border-top:1px solid #ddd;background:#fafafa;padding:8px 14px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;font-size:13px}
@@ -97,7 +101,8 @@
     <input id=label list=labellist autocomplete=off><datalist id=labellist></datalist></div>
   <div class=field><label>note</label><input id=note autocomplete=off></div>
   <button class=btn id=save>保存并下一个 ⏎</button>
-  <button class=btn id=skip>跳过(丢弃)</button>
-  <div class=qc><div id=hotkeys>⏎ 保存并下一个 · ↑↓ 切换段 · 空格 播放/暂停 · 1-9 套用常用标签</div><div id=common></div></div>
+  <button class=btn id=invalid>标记此段无效 (x)</button>
+  <button class=btn id=recinvalid title="整条录制无效，不参与打标/聚类/导出 (Shift+X)">整条录制无效 (X)</button>
+  <div class=qc><div id=hotkeys>⏎ 保存并下一个 · x 标记无效段 · Shift+X 整条录制无效 · ↑↓ 切换段 · 空格 播放/暂停 · 1-9 套用常用标签</div><div id=common></div></div>
 </div>
 <script src="/app.js"></script>

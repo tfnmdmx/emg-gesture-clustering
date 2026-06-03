@@ -5,10 +5,11 @@ let STATE = {
   expanded: new Set(),  // expanded folder keys in the left tree
   rec: null,            // loaded recording payload (segments=clips + frame grid)
   cur: null,            // currently selected clip (segment) = labelling target
-  labels_used: [], total_clips: 0, total_labeled: 0,
+  labels_used: [], total_clips: 0, total_labeled: 0, total_invalid: 0, total_invalid_rec: 0,
   t: 0, playing: false, raf: null,
   curHandFrame: -1, handPoll: null, handEpoch: 0,
   faces: null, wantFrame: 0, meshReady: false,   // 3D hand mesh state
+  handVerts: [], handN: 0,   // in-memory per-frame vertices (preloaded -> jitter-free playback)
 };
 
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -23,38 +24,65 @@ const ovX0 = () => (STATE.rec && STATE.rec.ov_x0 != null ? STATE.rec.ov_x0 : OVX
 const ovX1 = () => (STATE.rec && STATE.rec.ov_x1 != null ? STATE.rec.ov_x1 : OVX1);
 const recDur = () => (STATE.rec ? STATE.rec.duration_s : 0);
 
+// Bind helper: never let a missing/renamed element abort the whole boot (which
+// would leave a blank page). Logs which id was missing instead.
+function on(id, ev, fn) {
+  const el = document.getElementById(id);
+  if (el) el[ev] = fn;
+  else console.warn('missing element #' + id);
+}
+
+// Plotly loads deferred (4.5MB, non-blocking) so the tree paints immediately;
+// the 3D hand mesh awaits it here rather than blocking the whole page.
+function whenPlotly() {
+  if (window.Plotly) return Promise.resolve();
+  return new Promise(res => {
+    const t = setInterval(() => { if (window.Plotly) { clearInterval(t); res(); } }, 50);
+  });
+}
+
 async function boot() {
-  const d = await (await fetch('/api/recordings')).json();
-  STATE.recordings = d.recordings;
-  STATE.labels_used = d.labels_used;
-  STATE.total_clips = d.total_clips;
-  STATE.total_labeled = d.total_labeled;
-  refreshDatalist();
-  document.getElementById('filter').onchange = applyRecFilter;
-  document.getElementById('sort').onchange = applyRecFilter;
-  document.getElementById('search').oninput = applyRecFilter;
-  document.getElementById('save').onclick = () => saveLabel(true);
-  document.getElementById('skip').onclick = () => { setLabelInput(''); saveLabel(true); };
-  document.getElementById('export').onclick = doExport;
-  document.getElementById('play').onclick = togglePlay;
-  document.getElementById('scrub').oninput = e => { stop(); setTime(e.target.value / 1000 * recDur()); };
-  document.getElementById('list').onclick = e => {
-    const fh = e.target.closest('.folder');
-    if (fh) {
-      const f = fh.dataset.folder;
-      STATE.expanded.has(f) ? STATE.expanded.delete(f) : STATE.expanded.add(f);
-      return renderRecList();
-    }
-    const row = e.target.closest('.row');
-    if (row) selectRecordingIdx(+row.dataset.i);
-  };
-  document.getElementById('segchips').onclick = e => {
-    const c = e.target.closest('.seg');
-    if (c && STATE.rec) selectClip(STATE.rec.segments[+c.dataset.i]);
-  };
-  document.onkeydown = onKey;
-  applyRecFilter();
-  renderProgress();
+  try {
+    const d = await (await fetch('/api/recordings')).json();
+    STATE.recordings = d.recordings || [];
+    STATE.labels_used = d.labels_used || [];
+    STATE.total_clips = d.total_clips || 0;
+    STATE.total_labeled = d.total_labeled || 0;
+    STATE.total_invalid = d.total_invalid || 0;
+    STATE.total_invalid_rec = d.total_invalid_rec || 0;
+    refreshDatalist();
+    on('filter', 'onchange', applyRecFilter);
+    on('sort', 'onchange', applyRecFilter);
+    on('search', 'oninput', applyRecFilter);
+    on('save', 'onclick', () => saveLabel(true));
+    on('invalid', 'onclick', () => markInvalid());
+    on('recinvalid', 'onclick', () => toggleRecordingInvalid());
+    on('export', 'onclick', doExport);
+    on('play', 'onclick', togglePlay);
+    on('scrub', 'oninput', e => { stop(); setTime(e.target.value / 1000 * recDur()); });
+    on('list', 'onclick', e => {
+      const fh = e.target.closest('.folder');
+      if (fh) {
+        const f = fh.dataset.folder;
+        STATE.expanded.has(f) ? STATE.expanded.delete(f) : STATE.expanded.add(f);
+        return renderRecList();
+      }
+      const row = e.target.closest('.row');
+      if (row) selectRecordingIdx(+row.dataset.i);
+    });
+    on('segchips', 'onclick', e => {
+      const c = e.target.closest('.seg');
+      if (c && STATE.rec) selectClip(STATE.rec.segments[+c.dataset.i]);
+    });
+    document.onkeydown = onKey;
+    applyRecFilter();
+    renderProgress();
+  } catch (e) {
+    console.error('boot failed', e);
+    document.body.insertAdjacentHTML('afterbegin',
+      '<div style="background:#fee;color:#900;padding:10px;font:13px monospace;' +
+      'white-space:pre-wrap">boot 失败: ' + ((e && e.stack) || e) + '</div>');
+  }
 }
 
 // ---- recordings list ------------------------------------------------------
@@ -65,13 +93,13 @@ function applyRecFilter() {
   let v = STATE.recordings.filter(r => {
     if (q && !(r.stem.toLowerCase().includes(q) ||
                (r.subject || '').toLowerCase().includes(q))) return false;
-    const done = r.n_labeled >= r.n_clips;
+    const done = recDone(r);                 // labelled+invalid clips, or whole rec invalid
     if (f === 'todo') return !done;
     if (f === 'review') return r.n_review > 0 && !done;
     if (f === 'done') return done;
     return true;
   });
-  const pending = r => (r.n_review > 0 && r.n_labeled < r.n_clips) ? 1 : 0;
+  const pending = r => (r.n_review > 0 && !recDone(r)) ? 1 : 0;
   if (s === 'review') v.sort((a, b) => pending(b) - pending(a));
   STATE.recView = v;
   // searching: expand all matching folders so results are visible
@@ -82,6 +110,11 @@ function applyRecFilter() {
   else if (v.length) selectRecordingIdx(0);
 }
 
+const reviewed = r => (r.n_labeled || 0) + (r.n_invalid || 0);  // triaged clips
+// A recording is "done" when every clip is triaged OR the whole recording is
+// marked invalid (excluded from labelling/clustering).
+const recDone = r => !!r.rec_invalid || reviewed(r) >= r.n_clips;
+
 // Left tree: recordings grouped by source folder; folders collapsible.
 function renderRecList() {
   const folders = [], byFolder = new Map();
@@ -89,25 +122,29 @@ function renderRecList() {
     if (!byFolder.has(r.folder)) { byFolder.set(r.folder, []); folders.push(r.folder); }
     byFolder.get(r.folder).push(i);
   });
-  const sum = (idxs, k) => idxs.reduce((a, i) => a + STATE.recView[i][k], 0);
+  const sum = (idxs, fn) => idxs.reduce((a, i) => a + fn(STATE.recView[i]), 0);
   const html = folders.map(folder => {
     const idxs = byFolder.get(folder);
-    const nLab = sum(idxs, 'n_labeled'), nClip = sum(idxs, 'n_clips'), nRev = sum(idxs, 'n_review');
+    const nLab = sum(idxs, r => r.n_labeled), nClip = sum(idxs, r => r.n_clips);
+    const nInv = sum(idxs, r => r.n_invalid || 0), nRev = sum(idxs, r => r.n_review);
+    const nRecInv = idxs.filter(i => STATE.recView[i].rec_invalid).length;
     const nCached = idxs.filter(i => STATE.recView[i].cached >= 2).length;
     const exp = STATE.expanded.has(folder);
-    const fcls = nLab >= nClip ? 'fdone' : (nRev > 0 ? 'freview' : '');
+    const allDone = idxs.every(i => recDone(STATE.recView[i]));
+    const fcls = allDone ? 'fdone' : (nRev > 0 ? 'freview' : '');
     let h = `<div class="folder ${fcls}" data-folder="${esc(folder)}">` +
       `${exp ? '▾' : '▸'} ${esc(folderShort(folder))} ` +
-      `<small>${idxs.length}录制 · ${nLab}/${nClip}${nRev ? ` · ⚠${nRev}` : ''}` +
+      `<small>${idxs.length}录制 · ${nLab}/${nClip}${nInv ? ` ✗${nInv}` : ''}${nRecInv ? ` ⊘${nRecInv}` : ''}${nRev ? ` · ⚠${nRev}` : ''}` +
       `${nCached ? ` · <span class=cdone>🎬${nCached}</span>` : ''}</small></div>`;
     if (exp) h += idxs.map(i => {
       const r = STATE.recView[i];
-      const cls = r.n_labeled >= r.n_clips ? 'done' : (r.n_review > 0 ? 'review' : 'todo');
+      const cls = r.rec_invalid ? 'recinvalid'
+        : (reviewed(r) >= r.n_clips ? 'done' : (r.n_review > 0 ? 'review' : 'todo'));
       const sel = STATE.rec && STATE.rec.stem === r.stem ? ' sel' : '';
       const dot = `<span class="cdot c${r.cached || 0}" title="3D缓存: ${['无','部分','完成'][r.cached || 0]}"></span>`;
       return `<div class="row ${cls}${sel}" data-i="${i}" title="${esc(r.stem)}">` +
-        `${dot}${esc(recShort(r.stem))} <small>${r.n_labeled}/${r.n_clips}` +
-        `${r.n_review ? ` ⚠${r.n_review}` : ''}</small></div>`;
+        `${dot}${esc(recShort(r.stem))} <small>${r.rec_invalid ? '⊘整条无效'
+          : `${r.n_labeled}/${r.n_clips}${r.n_invalid ? ` ✗${r.n_invalid}` : ''}${r.n_review ? ` ⚠${r.n_review}` : ''}`}</small></div>`;
     }).join('');
     return h;
   }).join('');
@@ -124,7 +161,7 @@ async function selectRecordingIdx(i) {
   if (!STATE.rec) return;
   renderRecList();
   const segs = STATE.rec.segments;
-  const seg = segs.find(s => !s.gesture_label) || segs[0];
+  const seg = segs.find(s => !s.gesture_label && !s.invalid) || segs[0];
   if (seg) selectClip(seg);
 }
 
@@ -138,7 +175,8 @@ function refreshDatalist() {
 
 function renderProgress() {
   document.getElementById('progress').textContent =
-    `${STATE.total_labeled}/${STATE.total_clips}`;
+    `已标 ${STATE.total_labeled} · 无效段 ${STATE.total_invalid}` +
+    `${STATE.total_invalid_rec ? ` · ⊘录制 ${STATE.total_invalid_rec}` : ''} / ${STATE.total_clips}`;
 }
 
 // ---- recording: overview img + hand frames --------------------------------
@@ -150,13 +188,17 @@ async function loadRecording(stem) {
   buildOverview(d);
   buildHand(d);
   renderChips();
+  updateRecInvalidBtn();
 }
 
-const OV = (stem) => '/api/overview?stem=' + encodeURIComponent(stem);
+// Version the URL by duration+frame count so a re-segmented/regenerated overview
+// (e.g. a corrected duration) never gets served stale from the browser cache.
+const OV = (stem, ver) => '/api/overview?stem=' + encodeURIComponent(stem) +
+  (ver != null ? '&v=' + encodeURIComponent(ver) : '');
 function buildOverview(d) {
   const img = document.getElementById('ovimg');
   img.onerror = () => { img.removeAttribute('src'); document.getElementById('msg').textContent = 'overview.png 缺失（--no-overview?）'; };
-  img.src = OV(d.stem);
+  img.src = OV(d.stem, `${d.duration_s}_${d.n_frames}`);
   document.getElementById('ovwrap').onclick = e => {
     const r = img.getBoundingClientRect();
     if (!r.width) return;
@@ -195,11 +237,14 @@ async function buildHand(d) {
   STATE.handEpoch += 1;
   STATE.wantFrame = 0;
   STATE.meshReady = false;
+  STATE.handVerts = new Array(d.n_frames || 0);  // fresh in-memory frame buffer
+  STATE.handN = d.n_frames || 0;
   document.getElementById('handprog').classList.remove('on', 'done');
   if (!STATE.faces) STATE.faces = await (await fetch('/api/handfaces')).json();
   const epoch = STATE.handEpoch;
   const v = await fetchVerts(d.stem, 0);
   if (epoch !== STATE.handEpoch) return;         // recording switched mid-fetch
+  STATE.handVerts[0] = v;
   const xs = v.map(p => p[0]), ys = v.map(p => p[1]), zs = v.map(p => p[2]);
   const [lo, hi] = cube(xs, ys, zs);
   const f = STATE.faces;
@@ -219,6 +264,8 @@ async function buildHand(d) {
       camera: { eye: { x: 1.5, y: -1.5, z: 0.9 } },
     },
   };
+  await whenPlotly();                              // deferred 4.5MB lib may still be loading
+  if (epoch !== STATE.handEpoch) return;
   Plotly.newPlot('hand', [trace], layout, { displaylogo: false, responsive: true });
   STATE.meshReady = true; STATE.curHandFrame = 0;
   preloadHands(d.stem, d.n_frames, STATE.handEpoch);
@@ -231,22 +278,34 @@ function markCached(stem, level) {
   if (r && (r.cached || 0) < level) { r.cached = level; renderRecList(); }
 }
 
+// Pull every frame's vertices into STATE.handVerts so playback restyles from
+// memory (no per-frame fetch -> no network jitter / dropped frames).
 function preloadHands(stem, n, epoch) {
   let next = 0;
-  const PAR = 3;                         // warm browser cache for smooth playback
-  const load = () => {
+  const PAR = 6;
+  const one = () => {
     if (epoch !== STATE.handEpoch || next >= n) return;
-    fetch(handUrl(stem, next++)).then(r => r.text()).then(load, load);
+    const fi = next++;
+    if (STATE.handVerts[fi]) return one();        // already have it (e.g. frame 0)
+    fetch(handUrl(stem, fi))
+      .then(r => r.json())
+      .then(m => { if (epoch === STATE.handEpoch) STATE.handVerts[fi] = m.v; })
+      .catch(() => {})
+      .finally(one);
   };
-  for (let k = 0; k < PAR; k++) load();
+  for (let k = 0; k < PAR; k++) one();
 }
 
 async function updateHand(fi) {
   if (!STATE.rec || !STATE.meshReady || fi === STATE.curHandFrame) return;
   STATE.wantFrame = fi;
   const stem = STATE.rec.stem;
-  const v = await fetchVerts(stem, fi);
-  if (!STATE.rec || stem !== STATE.rec.stem || fi !== STATE.wantFrame) return;  // stale
+  let v = STATE.handVerts[fi];
+  if (!v) {                              // not preloaded yet -> fetch on demand
+    v = await fetchVerts(stem, fi);
+    if (!STATE.rec || stem !== STATE.rec.stem || fi !== STATE.wantFrame) return;  // stale
+    STATE.handVerts[fi] = v;
+  }
   STATE.curHandFrame = fi;
   Plotly.restyle('hand', { x: [v.map(p => p[0])], y: [v.map(p => p[1])], z: [v.map(p => p[2])] });
 }
@@ -336,18 +395,19 @@ function stop() {
 function renderChips() {
   if (!STATE.rec) return;
   document.getElementById('segchips').innerHTML = STATE.rec.segments.map((s, i) => {
-    const done = !!s.gesture_label;
-    const cls = `seg ${done ? 'done' : 'todo'}${s.review ? ' review' : ''}` +
+    const state = s.invalid ? 'invalid' : (s.gesture_label ? 'done' : 'todo');
+    const cls = `seg ${state}${s.review ? ' review' : ''}` +
       `${STATE.cur && STATE.cur.key === s.key ? ' cur' : ''}`;
-    return `<div class="${cls}" data-i="${i}" title="${s.key}${s.review ? ' · burst=-1 复核' : ''}">` +
-      `s${s.s}${s.gesture_label ? ' ' + s.gesture_label : ''}</div>`;
+    const txt = s.invalid ? `s${s.s} ✗` : `s${s.s}${s.gesture_label ? ' ' + s.gesture_label : ''}`;
+    return `<div class="${cls}" data-i="${i}" title="${s.key}${s.review ? ' · burst=-1 复核' : ''}">${txt}</div>`;
   }).join('');
 }
 
 function selectClip(seg) {
   STATE.cur = seg;
   document.getElementById('meta').innerHTML =
-    `<b>s${seg.s} · c${String(seg.clip_id).padStart(4, '0')}</b><br>` +
+    `<b>s${seg.s} · c${String(seg.clip_id).padStart(4, '0')}</b>` +
+    `${seg.invalid ? ' <span class=warn>[已标记无效]</span>' : ''}<br>` +
     `dur ${seg.duration_s.toFixed(2)}s · motion ${seg.motion_duration_s.toFixed(2)}s<br>` +
     `env_peak ${seg.envelope_peak.toFixed(1)} · pose_range ${seg.pose_range.toFixed(2)}<br>` +
     (seg.review ? `<span class=warn>matched_burst = -1（优先复核）</span>` : `burst ${seg.matched_emg_seg_idx}`);
@@ -360,37 +420,79 @@ function selectClip(seg) {
 
 function setLabelInput(v) { document.getElementById('label').value = v; }
 
-async function saveLabel(advance) {
+// shared writer for both "save gesture label" and "mark invalid"
+async function postLabel(gesture_label, invalid, advance) {
   const seg = STATE.cur; if (!seg) return;
-  const gesture_label = document.getElementById('label').value.trim();
   const note = document.getElementById('note').value.trim();
   const labeler = document.getElementById('labeler').value.trim();
   const res = await (await fetch('/api/label', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key: seg.key, gesture_label, labeler, note })
+    body: JSON.stringify({ key: seg.key, gesture_label, invalid, labeler, note })
   })).json();
-  seg.gesture_label = gesture_label; seg.note = note;
+  seg.gesture_label = invalid ? '' : gesture_label; seg.invalid = invalid; seg.note = note;
   if (res.total_labeled != null) STATE.total_labeled = res.total_labeled;
+  if (res.total_invalid != null) STATE.total_invalid = res.total_invalid;
   const rec = STATE.recordings.find(r => r.stem === res.stem);
-  if (rec && res.stem_labeled != null) rec.n_labeled = res.stem_labeled;
-  if (gesture_label && !STATE.labels_used.includes(gesture_label)) {
+  if (rec) {
+    if (res.stem_labeled != null) rec.n_labeled = res.stem_labeled;
+    if (res.stem_invalid != null) rec.n_invalid = res.stem_invalid;
+  }
+  if (!invalid && gesture_label && !STATE.labels_used.includes(gesture_label)) {
     STATE.labels_used.push(gesture_label); STATE.labels_used.sort(); refreshDatalist();
   }
   renderChips(); renderRecList(); renderProgress();
-  document.getElementById('msg').textContent = '已保存 ' + new Date().toLocaleTimeString();
+  document.getElementById('msg').textContent =
+    (invalid ? '已标记无效 ' : '已保存 ') + new Date().toLocaleTimeString();
   if (advance) nextTodo();
+}
+
+function saveLabel(advance) { postLabel(document.getElementById('label').value.trim(), false, advance); }
+function markInvalid() { postLabel('', true, true); }
+
+// --- whole-recording invalid (excluded from labelling/clustering) ----------
+function recInvalidState() {
+  const rec = STATE.rec && STATE.recordings.find(r => r.stem === STATE.rec.stem);
+  return !!(rec && rec.rec_invalid);
+}
+function updateRecInvalidBtn() {
+  const btn = document.getElementById('recinvalid');
+  if (!btn) return;
+  const inv = recInvalidState();
+  btn.textContent = inv ? '取消整条无效 (X)' : '整条录制无效 (X)';
+  btn.style.background = inv ? '#444' : '';
+  btn.style.color = inv ? '#fff' : '';
+  btn.disabled = !STATE.rec;
+}
+async function markRecordingInvalid(toInvalid) {
+  if (!STATE.rec) return;
+  const stem = STATE.rec.stem;
+  const labeler = document.getElementById('labeler').value.trim();
+  const res = await (await fetch('/api/invalid_recording', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stem, invalid: toInvalid, labeler })
+  })).json();
+  const rec = STATE.recordings.find(r => r.stem === stem);
+  if (rec) rec.rec_invalid = res.rec_invalid;
+  if (res.total_invalid_rec != null) STATE.total_invalid_rec = res.total_invalid_rec;
+  updateRecInvalidBtn(); renderRecList(); renderProgress();
+  document.getElementById('msg').textContent =
+    (res.rec_invalid ? '整条录制已标记无效，跳过 ' : '已取消整条无效 ') + new Date().toLocaleTimeString();
+  if (res.rec_invalid) nextRecording();   // marked bad -> move on
+}
+function toggleRecordingInvalid() { markRecordingInvalid(!recInvalidState()); }
+
+function nextRecording() {
+  for (let k = STATE.recIdx + 1; k < STATE.recView.length; k++)
+    if (!recDone(STATE.recView[k])) return selectRecordingIdx(k);
+  document.getElementById('msg').textContent = '可见录制都看完了 🎉';
 }
 
 function nextTodo() {
   const segs = STATE.rec ? STATE.rec.segments : [];
   const ci = STATE.cur ? segs.findIndex(s => s.key === STATE.cur.key) : -1;
-  for (let j = ci + 1; j < segs.length; j++)
-    if (!segs[j].gesture_label) return selectClip(segs[j]);
-  // recording finished -> jump to next recording (in view) that has unlabeled
-  for (let k = STATE.recIdx + 1; k < STATE.recView.length; k++)
-    if (STATE.recView[k].n_labeled < STATE.recView[k].n_clips)
-      return selectRecordingIdx(k);
-  document.getElementById('msg').textContent = '可见录制都标完了 🎉';
+  for (let j = ci + 1; j < segs.length; j++)        // next un-reviewed clip
+    if (!segs[j].gesture_label && !segs[j].invalid) return selectClip(segs[j]);
+  nextRecording();                                  // recording done -> next
 }
 
 function navClip(d) {
@@ -406,6 +508,12 @@ function onKey(e) {
   else if (e.key === 'ArrowDown') { e.preventDefault(); navClip(1); }
   else if (e.key === 'ArrowUp') { e.preventDefault(); navClip(-1); }
   else if (e.key === ' ' && e.target.tagName !== 'INPUT') { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'X' && document.activeElement.id !== 'label' && document.activeElement.id !== 'note') {
+    e.preventDefault(); toggleRecordingInvalid();      // Shift+X: whole recording
+  }
+  else if (e.key === 'x' && document.activeElement.id !== 'label' && document.activeElement.id !== 'note') {
+    e.preventDefault(); markInvalid();                 // x: this clip
+  }
   else if (/^[1-9]$/.test(e.key) && e.target.id !== 'note' && document.activeElement.id !== 'label') {
     const l = STATE.labels_used[+e.key - 1];
     if (l) { setLabelInput(l); saveLabel(true); }

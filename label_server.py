@@ -46,10 +46,57 @@ from emg_label.skeleton import (  # noqa: E402
 )
 
 FS = 2000
-OVERVIEW_REGEN_V = 2          # bump to invalidate regenerated overview_cache
-POSE_REC_MAX_FRAMES = 600     # downsample target for whole-recording playback
+OVERVIEW_REGEN_V = 5          # bump to invalidate regenerated overview_cache
+                              # (v3: rad/s; v4: y-axis cap; v5: live rad pose_thr)
+# Whole-recording hand playback is sampled at POSE_FPS frames/sec (env-tunable),
+# bounded by POSE_REC_MAX_FRAMES so very long recordings stay cheap. Higher fps
+# = smoother motion but proportionally more emg2pose skinning + disk cache per
+# recording. 15fps over a ~2min recording is ~1800 frames.
+POSE_FPS = float(os.environ.get("POSE_FPS", "15"))
+POSE_REC_MAX_FRAMES = int(os.environ.get("POSE_REC_MAX_FRAMES", "3000"))
 CURVE_MAX_POINTS = 2000       # downsample target for overview curves
 WEBUI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
+
+
+def _frame_step(n: int) -> int:
+    """Sample stride for whole-recording hand playback: aim for POSE_FPS, but
+    widen the stride if that would exceed POSE_REC_MAX_FRAMES so the *whole*
+    recording is still covered (never truncated to the first N frames)."""
+    step = max(1, round(FS / POSE_FPS))
+    if (n + step - 1) // step > POSE_REC_MAX_FRAMES:
+        step = max(1, -(-n // POSE_REC_MAX_FRAMES))   # ceil(n / cap)
+    return step
+
+
+def _frame_indices(n: int) -> list:
+    """Sample indices (one pose per playback frame). Shared by the recording
+    payload, the mesh renderer, and the cache-count estimate so frame i always
+    maps to the same pose."""
+    return list(range(0, n, _frame_step(n))) if n > 0 else []
+
+
+def _frame_count(n: int) -> int:
+    return len(range(0, n, _frame_step(n))) if n > 0 else 0
+
+
+def _group_folder(source_path: str) -> str:
+    """Folder a recording is grouped under in the left tree (and per-folder
+    export). Pooled/processed data is a flat set of symlinks under work_pool/,
+    so dirname alone collapses every recording into one node -- resolve the
+    symlink to recover the real source dir (e.g. processed_data/<batch>), so it
+    groups like raw data groups by its {subject}/{session} dir.
+
+    Only the pool case is resolved: realpath() stats every path component, which
+    is slow over network mounts (raw data lives on /mnt) and pointless for real
+    files. We gate on the cheap string check "is this under a work_pool* dir?"
+    so non-pooled recordings skip the filesystem hit entirely."""
+    d = os.path.dirname(source_path)
+    if os.path.basename(d).startswith("work_pool"):
+        try:
+            return os.path.dirname(os.path.realpath(source_path))
+        except OSError:
+            pass
+    return d
 
 # matplotlib (pyplot-free Figure/Agg) is not thread-safe; serialize all hand
 # renders behind one lock. _HAND_PREP caches the per-recording normalized-mm
@@ -89,11 +136,16 @@ class Store:
         self.lock = threading.Lock()
         self.clips_path = os.path.join(out_dir, "clips.csv")
         self.labels_path = os.path.join(out_dir, "labels.csv")
-        self.rec_cache_dir = os.path.join(out_dir, "recording_cache")
+        # All render caches live under one umbrella dir (out/cache/) so the
+        # output root stays tidy; makedirs creates the parent on first run.
+        cache_root = os.path.join(out_dir, "cache")
+        self.rec_cache_dir = os.path.join(cache_root, "recording_cache")
         os.makedirs(self.rec_cache_dir, exist_ok=True)
-        self.hand_dir = os.path.join(out_dir, "mesh_cache_v2")  # v2 = deg->rad fix
+        # v2 = deg->rad fix; v3 = variable-fps frame grid (POSE_FPS) -- bumping
+        # the dir invalidates frames cached under the old fixed-600 grid.
+        self.hand_dir = os.path.join(cache_root, "mesh_cache_v3")
         os.makedirs(self.hand_dir, exist_ok=True)
-        self.overview_cache_dir = os.path.join(out_dir, "overview_cache")
+        self.overview_cache_dir = os.path.join(cache_root, "overview_cache")
         os.makedirs(self.overview_cache_dir, exist_ok=True)
         self.segments_path = os.path.join(out_dir, "segments.csv")
         self.regen_always = os.environ.get("OVERVIEW_REGEN") == "1"
@@ -143,7 +195,7 @@ class Store:
             hand = str(a["hand"])
             self.by_stem[stem] = {
                 "source_path": str(source_path), "source_file": sf,
-                "folder": os.path.dirname(str(source_path)),
+                "folder": _group_folder(str(source_path)),
                 "hand": (hand if hand and hand.lower() != "nan" else None),
                 "subject": str(a["subject"]), "group": str(a["group"]),
                 "rec_duration_s": float(rec_dur.get(sf, 0.0)),
@@ -154,14 +206,22 @@ class Store:
                 "n_clips": int(a["n_clips"]), "n_review": int(a["n_review"]),
                 # expected hand-frame count (== len(fidx)) from duration alone,
                 # so we can flag the 3D cache without loading the npz
-                "n_frames": min(POSE_REC_MAX_FRAMES,
-                                int(round(float(rec_dur.get(sf, 0.0)) * FS))),
+                "n_frames": _frame_count(
+                    int(round(float(rec_dur.get(sf, 0.0)) * FS))),
             }
             self.stem_to_source[stem] = sf
 
         self.labels: dict = {}           # (source_file, clip_id) -> label record
         self.labeled_count: dict = {}    # source_file -> non-empty gesture count
+        self.invalid_count: dict = {}    # source_file -> clips marked invalid
         self._load_labels()
+
+        # Whole-recording invalidation: source_file -> {labeler, marked_at, note}.
+        # Such recordings drop out of labelling, export, clustering and eval.
+        self.invalid_rec_path = os.path.join(out_dir,
+                                             io_utils.INVALID_RECORDINGS_FILE)
+        self.invalid_recordings: dict = {}
+        self._load_invalid_recordings()
 
     def _stem_of(self, source_path: str) -> str:
         s = self._stem_cache.get(source_path)
@@ -182,13 +242,16 @@ class Store:
         ldf = pd.read_csv(self.labels_path, dtype=str).fillna("")
         for _, r in ldf.iterrows():
             sf = str(r["source_file"]); cid = int(float(r["clip_id"]))
-            rec = {"gesture_label": r.get("gesture_label", ""),
+            inv = str(r.get("invalid", "")).strip() in ("1", "true", "True")
+            rec = {"gesture_label": r.get("gesture_label", ""), "invalid": inv,
                    "labeler": r.get("labeler", ""),
                    "labeled_at": r.get("labeled_at", ""),
                    "note": r.get("note", "")}
             self.labels[(sf, cid)] = rec
             if rec["gesture_label"]:
                 self.labeled_count[sf] = self.labeled_count.get(sf, 0) + 1
+            if inv:
+                self.invalid_count[sf] = self.invalid_count.get(sf, 0) + 1
 
     def _hand_count(self, stem: str) -> int:
         d = os.path.join(self.hand_dir, stem)
@@ -211,45 +274,107 @@ class Store:
                 "group": st["group"], "n_clips": st["n_clips"],
                 "n_review": st["n_review"],
                 "n_labeled": self.labeled_count.get(sf, 0),
+                "n_invalid": self.invalid_count.get(sf, 0),
+                "rec_invalid": sf in self.invalid_recordings,
                 "cached": cached,    # 0 none / 1 partial / 2 full 3D cache
             })
         return {"fs": FS, "labels_used": used, "recordings": recs,
                 "total_clips": int(len(self.df)),
-                "total_labeled": sum(self.labeled_count.values())}
+                "total_labeled": sum(self.labeled_count.values()),
+                "total_invalid": sum(self.invalid_count.values()),
+                "total_invalid_rec": len(self.invalid_recordings)}
 
     # --- upsert one label + atomic flush ------------------------------------
-    def set_label(self, key, gesture_label, labeler, note) -> dict:
+    def set_label(self, key, gesture_label, labeler, note, invalid=False) -> dict:
         stem, sf, cid = self._resolve_key(key)
         if sf is None:
             raise KeyError(key)
-        gl = gesture_label.strip()
+        inv = bool(invalid)
+        gl = "" if inv else gesture_label.strip()   # invalid & gesture are exclusive
         with self.lock:
-            prev = self.labels.get((sf, cid), {}).get("gesture_label", "")
+            prev = self.labels.get((sf, cid), {})
+            pg, pi = prev.get("gesture_label", ""), prev.get("invalid", False)
             self.labels[(sf, cid)] = {
-                "gesture_label": gl, "labeler": labeler.strip(),
+                "gesture_label": gl, "invalid": inv, "labeler": labeler.strip(),
                 "labeled_at": datetime.now(timezone.utc).isoformat(
                     timespec="seconds"),
                 "note": note.strip(),
             }
-            if gl and not prev:
+            if gl and not pg:
                 self.labeled_count[sf] = self.labeled_count.get(sf, 0) + 1
-            elif prev and not gl:
+            elif pg and not gl:
                 self.labeled_count[sf] = max(0, self.labeled_count.get(sf, 0) - 1)
+            if inv and not pi:
+                self.invalid_count[sf] = self.invalid_count.get(sf, 0) + 1
+            elif pi and not inv:
+                self.invalid_count[sf] = max(0, self.invalid_count.get(sf, 0) - 1)
             self._flush_labels()
         return {"ok": True, "total": int(len(self.df)),
                 "total_labeled": sum(self.labeled_count.values()),
-                "stem": stem, "stem_labeled": self.labeled_count.get(sf, 0)}
+                "total_invalid": sum(self.invalid_count.values()),
+                "stem": stem, "stem_labeled": self.labeled_count.get(sf, 0),
+                "stem_invalid": self.invalid_count.get(sf, 0)}
 
     def _flush_labels(self):
         tmp = self.labels_path + ".tmp"
         with open(tmp, "w", newline="") as f:
             w = _csv.writer(f)
-            w.writerow(["source_file", "clip_id", "gesture_label",
+            w.writerow(["source_file", "clip_id", "gesture_label", "invalid",
                         "labeler", "labeled_at", "note"])
             for (sf, cid), lab in self.labels.items():
-                w.writerow([sf, cid, lab["gesture_label"], lab["labeler"],
+                w.writerow([sf, cid, lab["gesture_label"],
+                            1 if lab.get("invalid") else 0, lab["labeler"],
                             lab["labeled_at"], lab["note"]])
         os.replace(tmp, self.labels_path)
+
+    # --- whole-recording invalid flag ---------------------------------------
+    def _load_invalid_recordings(self):
+        if not os.path.isfile(self.invalid_rec_path):
+            return
+        try:
+            df = pd.read_csv(self.invalid_rec_path, dtype=str).fillna("")
+        except Exception:
+            return
+        for _, r in df.iterrows():
+            sf = str(r.get("source_file", "")).strip()
+            if sf:
+                self.invalid_recordings[sf] = {
+                    "labeler": r.get("labeler", ""),
+                    "marked_at": r.get("marked_at", ""),
+                    "note": r.get("note", ""),
+                }
+
+    def set_recording_invalid(self, stem, invalid, labeler="", note="") -> dict:
+        """Mark/unmark a WHOLE recording invalid. Invalid recordings drop out of
+        labelling (treated as done), export, clustering and eval. Keyed by
+        source_file so it survives stem re-derivation."""
+        sf = self.stem_to_source.get(stem)
+        if sf is None:
+            raise KeyError(stem)
+        with self.lock:
+            if invalid:
+                self.invalid_recordings[sf] = {
+                    "labeler": labeler.strip(),
+                    "marked_at": datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"),
+                    "note": note.strip(),
+                }
+            else:
+                self.invalid_recordings.pop(sf, None)
+            self._flush_invalid_recordings()
+        return {"ok": True, "stem": stem,
+                "rec_invalid": sf in self.invalid_recordings,
+                "total_invalid_rec": len(self.invalid_recordings)}
+
+    def _flush_invalid_recordings(self):
+        tmp = self.invalid_rec_path + ".tmp"
+        with open(tmp, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["source_file", "labeler", "marked_at", "note"])
+            for sf, m in self.invalid_recordings.items():
+                w.writerow([sf, m.get("labeler", ""),
+                            m.get("marked_at", ""), m.get("note", "")])
+        os.replace(tmp, self.invalid_rec_path)
 
     @staticmethod
     def _folder_key(folder: str) -> str:
@@ -272,13 +397,16 @@ class Store:
             df["gesture_label"] = ""; df["label_note"] = ""
         df["gesture_label"] = df["gesture_label"].fillna("")
         df["label_note"] = df["label_note"].fillna("")
-        # Only labelled clips (empty gesture_label = discard, per convention).
+        # Drop whole recordings marked invalid, then keep only labelled clips
+        # (empty gesture_label = discard, per convention).
+        if self.invalid_recordings:
+            df = df[~df["source_file"].astype(str).isin(self.invalid_recordings)]
         df = df[df["gesture_label"].astype(str).str.strip() != ""].copy()
 
         # one CSV per source folder (= {subject}/{session} dir, like the tree)
         sub_dir = os.path.join(self.out, "clips_labeled")
         os.makedirs(sub_dir, exist_ok=True)
-        folders = df["source_path"].map(lambda p: os.path.dirname(str(p)))
+        folders = df["source_path"].map(lambda p: _group_folder(str(p)))
         seen, n_files = {}, 0
         for folder, g in df.groupby(folders, sort=True):
             key = self._folder_key(folder)
@@ -355,6 +483,13 @@ class Store:
                  for r in sub.itertuples()]
         c2b = [seg2pos.get(int(r.matched_emg_seg_idx), -1) for r in sub.itertuples()]
         thr = lambda v: (None if v is None or not np.isfinite(v) else float(v))
+        # Recompute the pose threshold LIVE (radians). recordings.csv's
+        # pose_thresh was written by segment.py and may be in stale units
+        # (degrees, pre deg->rad fix); mixing it with the rad/s curve misplaces
+        # the threshold line AND blows up the pose-speed panel's y-axis. EMG
+        # enter/exit thresholds are unaffected (EMG units never changed).
+        from emg_label.pose_segmentation import robust_threshold
+        pose_thr_live = float(robust_threshold(np.asarray(ps, dtype=float)))
         import matplotlib.figure as _mf
         cap = {}
         with RENDER_LOCK:                          # plot_overview_dual uses pyplot
@@ -370,7 +505,7 @@ class Store:
                 plotting.plot_overview_dual(
                     env, ps, FS, tmp, burst_segments=bursts, clips=clips,
                     clip_to_burst=c2b, enter_thr=thr(st["enter_thresh"]),
-                    exit_thr=thr(st["exit_thresh"]), pose_thr=thr(st["pose_thresh"]),
+                    exit_thr=thr(st["exit_thresh"]), pose_thr=pose_thr_live,
                     apex_samples=apex)
             finally:
                 _mf.Figure.savefig = orig
@@ -380,13 +515,46 @@ class Store:
                        "x1": cap.get("x1")}, f)
         return png, cap.get("x0"), cap.get("x1")
 
+    def overview_image(self, stem: str) -> str | None:
+        """Path of the overview png to SERVE (used by /api/overview).
+
+        In regen mode, rebuild the cached png when it's missing or version-stale
+        (OVERVIEW_REGEN_V) -- this is independent of the recording-geometry
+        cache, so an OVERVIEW_REGEN_V bump actually invalidates served images
+        (the bug before: the handler served any existing png without checking
+        its version). In static mode, prefer the tuned shard overview.png."""
+        if not self.regen_always:
+            static = self.overview_path(stem)
+            if static:
+                return static
+        png = os.path.join(self.overview_cache_dir, stem + ".png")
+        side = os.path.join(self.overview_cache_dir, stem + ".json")
+        try:
+            if os.path.isfile(png) and os.path.isfile(side):
+                with open(side) as f:
+                    if json.load(f).get("v") == OVERVIEW_REGEN_V:
+                        return png
+        except Exception:
+            pass
+        # stale or missing -> recompute curves and regen (version-stamped)
+        from emg_label.pose_segmentation import pose_speed
+        from emg_label.segmentation import emg_envelope
+        st = self.by_stem[stem]
+        side_hand = (st["hand"]
+                     or io_utils.parse_file_info(st["source_path"]).hand or "left")
+        emg, ja = io_utils.load_npz(st["source_path"], hand=side_hand)
+        ps = np.asarray(pose_speed(ja, FS), dtype=float)
+        env = np.asarray(emg_envelope(emg, FS), dtype=float)
+        p, _, _ = self._regen_overview(stem, env, ps)
+        return p
+
     # --- whole-recording overview curves + frame grid (cached geometry) ----
     def _recording_geometry(self, stem: str) -> dict:
         cache = os.path.join(self.rec_cache_dir, stem + ".json")
         if os.path.isfile(cache):
             with open(cache) as f:
                 d = json.load(f)
-            if d.get("v") == 6:        # ignore older-schema caches
+            if d.get("v") == 8:        # ignore older-schema caches
                 return d
         st = self.by_stem[stem]
         side = (st["hand"]
@@ -397,8 +565,7 @@ class Store:
         # Hand frames are rendered server-side as PNGs (matplotlib draw_skeleton,
         # ipynb-identical) and indexed by this same downsampled grid -- the
         # payload only carries frame_times so the scrubber maps time -> frame i.
-        fstep = max(1, n // POSE_REC_MAX_FRAMES)
-        fidx = list(range(0, n, fstep))[:POSE_REC_MAX_FRAMES]
+        fidx = _frame_indices(n)
 
         # Overview curves: pose-speed + EMG envelope, downsampled for plotting.
         from emg_label.pose_segmentation import pose_speed
@@ -450,7 +617,7 @@ class Store:
                 print(f"overview regen failed for {stem}: {ex}")
                 ov_x0 = ov_x1 = None
         out = {
-            "v": 6, "stem": stem, "fps": 30,
+            "v": 8, "stem": stem, "fps": POSE_FPS,
             "duration_s": round(n / FS, 3),
             "n_frames": len(fidx),
             "ov_x0": ov_x0, "ov_x1": ov_x1,   # overview data-axis edges (img frac)
@@ -475,7 +642,8 @@ class Store:
         out["segments"] = [
             {**s, "gesture_label": self.labels.get((sf, s["clip_id"]), {}).get(
                 "gesture_label", ""),
-             "note": self.labels.get((sf, s["clip_id"]), {}).get("note", "")}
+             "note": self.labels.get((sf, s["clip_id"]), {}).get("note", ""),
+             "invalid": self.labels.get((sf, s["clip_id"]), {}).get("invalid", False)}
             for s in geo["segments"]]
         return out
 
@@ -498,8 +666,7 @@ class Store:
                     or "left")
             _, ja = io_utils.load_npz(st["source_path"], hand=side)
             n = len(ja)
-            fstep = max(1, n // POSE_REC_MAX_FRAMES)
-            fidx = list(range(0, n, fstep))[:POSE_REC_MAX_FRAMES]
+            fidx = _frame_indices(n)
             ja_sub = np.asarray(ja[fidx], dtype=np.float32)
             # Manus ergonomics are in DEGREES (range ~±60); emg2pose skinning
             # expects RADIANS. Feeding degrees twists the fingers into a blob.
@@ -639,19 +806,16 @@ def make_handler(store: Store):
                 return self._send(200, store.recordings_payload())
             if p == "/api/overview":
                 stem = q.get("stem", [""])[0]
-                # regenerated cache wins if present; else static; else regen now
-                regen = os.path.join(store.overview_cache_dir, stem + ".png")
-                if os.path.isfile(regen):
-                    return self._file(regen, "image/png")
-                static = None if store.regen_always else store.overview_path(stem)
-                if static:
-                    return self._file(static, "image/png")
+                # overview_image() version-checks the regen cache and rebuilds
+                # when stale; no_cache because the URL is keyed only by stem, so
+                # without it a browser serves a stale (e.g. wrong-unit) overview.
                 try:
-                    store._recording_geometry(stem)   # triggers regen + caching
+                    png = store.overview_image(stem)
                 except Exception as ex:
                     print(f"WARN /api/overview regen {stem}: {ex}")
-                if os.path.isfile(regen):
-                    return self._file(regen, "image/png")
+                    png = None
+                if png and os.path.isfile(png):
+                    return self._file(png, "image/png", no_cache=True)
                 print(f"WARN /api/overview: no overview for stem={stem}")
                 return self._send(404, {"error": "overview not found",
                                         "stem": stem})
@@ -696,14 +860,20 @@ def make_handler(store: Store):
 
         def do_POST(self):
             u = urlparse(self.path)
-            if u.path != "/api/label":
+            if u.path not in ("/api/label", "/api/invalid_recording"):
                 return self._send(404, {"error": "no route"})
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
             try:
-                res = store.set_label(
-                    data["key"], data.get("gesture_label", ""),
-                    data.get("labeler", ""), data.get("note", ""))
+                if u.path == "/api/invalid_recording":
+                    res = store.set_recording_invalid(
+                        data["stem"], bool(data.get("invalid", False)),
+                        data.get("labeler", ""), data.get("note", ""))
+                else:
+                    res = store.set_label(
+                        data["key"], data.get("gesture_label", ""),
+                        data.get("labeler", ""), data.get("note", ""),
+                        invalid=bool(data.get("invalid", False)))
                 return self._send(200, res)
             except KeyError as ex:
                 return self._send(400, {"error": f"unknown key {ex}"})

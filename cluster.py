@@ -40,6 +40,13 @@ def main():
     k_min, k_max = (args.k, args.k) if args.k is not None else (args.k_min, args.k_max)
     cfg = Config(fs=args.fs, out_dir=args.out, k_min=k_min, k_max=k_max)
     seg_df = pd.read_csv(os.path.join(cfg.out_dir, "segments.csv"))
+    invalid = io_utils.load_invalid_recordings(cfg.out_dir)
+    if invalid:
+        n0 = len(seg_df)
+        seg_df = seg_df[~seg_df["source_file"].astype(str).isin(invalid)] \
+            .reset_index(drop=True)
+        print(f"excluded {len(invalid)} invalid recording(s): "
+              f"{n0 - len(seg_df)} segments dropped")
     os.makedirs(os.path.join(cfg.out_dir, "clusters"), exist_ok=True)
 
     # Remap the grouping column. Everything downstream (clustered csv, label

@@ -33,6 +33,13 @@ def main():
 
     cfg = Config(fs=args.fs, out_dir=args.out)
     seg_df = pd.read_csv(os.path.join(cfg.out_dir, "segments_clustered.csv"))
+    invalid = io_utils.load_invalid_recordings(cfg.out_dir)
+    if invalid:
+        n0 = len(seg_df)
+        seg_df = seg_df[~seg_df["source_file"].astype(str).isin(invalid)] \
+            .reset_index(drop=True)
+        print(f"excluded {len(invalid)} invalid recording(s): "
+              f"{n0 - len(seg_df)} segments dropped")
     labels_path = args.labels or os.path.join(cfg.out_dir, "labels.csv")
     lab_df = pd.read_csv(labels_path)
     lab_map = {(r["group"], int(r["cluster_id"])): _clean_label(r["label"])

@@ -198,6 +198,14 @@ def load_npz(path: str, hand: str | None = None) -> tuple[np.ndarray, np.ndarray
     if pose.ndim != 2:
         raise ValueError(f"expected 2D {pose_key} in {path}, got {pose.shape}")
 
+    # Manus ergonomics are stored in DEGREES; the processed `joint_angles`
+    # layout above is in RADIANS, and everything downstream (pose_speed's rad/s
+    # axis, apex features, emg2pose skinning) assumes radians. Convert when the
+    # values clearly look like degrees so both layouts return the same units.
+    finite = pose[np.isfinite(pose)]
+    if finite.size and float(np.nanmax(np.abs(finite))) > 2 * np.pi:
+        pose = pose * np.float32(np.pi / 180.0)
+
     duration: float | None = None
     if "record_t0" in d.files and "record_t1" in d.files:
         duration = float(d["record_t1"]) - float(d["record_t0"])
@@ -295,6 +303,33 @@ def discover_npz(root: str, recursive: bool = False) -> list[str]:
         return []
     pattern = "**/*.npz" if recursive else "*.npz"
     return sorted(str(p) for p in root.glob(pattern))
+
+
+INVALID_RECORDINGS_FILE = "invalid_recordings.csv"
+
+
+def load_invalid_recordings(out_dir: str) -> set:
+    """Set of ``source_file`` names marked invalid for the WHOLE recording via
+    the label UI (stored in ``out/invalid_recordings.csv``).
+
+    Such recordings are excluded everywhere downstream -- export, clustering,
+    evaluation -- so they never reach labelling or the cluster pool. Returns an
+    empty set when the file is absent or unreadable (fail-open: a missing file
+    must not silently drop recordings)."""
+    import csv
+    path = os.path.join(out_dir, INVALID_RECORDINGS_FILE)
+    out: set = set()
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                sf = (row.get("source_file") or "").strip()
+                if sf:
+                    out.add(sf)
+    except (OSError, csv.Error):
+        pass
+    return out
 
 
 def parse_meta_csv(meta_path: str) -> list[FileInfo]:

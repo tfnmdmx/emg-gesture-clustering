@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 """Pre-render hand-frame PNGs for the labelling UI so first open is instant.
 
-The label server renders each recording's hand frames on demand and caches them
-to ``<out>/hand_frames/{stem}/f*.png`` (~13 KB/frame, ~8 MB and ~29 s per
-recording). That cache already persists across restarts, so a recording is only
-slow the *first* time it's opened. This script warms that cache ahead of time
-for every recording in ``<out>/clips.csv`` (or a subset), in parallel across
-recordings -- one process per recording keeps matplotlib single-threaded inside
-each worker (it's not thread-safe) while still using all cores.
+The label server skins each recording's hand frames on demand (emg2pose) and
+caches them as vertex JSON to ``<out>/cache/mesh_cache_v3/{stem}/f*.json``
+(~12 KB/frame; frame count scales with POSE_FPS and duration). That cache
+persists across restarts, so a recording is only slow the *first* time it's
+opened. This script warms that cache ahead of time for every recording in
+``<out>/clips.csv`` (or a subset), in parallel across recordings -- one process
+per recording keeps the renderer single-threaded inside each worker (it's not
+thread-safe) while still using all cores.
 
 Usage:
     python prewarm_hands.py --out out_pose --workers 8
@@ -32,7 +33,7 @@ def _init(out_dir):
 
 def _do(stem):
     try:
-        _, _, nfr, _, _ = _STORE._hand_prep(stem)
+        _, _, nfr, _ = _STORE._mesh_prep(stem)
         new = 0
         for i in range(nfr):
             if not os.path.isfile(_STORE._hand_path(stem, i)):
@@ -64,7 +65,7 @@ def main():
 
     total_frames = est_mb = 0
     print(f"prewarm {len(stems)} recordings, workers={args.workers} -> "
-          f"{args.out}/hand_frames/")
+          f"{store.hand_dir}/")
     done_recs = 0
     with Pool(args.workers, initializer=_init, initargs=(args.out,)) as pool:
         for stem, nfr, new, err in pool.imap_unordered(_do, stems):
@@ -73,11 +74,11 @@ def main():
                 print(f"  [{done_recs}/{len(stems)}] SKIP {stem}: {err}")
                 continue
             total_frames += nfr
-            est_mb += nfr * 13 / 1024.0
+            est_mb += nfr * 12 / 1024.0
             tag = "cached" if new == 0 else f"{new} new"
             print(f"  [{done_recs}/{len(stems)}] {stem}: {nfr} frames ({tag})")
     print(f"\ndone: {done_recs} recordings, ~{total_frames} frames, "
-          f"~{est_mb:.0f} MB on disk under {args.out}/hand_frames/")
+          f"~{est_mb:.0f} MB on disk under {store.hand_dir}/")
 
 
 if __name__ == "__main__":

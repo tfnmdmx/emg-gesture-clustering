@@ -8,6 +8,7 @@
 #   ./pulse.sh raw-segment <meta.csv | raw-dir> stage 1 only (raw input)
 #   ./pulse.sh raw-qc                            write recordings_keep.csv (informational subset)
 #   ./pulse.sh raw-export                        stage 3 only: per-clip npz/png + index.html
+#   ./pulse.sh raw-index                         rebuild top-level segments/clips/recordings.csv from existing shards
 #   ./pulse.sh raw-status                        show raw-flow progress
 #   ./pulse.sh label                             interactive web UI to hand-label clips (writes labels.csv)
 #   ./pulse.sh label-prewarm                     pre-render hand-frame cache (WORKERS=N) so first open is instant
@@ -234,6 +235,13 @@ _raw_seg_extra() {
   [ -n "$SUBJECT" ] && extra="$extra --only-subject $SUBJECT"
   [ -n "$ONLY_HAND" ] && extra="$extra --only-hand $ONLY_HAND"
   [ "$NO_OVERVIEW" = "1" ] && extra="$extra --no-overview"
+  # pose-segmentation thresholds: lower these to over-segment (more clips),
+  # then prune by labelling. Only passed when set, else segment.py defaults.
+  [ -n "${POSE_PCT:-}" ]     && extra="$extra --pose-pct $POSE_PCT"          # default 35 -> lower = more motion
+  [ -n "${POSE_MAD:-}" ]     && extra="$extra --pose-mad $POSE_MAD"          # default 1.5
+  [ -n "${MIN_STATIC_S:-}" ] && extra="$extra --min-static-s $MIN_STATIC_S"  # default 0.35
+  [ -n "${MIN_MOTION_S:-}" ] && extra="$extra --min-motion-s $MIN_MOTION_S"  # default 0.20
+  [ -n "${MERGE_GAP_S:-}" ]  && extra="$extra --merge-gap-s $MERGE_GAP_S"    # default 0.20
   echo "$extra"
 }
 
@@ -282,6 +290,17 @@ cmd_raw_export() {
   "$PY" export_clips.py --out "$RAW_OUT" $extra
 }
 
+# Rebuild the three top-level index CSVs (segments/clips/recordings.csv) by
+# concatenating every completed shard under $RAW_OUT/shards/. Use this when a
+# `raw` run was interrupted before segment.py reached its end-of-run index step
+# (each shard is committed independently, so the per-recording data survives --
+# only the top-level concat is missing). No recordings are reprocessed.
+cmd_raw_index() {
+  [ -d "$RAW_OUT/shards" ] || die "no $RAW_OUT/shards/. run: ./pulse.sh raw-segment <input>"
+  say "rebuild index from shards ($RAW_OUT/{segments,clips,recordings}.csv)"
+  "$PY" segment.py --out "$RAW_OUT" --index-only
+}
+
 cmd_raw() {
   [ "$#" -ge 1 ] || die "raw needs <meta.csv | raw-dir>. e.g. ./pulse.sh raw reference/sample_meta.csv"
   cmd_raw_segment "$1"
@@ -322,7 +341,11 @@ cmd_raw_status() {
 
 cmd_label() {
   : "${PORT:=8000}" ; : "${HOST:=127.0.0.1}"
-  say "interactive labelling UI: $RAW_OUT -> http://$HOST:$PORT"
+  # Regenerate overviews live by default: shard-baked static overview.png are
+  # stale after pose/plot fixes (units, axis caps). Set OVERVIEW_REGEN=0 to use
+  # the static ones (faster first open, but only correct right after segment).
+  export OVERVIEW_REGEN="${OVERVIEW_REGEN:-1}"
+  say "interactive labelling UI: $RAW_OUT -> http://$HOST:$PORT (OVERVIEW_REGEN=$OVERVIEW_REGEN)"
   exec "$PY" label_server.py --out "$RAW_OUT" --host "$HOST" --port "$PORT"
 }
 
@@ -344,6 +367,7 @@ case "$sub" in
   raw-segment) cmd_raw_segment "$@";;
   raw-qc)      cmd_raw_qc "$@";;
   raw-export)  cmd_raw_export "$@";;
+  raw-index)   cmd_raw_index "$@";;
   raw-status)  cmd_raw_status "$@";;
   label)         cmd_label "$@";;
   label-prewarm) cmd_label_prewarm "$@";;

@@ -81,6 +81,17 @@ def plot_overview_dual(env, pose_speed, fs, out_path,
     axes[1].set_ylabel("pose speed (rad/s)")
     if pose_thr is not None:
         axes[1].axhline(pose_thr, color="r", ls="--", lw=0.8)
+    # pose_speed is a derivative -> a few rare spikes otherwise autoscale the
+    # axis tall and flatten the curve. Cap at the 98.5th pct (clip those spikes
+    # off the top), but keep the motion threshold band visible.
+    _psf = np.asarray(pose_speed, dtype=float)
+    _psf = _psf[np.isfinite(_psf)]
+    if _psf.size:
+        _top = float(np.nanpercentile(_psf, 98.5))
+        if pose_thr is not None and np.isfinite(pose_thr):
+            _top = max(_top, float(pose_thr) * 3.0)
+        if _top > 0:
+            axes[1].set_ylim(0, _top * 1.1)
 
     if burst_segments:
         for idx, (s, e) in enumerate(burst_segments):

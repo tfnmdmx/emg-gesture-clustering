@@ -206,6 +206,10 @@ def main():
     args = ap.parse_args()
 
     clu = pd.read_csv(os.path.join(args.out, "segments_clustered.csv"))
+    invalid = io_utils.load_invalid_recordings(args.out)
+    if invalid:
+        clu = clu[~clu["source_file"].astype(str).isin(invalid)] \
+            .reset_index(drop=True)
     cache_dir = os.path.join(args.out, "eval_cache")
     os.makedirs(cache_dir, exist_ok=True)
 
