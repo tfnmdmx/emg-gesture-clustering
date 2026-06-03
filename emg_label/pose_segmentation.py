@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.ndimage import uniform_filter1d
+from scipy.signal import find_peaks
 
 
 def pose_speed(joint_angles, fs: int, smooth_ms: float = 250.0):
@@ -70,6 +71,57 @@ def mask_to_intervals(mask, fs: int, min_sec: float, merge_gap_sec: float):
         else:
             merged.append([s, e])
     return [(s, e) for s, e in merged]
+
+
+def velocity_peak_segments(speed, fs: int, detect_thr: float,
+                           bound_frac: float = 0.5, prom_k: float = 2.0,
+                           min_gesture_s: float = 0.25, merge_gap_s: float = 0.12):
+    """One dynamic-gesture segment per pose-speed peak; split mega-runs at valleys.
+
+    A dynamic gesture is a *movement* = one bell in the pose-speed signal. Unlike
+    ``static_motion_intervals`` (which needs a static hold to bracket gestures and
+    so collapses continuous back-to-back gesturing into one mega-segment), this
+    cuts on the movements themselves:
+
+    1. detect peaks above ``detect_thr`` (the robust motion floor), spaced at
+       least ``min_gesture_s`` apart, each standing out by >= ``prom_k * MAD``
+       (so a wobble inside one movement is not promoted to its own gesture);
+    2. bound each movement at the lower ``bound_frac * detect_thr`` so the rising
+       and falling flanks stay in the segment (hysteresis: detect high, bound low);
+    3. when one supra-``bound`` run holds several peaks (continuous gesturing that
+       never settles) split it at the velocity *valley* (argmin) between
+       consecutive peaks.
+
+    ``apex`` for each segment is the peak-velocity frame -- for a dynamic gesture
+    the most intense instant of the movement, far more meaningful than a settled
+    end-pose. NaN samples (Manus occlusion) are treated as no-motion (0) for
+    detection, the safe default. Returns ``(segments, apex_samples)``.
+    """
+    s = np.nan_to_num(np.asarray(speed, float), nan=0.0)
+    finite = s[np.isfinite(s)]
+    med = float(np.median(finite)) if finite.size else 0.0
+    mad = 1.4826 * float(np.median(np.abs(finite - med))) if finite.size else 0.0
+    prom = max(prom_k * mad, 1e-9)
+    min_dist = max(1, int(round(min_gesture_s * fs)))
+    peaks, _ = find_peaks(s, height=detect_thr, distance=min_dist, prominence=prom)
+
+    bound = bound_frac * detect_thr
+    runs = mask_to_intervals(s > bound, fs, 0.0, merge_gap_s)
+    segs, apexes = [], []
+    for rs, re in runs:
+        pk = peaks[(peaks >= rs) & (peaks < re)]
+        if len(pk) == 0:
+            continue
+        bnds = [rs]
+        for j in range(len(pk) - 1):
+            bnds.append(pk[j] + int(np.argmin(s[pk[j]:pk[j + 1] + 1])))
+        bnds.append(re)
+        for j in range(len(pk)):
+            a, b = bnds[j], bnds[j + 1]
+            if b - a >= min_dist:
+                segs.append((int(a), int(b)))
+                apexes.append(int(pk[j]))
+    return segs, apexes
 
 
 def static_motion_intervals(speed, fs: int, threshold: float,

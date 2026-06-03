@@ -132,6 +132,12 @@ def process(stem, clips_df, cfg, args, out_dir):
     segs = [s for s, k in zip(segs0, keep) if k]
     apexes = [p for p, k in zip(apexes0, keep) if k]
     n_dropped = len(segs0) - len(segs)
+    # long-segment review flag: a kept segment longer than long_seg_s is likely
+    # a sustained/continuous motion that the peak detector under-split -> flag
+    # for human review rather than force-splitting (which would risk chopping
+    # clean single gestures elsewhere).
+    seg_long = [(b - a) / fs > args.long_seg_s for a, b in segs]
+    n_long = sum(seg_long)
 
     env = segmentation.emg_envelope(emg, fs, cfg.smooth_ms)
     bursts, _, enter, _ = segmentation.segment_emg(emg, cfg)
@@ -191,9 +197,13 @@ def process(stem, clips_df, cfg, args, out_dir):
     for (a, b), kp in zip(segs0, keep):
         if kp:
             col = "green" if seg_both[ki] else "orange"
-            ax[2].axvspan(a / fs, b / fs, ymin=0.10, ymax=0.45, color=col, alpha=0.5)
-            ax[2].text((a + b) / 2 / fs, 0.27, f"p{ki}", ha="center", va="center",
-                       fontsize=6, color="black")
+            longf = seg_long[ki]
+            ax[2].axvspan(a / fs, b / fs, ymin=0.10, ymax=0.45, facecolor=col,
+                          alpha=0.5, edgecolor=("red" if longf else "none"),
+                          linewidth=(2.0 if longf else 0))
+            ax[2].text((a + b) / 2 / fs, 0.27,
+                       (f"p{ki}!" if longf else f"p{ki}"), ha="center",
+                       va="center", fontsize=6, color="black")
             ki += 1
         else:                            # dropped by absolute gate -> gray
             ax[2].axvspan(a / fs, b / fs, ymin=0.10, ymax=0.45,
@@ -206,7 +216,8 @@ def process(stem, clips_df, cfg, args, out_dir):
         f"current {len(cur)} clips  ->  {len(segs)} kept "
         f"(+{n_dropped} dropped by range>={args.min_range:g} gate)   |   "
         f"vote: {n_both} both, {len(segs)-n_both} pose-only, "
-        f"{len(burst_only)} EMG-only   |   rec_range={rec_range:.1f}{static_tag}",
+        f"{len(burst_only)} EMG-only   |   {n_long} long(>{args.long_seg_s:g}s) "
+        f"flagged   |   rec_range={rec_range:.1f}{static_tag}",
         fontsize=9, loc="left")
 
     suffix = ""
@@ -243,6 +254,9 @@ def main():
                     help="ABSOLUTE joint-excursion floor (pose_range) for a "
                          "segment to count as a real dynamic gesture. Static "
                          "recordings (ax-0819 ~2) fall far below typical (~177).")
+    ap.add_argument("--long-seg-s", type=float, default=2.5,
+                    help="kept segments longer than this are flagged for review "
+                         "(likely under-split sustained motion).")
     args = ap.parse_args()
 
     cfg = Config(fs=args.fs, pose_smooth_ms=args.pose_smooth_ms)

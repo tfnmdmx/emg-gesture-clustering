@@ -26,3 +26,15 @@ class Config:
     pre_static_s: float = 0.5
     post_static_s: float = 0.5
     pad_s: float = 0.05
+    # Velocity-peak segmentation (the dynamic-gesture segmenter that replaces
+    # static->motion->static clips: one segment per pose-speed peak). See
+    # pose_segmentation.velocity_peak_segments.
+    pose_prom_k: float = 2.0          # peak prominence = k * MAD(speed)
+    pose_min_gesture_s: float = 0.25  # min peak spacing AND min segment length
+    pose_bound_frac: float = 0.5      # segment-bound level = frac * detect_thr
+    pose_peak_merge_gap_s: float = 0.12
+    # Absolute motion gate -- robust_threshold is per-recording relative, so on a
+    # static recording it descends to the noise floor and manufactures phantom
+    # segments. A real dynamic gesture must move the joints an absolute distance.
+    pose_min_range: float = 15.0      # min joint excursion (pose_range) per segment
+    pose_long_seg_s: float = 2.5      # segments longer than this -> review flag

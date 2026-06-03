@@ -28,14 +28,15 @@ CLIP_FIELDS = ["source_file", "source_path", "group", "subject", "hand",
                "apex_sample", "duration_s", "motion_duration_s",
                "emg_rms", "envelope_peak",
                "mean_pose_speed", "max_pose_speed", "pose_range",
-               "matched_emg_seg_idx", "gesture_label"]
+               "matched_emg_seg_idx", "review_flag", "gesture_label"]
 
 REC_FIELDS = ["source_file", "source_path", "group", "subject", "hand",
               "n_samples", "duration_s", "n_bursts", "n_clips",
               "n_burst_only", "n_clip_only",
               "emg_pose_lag_s", "emg_pose_corr", "lag_flag",
               "pose_nan_frac", "emg_nan_frac",
-              "enter_thresh", "exit_thresh", "pose_thresh"]
+              "enter_thresh", "exit_thresh", "pose_thresh",
+              "rec_pose_range", "pose_static"]
 
 
 # ---------- atomic write helpers --------------------------------------------
@@ -138,31 +139,62 @@ def process_one(path: str, info, cfg: Config,
     burst_apexes = [features.apex_index(ja, s, he, rest, cfg.fs)
                     for (s, _), he in zip(segs, hold_ends)]
 
-    # --- Pose-speed clip path ----------------------------------------------
+    # --- Pose-speed MOVEMENT clip path (hold-to-hold dynamic segmentation) --
+    # The subject's protocol is move -> hold -> move -> hold (e.g. extend index,
+    # settle, extend middle, settle), so the static holds ARE the natural gesture
+    # boundaries. One clip per movement = one motion run bracketed by two holds,
+    # emitted as pad-motion-pad. This replaces the velocity-peak splitter, which
+    # over-cut each movement ~2x at internal velocity valleys (see S0/S1 in
+    # docs/切分聚类问题与改进方向.md). The EMG burst path above stays as a
+    # cross-reference/vote. Continuous never-settling runs (movements too fast to
+    # register a hold) collapse into one long motion run -> review_flag='long',
+    # surfaced for later 异常-segment handling rather than silently fragmented.
     spd = pose_segmentation.pose_speed(ja, cfg.fs, cfg.pose_smooth_ms)
     pose_thr = pose_segmentation.robust_threshold(
         spd, cfg.pose_pct, cfg.pose_mad)
-    static, motion = pose_segmentation.static_motion_intervals(
-        spd, cfg.fs, pose_thr,
-        min_static_s=cfg.min_static_s,
-        min_motion_s=cfg.min_motion_s,
-        merge_gap_s=cfg.merge_gap_s,
-    )
-    clips = pose_segmentation.build_smc_clips(
-        static, motion, cfg.fs, n,
-        pre_static_s=cfg.pre_static_s,
-        post_static_s=cfg.post_static_s,
-        pad_s=cfg.pad_s,
-        min_motion_s=cfg.min_motion_s,
-    )
-    clip_apexes = []
-    for c in clips:
-        so_s, so_e = c["static_out_start"], c["static_out_end"]
-        if so_e > so_s:
-            clip_apexes.append(features.apex_index(
-                ja, so_s, so_e, rest, cfg.fs))
-        else:
-            clip_apexes.append((so_s + so_e) // 2)
+    # Absolute motion gate. robust_threshold is per-recording RELATIVE, so on a
+    # near-static recording it descends to the noise floor and manufactures
+    # phantom segments. A real dynamic gesture must move the joints an absolute
+    # distance: rec_pose_range = whole-recording joint excursion; below the
+    # floor the recording is static and yields no clips.
+    rec_pose_range = float(np.linalg.norm(
+        np.nanmax(ja, axis=0) - np.nanmin(ja, axis=0)))
+    pose_static = rec_pose_range < cfg.pose_min_range
+    if pose_static:
+        motion_runs = []
+    else:
+        _static, motion_runs = pose_segmentation.static_motion_intervals(
+            spd, cfg.fs, pose_thr,
+            min_static_s=cfg.min_static_s, min_motion_s=cfg.min_motion_s,
+            merge_gap_s=cfg.merge_gap_s)
+
+    pad = int(round(cfg.pad_s * cfg.fs))
+    clips, clip_apexes = [], []
+    cid = 0
+    for ms, me in motion_runs:
+        # Per-segment absolute gate: drop noise bumps even inside a non-static
+        # recording (the joints barely move over this window).
+        seg_range = float(np.linalg.norm(
+            np.nanmax(ja[ms:me], axis=0) - np.nanmin(ja[ms:me], axis=0)))
+        if seg_range < cfg.pose_min_range:
+            continue
+        cs, ce = max(0, ms - pad), min(n, me + pad)
+        clips.append({
+            "clip_id": cid, "clip_start": cs, "clip_end": ce,
+            # static_in/out are the small pad regions only (no real hold is
+            # captured in a pad-motion-pad clip) -- kept for schema compatibility.
+            "static_in_start": cs, "static_in_end": ms,
+            "motion_start": ms, "motion_end": me,
+            "static_out_start": me, "static_out_end": ce,
+            # a movement that never settled into a hold (too-fast continuous
+            # gesturing) shows up as one over-long motion run -> flag for review.
+            "review_flag": ("long" if (me - ms) / cfg.fs > cfg.pose_long_seg_s
+                            else ""),
+        })
+        # apex = the formed-pose frame (max joint deviation from rest within the
+        # movement), not the peak-velocity transition frame the old path used.
+        clip_apexes.append(features.apex_index(ja, ms, me, rest, cfg.fs))
+        cid += 1
 
     # --- Cross-reference ----------------------------------------------------
     burst_to_clip = pose_segmentation.match_bursts_to_clips(segs, clips)
@@ -219,6 +251,7 @@ def process_one(path: str, info, cfg: Config,
             "max_pose_speed": round(m_clip["max_pose_speed"], 4),
             "pose_range": round(m_clip["pose_range"], 4),
             "matched_emg_seg_idx": mb,
+            "review_flag": c["review_flag"],
             "gesture_label": "",
         })
 
@@ -249,6 +282,8 @@ def process_one(path: str, info, cfg: Config,
         "enter_thresh": round(float(enter), 6),
         "exit_thresh": round(float(exit_thr), 6),
         "pose_thresh": round(float(pose_thr), 6),
+        "rec_pose_range": round(rec_pose_range, 4),
+        "pose_static": int(pose_static),
     }
 
     # --- Stage-2 features cache (apex pose vectors, one per burst) ---------
@@ -358,6 +393,19 @@ def main():
     ap.add_argument("--pre-static-s", type=float, default=0.5)
     ap.add_argument("--post-static-s", type=float, default=0.5)
     ap.add_argument("--pad-s", type=float, default=0.05)
+    # --- velocity-peak segmentation (dynamic-gesture clips) ---
+    ap.add_argument("--pose-prom-k", type=float, default=2.0,
+                    help="peak prominence = k * MAD(pose-speed)")
+    ap.add_argument("--pose-min-gesture-s", type=float, default=0.25,
+                    help="min peak spacing AND min segment length")
+    ap.add_argument("--pose-bound-frac", type=float, default=0.5,
+                    help="segment-bound level = frac * detect threshold")
+    ap.add_argument("--pose-peak-merge-gap-s", type=float, default=0.12)
+    ap.add_argument("--pose-min-range", type=float, default=15.0,
+                    help="absolute joint-excursion floor; segments/recordings "
+                         "below it are dropped as static (no real gesture)")
+    ap.add_argument("--pose-long-seg-s", type=float, default=2.5,
+                    help="segments longer than this get review_flag=long")
     # --- incremental-mode flags ---
     ap.add_argument("--force", action="store_true",
                     help="reprocess recordings even if their shard exists "
@@ -390,6 +438,10 @@ def main():
         min_motion_s=args.min_motion_s, merge_gap_s=args.merge_gap_s,
         pre_static_s=args.pre_static_s, post_static_s=args.post_static_s,
         pad_s=args.pad_s,
+        pose_prom_k=args.pose_prom_k, pose_min_gesture_s=args.pose_min_gesture_s,
+        pose_bound_frac=args.pose_bound_frac,
+        pose_peak_merge_gap_s=args.pose_peak_merge_gap_s,
+        pose_min_range=args.pose_min_range, pose_long_seg_s=args.pose_long_seg_s,
     )
     os.makedirs(os.path.join(cfg.out_dir, "shards"), exist_ok=True)
     os.makedirs(os.path.join(cfg.out_dir, "features"), exist_ok=True)
