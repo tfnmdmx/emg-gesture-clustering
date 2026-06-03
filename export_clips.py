@@ -30,7 +30,32 @@ from emg_label import io_utils  # noqa: E402
 
 
 def _clip_key(stem: str, clip_id) -> str:
+    """Stable global identifier for a clip; used in logs and as the npz's
+    ``source_file`` metadata. The on-disk layout uses a per-recording subdir
+    (see ``_clip_paths``) -- the key is no longer baked into the file name."""
     return f"{stem}__c{int(clip_id):04d}"
+
+
+def _clip_paths(export_dir: str, stem: str, clip_id) -> dict:
+    """Resolve the on-disk paths for one clip's npz + png and the HTML-relative
+    refs that point at them from <export_dir>/index.html.
+
+    Layout:
+        <export_dir>/{stem}/c{cid:04d}.npz
+        <export_dir>/{stem}/c{cid:04d}.png
+
+    Matches the per-recording shard layout segment.py writes
+    (<out>/shards/{stem}/...), so one recording = one folder everywhere.
+    """
+    sub = stem
+    base = f"c{int(clip_id):04d}"
+    return {
+        "subdir": os.path.join(export_dir, sub),
+        "npz": os.path.join(export_dir, sub, base + ".npz"),
+        "png": os.path.join(export_dir, sub, base + ".png"),
+        "rel_npz": f"{sub}/{base}.npz",
+        "rel_png": f"{sub}/{base}.png",
+    }
 
 
 def _keyframe_indices(row, n_clip: int):
@@ -210,18 +235,15 @@ def main():
 
         rows = gdf if args.limit is None else gdf.head(args.limit)
 
-        # Skip-detection: from the clips.csv row derive {key}, then check
-        # whether {key}.npz (+ {key}.png unless png-disabled) already exist.
-        # Defer the heavy load_npz / load_skeleton until at least one row of
-        # this source actually needs (re)processing -- a fully-cached source
-        # then costs zero IO.
+        # Skip-detection: from the clips.csv row derive its on-disk paths,
+        # check both npz + png exist (per the user's PNG choice). Defer the
+        # heavy load_npz / load_skeleton until at least one row of this source
+        # actually needs (re)processing -- a fully-cached source then costs
+        # zero IO and we don't even mkdir the subdir.
         def _row_done(row):
-            key = _clip_key(info.stem, row["clip_id"])
-            npz_done = os.path.isfile(os.path.join(export_dir, key + ".npz"))
-            png_done = (png_disabled
-                        or os.path.isfile(
-                            os.path.join(export_dir, key + ".png")))
-            return npz_done and png_done
+            p = _clip_paths(export_dir, info.stem, row["clip_id"])
+            return os.path.isfile(p["npz"]) and (
+                png_disabled or os.path.isfile(p["png"]))
 
         needs_work = (args.force
                       or any(not _row_done(r) for _, r in rows.iterrows()))
@@ -231,12 +253,17 @@ def main():
             emg, ja = io_utils.load_npz(src_path, hand=side)
             skel = (None if png_disabled
                     else io_utils.load_skeleton(src_path, hand=side))
+            # Materialise the per-recording subdir only when we actually
+            # need to write into it.
+            os.makedirs(_clip_paths(export_dir, info.stem, 0)["subdir"],
+                        exist_ok=True)
 
         n_new = n_cached = 0
         for _, row in rows.iterrows():
             key = _clip_key(info.stem, row["clip_id"])
-            npz_out = os.path.join(export_dir, key + ".npz")
-            png_out = os.path.join(export_dir, key + ".png")
+            cpath = _clip_paths(export_dir, info.stem, row["clip_id"])
+            npz_out = cpath["npz"]
+            png_out = cpath["png"]
             npz_exists = os.path.isfile(npz_out)
             png_exists = os.path.isfile(png_out)
 
@@ -249,9 +276,9 @@ def main():
                     n_png_cached += 1
                 entries_by_source.setdefault(source_file, []).append({
                     "key": key, "row": row,
-                    "png_rel": (key + ".png") if (
+                    "png_rel": cpath["rel_png"] if (
                         not png_disabled and png_exists) else None,
-                    "npz_rel": key + ".npz",
+                    "npz_rel": cpath["rel_npz"],
                 })
                 continue
 
@@ -327,8 +354,8 @@ def main():
             n_new += 1
             entries_by_source.setdefault(source_file, []).append({
                 "key": key, "row": row,
-                "png_rel": (key + ".png") if png_made else None,
-                "npz_rel": key + ".npz",
+                "png_rel": cpath["rel_png"] if png_made else None,
+                "npz_rel": cpath["rel_npz"],
             })
         if emg is not None:
             del emg, ja
