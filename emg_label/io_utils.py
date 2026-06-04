@@ -24,12 +24,27 @@ _SESSION_RE = re.compile(
     r"^(?P<date>\d{8})-(?P<hand>left|right|both)(?:-(?P<batch>\d+))?$",
     re.IGNORECASE,
 )
+# processed_data batch dir like 'fgw0917_0502_left', 'zyb0201_20260514',
+# 'ghd1108_20260513_redmi': leading token is the subject with no hyphen.
+_BATCH_RE = re.compile(r"^(?P<subj>[A-Za-z]{2,}\d{3,})(?:_(?P<rest>.+))?$")
+
+
+def normalize_subject(s) -> str:
+    """Subject id reduced to lowercase alphanumerics for matching.
+
+    Canonical ids carry a hyphen (``fgw-0917``) while processed_data batch dirs
+    drop it (``fgw0917``); both normalize to ``fgw0917`` so the same ``--subjects``
+    value selects from a meta CSV and from processed_data alike.
+    """
+    if not s:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
 
 
 def parse_file_info(path: str) -> FileInfo:
     """Parse subject / hand / group from path.
 
-    Tries two layouts in order:
+    Tries three layouts in order:
 
     1. **Processed** filename ``{subject}__{date}-{hand}[-{run}|_{note}...]__{timestamp}``.
        Used by data already aligned to the EMG sample axis.
@@ -39,6 +54,12 @@ def parse_file_info(path: str) -> FileInfo:
        timestamp). The synthesized stem is
        ``{subject}__{session}__{filename_stem}`` so it stays unique and matches
        the processed-format pattern downstream.
+
+    3. **Processed batch dir** ``.../{subj}{date}[_{hand}|_{note}]/{timestamp}.npz``
+       (under processed_data/) -- subject lives in the dir name with no hyphen and
+       the filename is a bare timestamp. The subject is re-hyphenated to the
+       canonical form (``fgw0917`` -> ``fgw-0917``) and the stem synthesized
+       ``{subject}__{batchdir}__{filename_stem}`` to stay unique across batches.
     """
     p = Path(path)
     stem = p.stem
@@ -69,6 +90,17 @@ def parse_file_info(path: str) -> FileInfo:
         subject = subject_dir
         synth = f"{subject}__{session_dir}__{stem}"
         return FileInfo(path, synth, subject, hand, f"{subject}-{hand}", True)
+
+    # --- Processed batch dir: subject in the dir name (no hyphen), bare ts file ---
+    bm = _BATCH_RE.match(session_dir)
+    if bm:
+        # 'fgw0917' -> 'fgw-0917' (hyphen before the trailing digit run).
+        subject = re.sub(r"^([A-Za-z]+)(\d+)$", r"\1-\2", bm.group("subj"))
+        rest = (bm.group("rest") or "").lower().split("_")
+        hand = next((h for h in rest if h in ("left", "right", "both")), None)
+        synth = f"{subject}__{session_dir}__{stem}"
+        group = f"{subject}-{hand}" if hand else subject
+        return FileInfo(path, synth, subject, hand, group, True)
 
     warnings.warn(f"Cannot parse filename, treating as own group: {stem}")
     return FileInfo(path, stem, None, None, stem, False)
@@ -143,6 +175,25 @@ def _align_pose_to_emg(pose: np.ndarray, pose_t: np.ndarray,
     for d in range(pose.shape[1]):
         out[:, d] = np.interp(emg_t, pose_t, pose[:, d].astype(np.float64))
     return out
+
+
+def resolve_npz_path(source_file: str, source_path=None,
+                     input_dir: str | None = None) -> str:
+    """Locate a recording's npz for a stage-2/3 reload.
+
+    Prefers the absolute ``source_path`` recorded in the stage-1 CSVs, so the
+    pipeline runs straight from a ``--meta`` CSV or a source directory WITHOUT a
+    flat ``work_pool/`` -- matching the raw flow (and cluster_traj.py, which
+    already reads ``source_path`` directly). Falls back to ``input_dir/source_file``
+    for legacy pool-based invocations, then to the bare filename.
+    """
+    if source_path is not None:
+        sp = str(source_path)
+        if sp and sp.lower() not in ("nan", "none") and os.path.isfile(sp):
+            return sp
+    if input_dir:
+        return os.path.join(input_dir, str(source_file))
+    return str(source_file)
 
 
 def load_npz(path: str, hand: str | None = None) -> tuple[np.ndarray, np.ndarray]:

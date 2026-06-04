@@ -409,9 +409,13 @@ def main():
                     help="skip per-recording processing; just rebuild the "
                          "top-level segments/clips/recordings.csv from "
                          "existing shards.")
+    ap.add_argument("--subjects", default=None,
+                    help="comma-separated subject ids to keep. Matched on the "
+                         "NORMALIZED id (hyphen/case-insensitive), so 'fgw-0917' "
+                         "== 'fgw0917'. Works identically for --meta and dir "
+                         "input -- the unified id-based selector.")
     ap.add_argument("--only-subject", default=None,
-                    help="process only recordings with this subject "
-                         "(local rerun).")
+                    help="(alias for a single --subjects id; kept for back-compat)")
     ap.add_argument("--only-hand", choices=["left", "right"], default=None,
                     help="process only recordings with this hand.")
     ap.add_argument("--workers", type=int, default=1,
@@ -466,8 +470,17 @@ def main():
             print("All input was force_data; nothing to do.")
             return
 
+    sel = []
+    if args.subjects:
+        sel += [s for s in args.subjects.split(",") if s.strip()]
     if args.only_subject:
-        work = [(p, i) for p, i in work if i.subject == args.only_subject]
+        sel.append(args.only_subject)
+    if sel:
+        want = {io_utils.normalize_subject(s) for s in sel}
+        before = len(work)
+        work = [(p, i) for p, i in work
+                if io_utils.normalize_subject(i.subject) in want]
+        print(f"--subjects {','.join(sel)}: kept {len(work)}/{before} recordings")
     if args.only_hand:
         work = [(p, i) for p, i in work if i.hand == args.only_hand]
     if not work:

@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # pulse.sh -- one entry point for the EMG gesture pipeline. See RUNBOOK.md.
 #
+# Selecting data by subject id (unified across both data shapes):
+#   SUBJECTS=fgw-0917,myy-0129   -- comma-separated ids; matched normalized so
+#   'fgw-0917' == 'fgw0917'. Works the SAME whether the source is a meta CSV
+#   (rows picked by subject_id) or a dir / processed_data (npz picked by parsed
+#   subject). Example, identical command, two sources:
+#     SUBJECTS=fgw-0917,myy-0129 ./pulse.sh segment reference/sample_meta.csv
+#     SUBJECTS=fgw-0917,myy-0129 ./pulse.sh segment processed   # = $DATA_ROOT
+#
 # Two flows -- pick by data shape:
 #
 # A. RAW data -> ground-truth clip gallery (path A in RUNBOOK):
@@ -11,15 +19,20 @@
 #   ./pulse.sh raw-status                        show raw-flow progress
 #
 # B. PROCESSED data -> unsupervised cluster -> labeled npz (path B in RUNBOOK):
-#   ./pulse.sh pool   <batch|path> [...]   build work pool from processed_data batches
-#   ./pulse.sh segment                     stage 1: segment
+#   ./pulse.sh segment [meta.csv|dir|processed]   stage 1: segment (no pool needed).
+#                                          Source = a meta CSV, a source dir, or
+#                                          'processed' ($DATA_ROOT); pick subjects
+#                                          with SUBJECTS=id1,id2. Omit -> work_pool.
 #   ./pulse.sh cluster [K]                 stage 2: cluster (K default 18; "auto" = silhouette)
 #   ./pulse.sh eval                        subject-invariance metrics (pooled runs)
 #   ./pulse.sh qc                          quality check: feature maps (+ gallery if exported)
 #   ./pulse.sh export                      stage 3: export labeled npz (+ build gallery)
 #   ./pulse.sh gallery                     build the per-label animation gallery (after export)
-#   ./pulse.sh run                         segment + cluster + eval + qc (existing pool, no batches)
-#   ./pulse.sh prep   <batch|path> [...]   pool + segment + cluster + eval + qc (everything pre-labeling)
+#   ./pulse.sh run     [meta.csv|dir]      segment + cluster + eval + qc
+#   ./pulse.sh pool    <batch|path> [...]  (optional) gather processed_data batches into a
+#                                          work_pool -- only to select/merge specific batches;
+#                                          cluster/eval/export now find npz via source_path
+#   ./pulse.sh prep    <batch|path> [...]  pool + run (everything pre-labeling)
 #
 # Shared:
 #   ./pulse.sh status                      show flow-B progress
@@ -53,7 +66,9 @@ fi
 : "${RAW_OUT:=out_pose}"           # output dir for raw-data flow
 : "${RAW_LAG_FLAGS:=ok}"           # recordings.lag_flag values to keep (comma-sep)
 : "${RAW_NAN_MAX:=0.01}"           # max pose_nan_frac to keep in recordings_keep.csv
-: "${SUBJECT:=}"                   # filter segment.py to one subject (--only-subject)
+: "${SUBJECT:=}"                   # (legacy alias) single subject id
+: "${SUBJECTS:=$SUBJECT}"          # comma-sep subject ids to keep (csv OR processed_data);
+                                   # matched normalized so fgw-0917 == fgw0917
 : "${ONLY_HAND:=}"                 # filter segment.py to one hand (left|right)
 : "${NO_OVERVIEW:=0}"              # set to 1 to skip overview.png in segment.py
 : "${RAW_LIMIT:=}"                 # cap clips per source in export_clips.py
@@ -113,9 +128,29 @@ PYEOF
 }
 
 cmd_segment() {
-  [ -d "$POOL" ] || die "no pool. run: ./pulse.sh pool <batches...>"
-  say "stage 1: segment ($POOL -> $OUT, workers=$WORKERS)"
-  "$PY" segment.py "$POOL" --out "$OUT" --workers "$WORKERS"
+  # ONE unified entry for both data shapes. The source can be:
+  #   * a sample_meta.csv          -> rows are picked by SUBJECTS (raw flow)
+  #   * a source dir (or 'processed' = $DATA_ROOT) -> npz scanned + picked by SUBJECTS
+  #   * omitted                    -> falls back to the work_pool
+  # SUBJECTS is matched on the normalized id (fgw-0917 == fgw0917), so the same
+  # value selects from the CSV and from processed_data. No pool required --
+  # segment.py writes source_path, and downstream stages locate npz via it.
+  local src="${1:-$POOL}"
+  [ "$src" = "processed" ] && src="$DATA_ROOT"
+  local extra=""
+  [ -n "$SUBJECTS" ] && extra="$extra --subjects $SUBJECTS"
+  [ -n "$ONLY_HAND" ] && extra="$extra --only-hand $ONLY_HAND"
+  if [ -f "$src" ] && [[ "$src" == *.csv ]]; then
+    say "stage 1: segment (--meta $src -> $OUT, workers=$WORKERS, subjects=${SUBJECTS:-all})"
+    # shellcheck disable=SC2086
+    "$PY" segment.py --meta "$src" --out "$OUT" --workers "$WORKERS" $extra
+  elif [ -d "$src" ]; then
+    say "stage 1: segment ($src -> $OUT, workers=$WORKERS, subjects=${SUBJECTS:-all})"
+    # shellcheck disable=SC2086
+    "$PY" segment.py "$src" --recursive --out "$OUT" --workers "$WORKERS" $extra
+  else
+    die "segment input not found: '$src'. Pass a sample_meta.csv, a source dir, 'processed' ($DATA_ROOT), e.g. SUBJECTS=fgw-0917,myy-0129 ./pulse.sh segment processed  (or build a pool: ./pulse.sh pool <batches...>)"
+  fi
 }
 
 cmd_cluster() {
@@ -123,11 +158,11 @@ cmd_cluster() {
   local k="${1:-$K}"
   if [ "$k" = "auto" ]; then
     say "stage 2: cluster (auto k via silhouette, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM)"
-    "$PY" cluster.py "$POOL" --out "$OUT" --group-by "$GROUP_BY" \
+    "$PY" cluster.py --out "$OUT" --group-by "$GROUP_BY" \
       --subject-norm "$SUBJECT_NORM"
   else
     say "stage 2: cluster (k=$k, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM)"
-    "$PY" cluster.py "$POOL" --out "$OUT" --k "$k" --group-by "$GROUP_BY" \
+    "$PY" cluster.py --out "$OUT" --k "$k" --group-by "$GROUP_BY" \
       --subject-norm "$SUBJECT_NORM"
   fi
 }
@@ -135,13 +170,13 @@ cmd_cluster() {
 cmd_eval() {
   [ -f "$OUT/segments_clustered.csv" ] || die "no clusters yet. run: ./pulse.sh cluster"
   say "evaluation: subject-invariance metrics ($OUT/eval_metrics.csv, subject-norm=$SUBJECT_NORM)"
-  "$PY" evaluate.py "$POOL" --out "$OUT" --subject-norm "$SUBJECT_NORM"
+  "$PY" evaluate.py --out "$OUT" --subject-norm "$SUBJECT_NORM"
 }
 
 cmd_qc() {
   [ -f "$OUT/segments_clustered.csv" ] || die "no clusters yet. run: ./pulse.sh cluster"
   say "quality check: feature maps ($OUT/feature_maps/)"
-  "$PY" plot_cluster_features.py "$POOL" --out "$OUT"
+  "$PY" plot_cluster_features.py --out "$OUT"
   # The animation gallery reads exported per-label dirs, which only exist after
   # export. Build it now only if they're there; otherwise export builds it.
   if [ -d "$OUT/segments" ]; then
@@ -175,13 +210,13 @@ print(f"wrote {out}/labels.csv with {len(df)} placeholder labels")
 PYEOF
   fi
   say "stage 3: export ($OUT/segments/<label>/)"
-  "$PY" export.py "$POOL" --out "$OUT"
+  "$PY" export.py --out "$OUT"
   cmd_gallery   # per-label animations now that segments/ exists
 }
 
 cmd_run() {
-  [ -d "$POOL" ] || die "no pool. run: ./pulse.sh pool <batches...>"
-  cmd_segment
+  # Optional <meta|dir>; without it, cmd_segment falls back to the work_pool.
+  cmd_segment "${1:-}"
   cmd_cluster "$K"
   cmd_eval
   cmd_qc
@@ -229,7 +264,7 @@ _raw_input_to_args() {
 # Build the optional-flag tail shared by raw_segment and raw_export.
 _raw_seg_extra() {
   local extra=""
-  [ -n "$SUBJECT" ] && extra="$extra --only-subject $SUBJECT"
+  [ -n "$SUBJECTS" ] && extra="$extra --subjects $SUBJECTS"
   [ -n "$ONLY_HAND" ] && extra="$extra --only-hand $ONLY_HAND"
   [ "$NO_OVERVIEW" = "1" ] && extra="$extra --no-overview"
   echo "$extra"
@@ -295,7 +330,7 @@ cmd_raw() {
 cmd_raw_status() {
   echo "PY        = $PY"
   echo "RAW_OUT   = $RAW_OUT"
-  echo "WORKERS   = $WORKERS    SUBJECT=$SUBJECT    ONLY_HAND=$ONLY_HAND"
+  echo "WORKERS   = $WORKERS    SUBJECTS=${SUBJECTS:-all}    ONLY_HAND=$ONLY_HAND"
   echo "QC keep   = lag_flag in ($RAW_LAG_FLAGS), pose_nan_frac<$RAW_NAN_MAX"
   for f in segments.csv clips.csv recordings.csv recordings_keep.csv; do
     if [ -f "$RAW_OUT/$f" ]; then

@@ -12,7 +12,9 @@ from emg_label.config import Config
 
 def main():
     ap = argparse.ArgumentParser(description="Stage 2: cluster segments per group")
-    ap.add_argument("input_dir", help="same folder of .npz used in stage 1")
+    ap.add_argument("input_dir", nargs="?", default=None,
+                    help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
+                         "located via each row's source_path (no work_pool needed).")
     ap.add_argument("--out", default="out")
     ap.add_argument("--fs", type=int, default=2000)
     ap.add_argument("--k-min", type=int, default=12)
@@ -84,7 +86,10 @@ def main():
                 feat_by_seg = None
 
             if feat_by_seg is None:
-                _, ja = io_utils.load_npz(os.path.join(args.input_dir, fname))
+                sp = (fdf["source_path"].iloc[0]
+                      if "source_path" in fdf.columns else None)
+                _, ja = io_utils.load_npz(
+                    io_utils.resolve_npz_path(fname, sp, args.input_dir))
                 rest = np.median(ja, axis=0)
                 feat_by_seg = {}
                 for _, row in fdf.iterrows():
