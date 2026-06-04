@@ -46,14 +46,15 @@ from emg_label.skeleton import (  # noqa: E402
 )
 
 FS = 2000
-OVERVIEW_REGEN_V = 9          # bump to invalidate regenerated overview_cache
+OVERVIEW_REGEN_V = 10         # bump to invalidate regenerated overview_cache
                               # (v3: rad/s; v4: y-axis cap; v5: live rad pose_thr;
                               #  v6: NaN-interp curve + persisted move_exit line;
                               #  v7: y-cap 4x->2x move_enter so holds are legible;
                               #  v8: move_enter/exit recomputed live (units-robust
                               #  vs stale deg pose_thresh in old recordings.csv);
                               #  v9: xlim=[0,n/fs] -> no left/right margin, playhead
-                              #  flush)
+                              #  flush; v10: pass hold_*/static_out_* so the blue
+                              #  hold span is the REAL hold, not the capped fallback)
 
 
 def _seg_pose_speed(ja):
@@ -496,12 +497,27 @@ class Store:
         st = self.by_stem[stem]
         bursts, apex, seg2pos = self._load_bursts(stem)
         sub = self.df.loc[st["row_idx"]]
-        clips = [dict(clip_id=int(r.clip_id),
-                      clip_start=int(r.clip_start_sample),
-                      clip_end=int(r.clip_end_sample),
-                      motion_start=int(r.motion_start_sample),
-                      motion_end=int(r.motion_end_sample))
-                 for r in sub.itertuples()]
+        cols = set(sub.columns)
+
+        def _clip_dict(r):
+            d = dict(clip_id=int(r.clip_id),
+                     clip_start=int(r.clip_start_sample),
+                     clip_end=int(r.clip_end_sample),
+                     motion_start=int(r.motion_start_sample),
+                     motion_end=int(r.motion_end_sample))
+            # The blue hold span: pass the REAL hold so plot_overview_dual draws
+            # it, not the [motion_end, clip_end] fallback. clip_end is post-static
+            # capped (~0.55s in the old SMC schema) so the fallback under-draws a
+            # ~1s hold to half. Prefer hold_* (new schema), else static_out_* (old).
+            if "hold_start_sample" in cols:
+                d["hold_start"] = int(r.hold_start_sample)
+                d["hold_end"] = int(r.hold_end_sample)
+            if "static_out_start_sample" in cols:
+                d["static_out_start"] = int(r.static_out_start_sample)
+                d["static_out_end"] = int(r.static_out_end_sample)
+            return d
+
+        clips = [_clip_dict(r) for r in sub.itertuples()]
         c2b = [seg2pos.get(int(r.matched_emg_seg_idx), -1) for r in sub.itertuples()]
         thr = lambda v: (None if v is None or not np.isfinite(v) else float(v))
         # Recompute move_enter/move_exit LIVE from THIS curve, exactly the way
@@ -585,7 +601,7 @@ class Store:
         if os.path.isfile(cache):
             with open(cache) as f:
                 d = json.load(f)
-            if d.get("v") == 8:        # ignore older-schema caches
+            if d.get("v") == 9:        # ignore older-schema caches
                 return d
         st = self.by_stem[stem]
         side = (st["hand"]
@@ -647,7 +663,8 @@ class Store:
                 print(f"overview regen failed for {stem}: {ex}")
                 ov_x0 = ov_x1 = None
         out = {
-            "v": 8, "stem": stem, "fps": POSE_FPS,
+            "v": 9, "stem": stem, "fps": POSE_FPS,   # bump when overview render
+                                                     # / curves / ov_x0,x1 change
             "duration_s": round(n / FS, 3),
             "n_frames": len(fidx),
             "ov_x0": ov_x0, "ov_x1": ov_x1,   # overview data-axis edges (img frac)
