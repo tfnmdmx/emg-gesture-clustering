@@ -56,7 +56,9 @@ def _group_features(input_dir, gdf, fs):
     """
     feats, cids, subs = [], [], []
     for fname, fdf in gdf.groupby("source_file"):
-        _, ja = io_utils.load_npz(os.path.join(input_dir, fname))
+        sp = fdf["source_path"].iloc[0] if "source_path" in fdf.columns else None
+        _, ja = io_utils.load_npz(
+            io_utils.resolve_npz_path(fname, sp, input_dir))
         rest = np.median(ja, axis=0)
         fdf = fdf.sort_values("start_sample")
         subj = _subject(fname)
@@ -194,7 +196,9 @@ def evaluate_group(group, X, cids, subs, subject_norm="none"):
 def main():
     ap = argparse.ArgumentParser(
         description="Evaluate pooled clustering for subject-invariance")
-    ap.add_argument("input_dir", help="folder of source .npz (stage-1 input)")
+    ap.add_argument("input_dir", nargs="?", default=None,
+                    help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
+                         "located via each row's source_path (no work_pool needed).")
     ap.add_argument("--out", default="out_4users")
     ap.add_argument("--fs", type=int, default=2000)
     ap.add_argument("--force", action="store_true",

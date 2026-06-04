@@ -33,7 +33,7 @@ WORKERS=8 ./pulse.sh raw /mnt/pose_data/emg2pose/data
 |--------|------|
 | `raw-segment` | `out_pose/shards/{stem}/*` + 顶层 `segments.csv / clips.csv / recordings.csv` + `features/{stem}.npz` |
 | `raw-qc` | `out_pose/recordings_keep.csv`（lag_flag=ok & pose_nan_frac<0.01 的子集） |
-| `raw-export` | `out_pose/clips_export/<key>.{npz,png}` + `index.html`（增量刷新） |
+| `raw-export` | `out_pose/clips_export/{stem}/c{cid:04d}.{npz,png}`（每条录制一个子目录）+ `index.html`（增量刷新） |
 
 跑完打开 `out_pose/clips_export/index.html` 浏览关键帧，往 `out_pose/clips.csv` 的 `gesture_label` 列填手势名即可。
 
@@ -151,10 +151,10 @@ cp out_pose/clips.csv out_pose/clips_labeled.csv
 
 ### A.6 单 clip 深度查看
 
-`export_clips.py` 产出的每个 `<key>.npz` 直接喂 `visualize_segment.py`：
+`export_clips.py` 产出的每个 npz 直接喂 `visualize_segment.py`：
 
 ```bash
-python visualize_segment.py out_pose/clips_export/<key>.npz -o /tmp/x.png
+python visualize_segment.py out_pose/clips_export/<stem>/c0000.npz -o /tmp/x.png
 # 四面板：16 通道 EMG / 包络 / 20 关节角 / 3D 手 (start/apex/end)
 ```
 
@@ -322,8 +322,8 @@ $PY export.py work_pool --out out
 PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
 
 # 静态四面板（EMG / 包络 / 关节角 / 3D 手 start-apex-end）
-$PY visualize_segment.py out_pose/clips_export/<key>.npz -o /tmp/x.png
+$PY visualize_segment.py out_pose/clips_export/<stem>/c0000.npz -o /tmp/x.png
 
 # 单段交互式 3D 动画（plotly html）
-$PY animate_segment.py out_pose/clips_export/<key>.npz
+$PY animate_segment.py out_pose/clips_export/<stem>/c0000.npz
 ```

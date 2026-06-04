@@ -415,9 +415,9 @@ segment.py ──► segments.csv (burst)
 
       ↓ 按 lag_flag、pose_nan_frac 筛 recordings.csv
 
-export_clips.py ──► clips_export/<key>.npz   (每个 clip 一个切片)
-                ├► clips_export/<key>.png   (6 帧关键帧)
-                └► clips_export/index.html  (浏览页 + QC 摘要 + matched_burst 标红)
+export_clips.py ──► clips_export/{stem}/c0000.npz   (每条录制一个子目录)
+                ├► clips_export/{stem}/c0000.png   (6 帧关键帧)
+                └► clips_export/index.html         (跨录制总览 + QC 摘要 + matched_burst 标红)
 
       ↓ 人浏览 index.html，在 clips.csv 填 gesture_label 列
 
@@ -518,7 +518,7 @@ io_utils.load_npz             │   ← 自动识别 + 对齐 pose 到 EMG 轴
      cluster.py → KMeans         export_clips.py
              │                          │
              ▼                          ▼
-     segments_clustered.csv      clips_export/*.npz + *.png + index.html
+     segments_clustered.csv      clips_export/{stem}/c*.npz + c*.png + index.html
              │                          │
    填 labels.csv 命名簇             浏览 index.html 填 clips.csv
              │                          │

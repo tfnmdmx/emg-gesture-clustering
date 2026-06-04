@@ -58,7 +58,10 @@ def _group_features(input_dir, gdf, fs, features_dir=None):
             if missing:
                 feat_by_seg = None
         if feat_by_seg is None:
-            _, ja = io_utils.load_npz(os.path.join(input_dir, fname))
+            sp = (fdf["source_path"].iloc[0]
+                  if "source_path" in fdf.columns else None)
+            _, ja = io_utils.load_npz(
+                io_utils.resolve_npz_path(fname, sp, input_dir))
             rest = np.median(ja, axis=0)
             feat_by_seg = {}
             for _, row in fdf.iterrows():
@@ -172,7 +175,9 @@ def plot_group(group, X, cids, out_path, do_tsne=True):
 def main():
     ap = argparse.ArgumentParser(
         description="Plot clustering feature space per group")
-    ap.add_argument("input_dir", help="folder of source .npz (stage-1 input)")
+    ap.add_argument("input_dir", nargs="?", default=None,
+                    help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
+                         "located via each row's source_path (no work_pool needed).")
     ap.add_argument("--out", default="out_fgw")
     ap.add_argument("--fs", type=int, default=2000)
     ap.add_argument("--no-tsne", action="store_true")

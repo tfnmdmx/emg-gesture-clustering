@@ -9,8 +9,8 @@ import os
 import numpy as np
 import pandas as pd
 
-from emg_label import (features, io_utils, plotting, pose_segmentation, qc,
-                       segmentation)
+from emg_label import (action_segmentation, features, io_utils, plotting,
+                       pose_segmentation, qc, segmentation)
 from emg_label.config import Config
 
 
@@ -25,17 +25,24 @@ CLIP_FIELDS = ["source_file", "source_path", "group", "subject", "hand",
                "static_in_start_sample", "static_in_end_sample",
                "motion_start_sample", "motion_end_sample",
                "static_out_start_sample", "static_out_end_sample",
+               # static_out_* IS the real hold now (motion+hold segment); the
+               # hold_* aliases name it explicitly. static_in_* is zero-width
+               # (no pre-motion pad -- the previous gesture's hold is its own seg).
+               "hold_start_sample", "hold_end_sample",
                "apex_sample", "duration_s", "motion_duration_s",
+               "hold_duration_s",
                "emg_rms", "envelope_peak",
                "mean_pose_speed", "max_pose_speed", "pose_range",
-               "matched_emg_seg_idx", "gesture_label"]
+               "matched_emg_seg_idx", "fusion_type",
+               "review_flag", "gesture_label"]
 
 REC_FIELDS = ["source_file", "source_path", "group", "subject", "hand",
               "n_samples", "duration_s", "n_bursts", "n_clips",
               "n_burst_only", "n_clip_only",
               "emg_pose_lag_s", "emg_pose_corr", "lag_flag",
               "pose_nan_frac", "emg_nan_frac",
-              "enter_thresh", "exit_thresh", "pose_thresh"]
+              "enter_thresh", "exit_thresh", "pose_thresh",
+              "rec_pose_range", "pose_static"]
 
 
 # ---------- atomic write helpers --------------------------------------------
@@ -131,38 +138,44 @@ def process_one(path: str, info, cfg: Config,
         return False
     n = len(emg)
 
-    # --- EMG burst path -----------------------------------------------------
-    segs, env, enter, exit_thr = segmentation.segment_emg(emg, cfg)
+    # --- Unified pose+EMG action segmentation ------------------------------
+    # The protocol is move -> hold -> move -> hold with NO neutral return: each
+    # 静止/hold is the just-formed gesture pose itself. pose-speed (the spine)
+    # draws every onset and where the hand settles; EMG re-splits over-long
+    # never-settling runs (R2). One action = a motion run + its following REAL
+    # stable hold, right boundary at the next onset (segments tile seamlessly,
+    # no artificial pad). move_enter/move_exit are adaptive per-recording
+    # (robust_threshold valley) -- pose-speed scale varies ~4x across recordings
+    # so a fixed deg/s does not work. Diagnostic-verified on jm-0503/ax-0819:
+    # ~1 segment per natural gesture, real hold median 0.6-1.0s, apex in hold
+    # >90%. See docs/检测切分统一设计.md + emg_label/action_segmentation.py.
+    actions, dbg = action_segmentation.segment_recording(emg, ja, cfg)
+    segs, env = dbg["bursts"], dbg["env"]
+    enter, exit_thr = dbg["enter"], dbg["exit_e"]
+    spd, pose_thr, pose_exit_thr = dbg["spd"], dbg["move_enter"], dbg["move_exit"]
+    rec_pose_range, pose_static = dbg["rec_pose_range"], bool(dbg["pose_static"])
+
+    # --- EMG burst path (cross-reference + Stage-2 features cache only) ------
     hold_ends = segmentation.hold_windows(segs, n, cfg.fs)
-    rest = np.median(ja, axis=0)
+    rest = np.nanmedian(ja, axis=0)
     burst_apexes = [features.apex_index(ja, s, he, rest, cfg.fs)
                     for (s, _), he in zip(segs, hold_ends)]
 
-    # --- Pose-speed clip path ----------------------------------------------
-    spd = pose_segmentation.pose_speed(ja, cfg.fs, cfg.pose_smooth_ms)
-    pose_thr = pose_segmentation.robust_threshold(
-        spd, cfg.pose_pct, cfg.pose_mad)
-    static, motion = pose_segmentation.static_motion_intervals(
-        spd, cfg.fs, pose_thr,
-        min_static_s=cfg.min_static_s,
-        min_motion_s=cfg.min_motion_s,
-        merge_gap_s=cfg.merge_gap_s,
-    )
-    clips = pose_segmentation.build_smc_clips(
-        static, motion, cfg.fs, n,
-        pre_static_s=cfg.pre_static_s,
-        post_static_s=cfg.post_static_s,
-        pad_s=cfg.pad_s,
-        min_motion_s=cfg.min_motion_s,
-    )
-    clip_apexes = []
-    for c in clips:
-        so_s, so_e = c["static_out_start"], c["static_out_end"]
-        if so_e > so_s:
-            clip_apexes.append(features.apex_index(
-                ja, so_s, so_e, rest, cfg.fs))
-        else:
-            clip_apexes.append((so_s + so_e) // 2)
+    clips, clip_apexes = [], []
+    for cid, a in enumerate(actions):
+        clips.append({
+            "clip_id": cid,
+            "clip_start": a["start"], "clip_end": a["end"],
+            # static_in zero-width (no pre-motion pad); static_out IS the real
+            # hold (aliased as hold_*), restoring the original SMC semantics.
+            "static_in_start": a["start"], "static_in_end": a["start"],
+            "motion_start": a["motion_start"], "motion_end": a["motion_end"],
+            "static_out_start": a["hold_start"], "static_out_end": a["hold_end"],
+            "hold_start": a["hold_start"], "hold_end": a["hold_end"],
+            "fusion_type": a["fusion_type"],
+            "review_flag": a["review_flag"],
+        })
+        clip_apexes.append(a["apex"])
 
     # --- Cross-reference ----------------------------------------------------
     burst_to_clip = pose_segmentation.match_bursts_to_clips(segs, clips)
@@ -195,6 +208,8 @@ def process_one(path: str, info, cfg: Config,
                      emg, env, ja, spd, cfg.fs)
         m_motion = _qc((c["motion_start"], c["motion_end"]),
                        emg, env, ja, spd, cfg.fs)
+        m_hold = _qc((c["hold_start"], c["hold_end"]),
+                     emg, env, ja, spd, cfg.fs)
         clip_rows.append({
             "source_file": info.stem + ".npz",
             "source_path": path,
@@ -210,15 +225,20 @@ def process_one(path: str, info, cfg: Config,
             "motion_end_sample": c["motion_end"],
             "static_out_start_sample": c["static_out_start"],
             "static_out_end_sample": c["static_out_end"],
+            "hold_start_sample": c["hold_start"],
+            "hold_end_sample": c["hold_end"],
             "apex_sample": ap,
             "duration_s": m_clip["duration_s"],
             "motion_duration_s": m_motion["duration_s"],
+            "hold_duration_s": m_hold["duration_s"],
             "emg_rms": round(m_clip["emg_rms"], 4),
             "envelope_peak": round(m_clip["envelope_peak"], 4),
             "mean_pose_speed": round(m_clip["mean_pose_speed"], 4),
             "max_pose_speed": round(m_clip["max_pose_speed"], 4),
             "pose_range": round(m_clip["pose_range"], 4),
             "matched_emg_seg_idx": mb,
+            "fusion_type": c["fusion_type"],
+            "review_flag": c["review_flag"],
             "gesture_label": "",
         })
 
@@ -249,6 +269,8 @@ def process_one(path: str, info, cfg: Config,
         "enter_thresh": round(float(enter), 6),
         "exit_thresh": round(float(exit_thr), 6),
         "pose_thresh": round(float(pose_thr), 6),
+        "rec_pose_range": round(rec_pose_range, 4),
+        "pose_static": int(pose_static),
     }
 
     # --- Stage-2 features cache (apex pose vectors, one per burst) ---------
@@ -276,9 +298,9 @@ def process_one(path: str, info, cfg: Config,
             paths["overview"],
             env=env, pose_speed=spd, fs=cfg.fs,
             burst_segments=segs, clips=clips,
-            clip_to_burst=clip_to_burst,
             enter_thr=enter, exit_thr=exit_thr, pose_thr=pose_thr,
-            apex_samples=burst_apexes,
+            pose_exit_thr=pose_exit_thr,
+            apex_samples=clip_apexes,  # clip apex = each movement's formed-pose frame
         )
     _atomic_write_csv(paths["recording"], REC_FIELDS, [rec_row])
 
@@ -349,6 +371,11 @@ def main():
     ap.add_argument("--smooth-ms", type=float, default=150.0)
     ap.add_argument("--enter-thresh", type=float, default=None)
     ap.add_argument("--exit-thresh", type=float, default=None)
+    ap.add_argument("--emg-enter-k", type=float, default=0.8,
+                    help="enter threshold placement rest_center(0)->Otsu valley(1). "
+                         "Lower to catch shorter/weaker bursts (1.0 = old behaviour).")
+    ap.add_argument("--emg-exit-k", type=float, default=0.4,
+                    help="hysteresis exit placement (must be < --emg-enter-k).")
     ap.add_argument("--pose-smooth-ms", type=float, default=250.0)
     ap.add_argument("--pose-pct", type=float, default=35.0)
     ap.add_argument("--pose-mad", type=float, default=1.5)
@@ -358,6 +385,19 @@ def main():
     ap.add_argument("--pre-static-s", type=float, default=0.5)
     ap.add_argument("--post-static-s", type=float, default=0.5)
     ap.add_argument("--pad-s", type=float, default=0.05)
+    # --- velocity-peak segmentation (dynamic-gesture clips) ---
+    ap.add_argument("--pose-prom-k", type=float, default=2.0,
+                    help="peak prominence = k * MAD(pose-speed)")
+    ap.add_argument("--pose-min-gesture-s", type=float, default=0.25,
+                    help="min peak spacing AND min segment length")
+    ap.add_argument("--pose-bound-frac", type=float, default=0.5,
+                    help="segment-bound level = frac * detect threshold")
+    ap.add_argument("--pose-peak-merge-gap-s", type=float, default=0.12)
+    ap.add_argument("--pose-min-range", type=float, default=15.0,
+                    help="absolute joint-excursion floor; segments/recordings "
+                         "below it are dropped as static (no real gesture)")
+    ap.add_argument("--pose-long-seg-s", type=float, default=2.5,
+                    help="segments longer than this get review_flag=long")
     # --- incremental-mode flags ---
     ap.add_argument("--force", action="store_true",
                     help="reprocess recordings even if their shard exists "
@@ -369,9 +409,13 @@ def main():
                     help="skip per-recording processing; just rebuild the "
                          "top-level segments/clips/recordings.csv from "
                          "existing shards.")
+    ap.add_argument("--subjects", default=None,
+                    help="comma-separated subject ids to keep. Matched on the "
+                         "NORMALIZED id (hyphen/case-insensitive), so 'fgw-0917' "
+                         "== 'fgw0917'. Works identically for --meta and dir "
+                         "input -- the unified id-based selector.")
     ap.add_argument("--only-subject", default=None,
-                    help="process only recordings with this subject "
-                         "(local rerun).")
+                    help="(alias for a single --subjects id; kept for back-compat)")
     ap.add_argument("--only-hand", choices=["left", "right"], default=None,
                     help="process only recordings with this hand.")
     ap.add_argument("--workers", type=int, default=1,
@@ -385,11 +429,16 @@ def main():
         fs=args.fs, out_dir=args.out, min_action_s=args.min_action_s,
         min_rest_gap_s=args.min_rest_gap_s, smooth_ms=args.smooth_ms,
         enter_thresh=args.enter_thresh, exit_thresh=args.exit_thresh,
+        emg_enter_k=args.emg_enter_k, emg_exit_k=args.emg_exit_k,
         pose_smooth_ms=args.pose_smooth_ms, pose_pct=args.pose_pct,
         pose_mad=args.pose_mad, min_static_s=args.min_static_s,
         min_motion_s=args.min_motion_s, merge_gap_s=args.merge_gap_s,
         pre_static_s=args.pre_static_s, post_static_s=args.post_static_s,
         pad_s=args.pad_s,
+        pose_prom_k=args.pose_prom_k, pose_min_gesture_s=args.pose_min_gesture_s,
+        pose_bound_frac=args.pose_bound_frac,
+        pose_peak_merge_gap_s=args.pose_peak_merge_gap_s,
+        pose_min_range=args.pose_min_range, pose_long_seg_s=args.pose_long_seg_s,
     )
     os.makedirs(os.path.join(cfg.out_dir, "shards"), exist_ok=True)
     os.makedirs(os.path.join(cfg.out_dir, "features"), exist_ok=True)
@@ -421,8 +470,17 @@ def main():
             print("All input was force_data; nothing to do.")
             return
 
+    sel = []
+    if args.subjects:
+        sel += [s for s in args.subjects.split(",") if s.strip()]
     if args.only_subject:
-        work = [(p, i) for p, i in work if i.subject == args.only_subject]
+        sel.append(args.only_subject)
+    if sel:
+        want = {io_utils.normalize_subject(s) for s in sel}
+        before = len(work)
+        work = [(p, i) for p, i in work
+                if io_utils.normalize_subject(i.subject) in want]
+        print(f"--subjects {','.join(sel)}: kept {len(work)}/{before} recordings")
     if args.only_hand:
         work = [(p, i) for p, i in work if i.hand == args.only_hand]
     if not work:

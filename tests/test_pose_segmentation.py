@@ -3,7 +3,7 @@ import numpy as np
 from emg_label.pose_segmentation import (
     build_smc_clips, mask_to_intervals, match_bursts_to_clips,
     match_clips_to_bursts, pose_speed, robust_threshold,
-    static_motion_intervals,
+    static_motion_intervals, velocity_peak_segments,
 )
 
 
@@ -102,3 +102,45 @@ def test_match_clips_to_bursts_symmetric():
     clips = [{"clip_id": 0, "clip_start": 0, "clip_end": 1000},
              {"clip_id": 1, "clip_start": 1200, "clip_end": 1700}]
     assert match_clips_to_bursts(clips, burst) == [0, 1]
+
+
+def test_velocity_peak_segments_one_per_separated_peak():
+    # Three well-separated velocity bells -> one dynamic segment each, with the
+    # apex at each bell's peak.
+    fs = 1000
+    spd = np.zeros(3000)
+    for c in (500, 1500, 2500):
+        spd[c - 200:c + 200] = np.hanning(400) * 10.0
+    segs, apex = velocity_peak_segments(
+        spd, fs, detect_thr=2.0, prom_k=2.0, min_gesture_s=0.2,
+        merge_gap_s=0.05)
+    assert len(segs) == 3
+    assert all(abs(a - c) < 30 for a, c in zip(apex, (500, 1500, 2500)))
+
+
+def test_velocity_peak_segments_splits_continuous_run_at_valley():
+    # A sustained plateau (never drops below the bound level) carrying two
+    # humps is ONE supra-bound run, but two peaks -> it must be split at the
+    # velocity valley between them. This is the case static->motion->static
+    # would have collapsed into one mega-clip.
+    fs = 1000
+    spd = np.zeros(2000)
+    spd[200:1800] = 3.0
+    spd[400:700] = np.hanning(300) * 7 + 3.0
+    spd[1100:1400] = np.hanning(300) * 7 + 3.0
+    segs, apex = velocity_peak_segments(
+        spd, fs, detect_thr=4.0, prom_k=2.0, min_gesture_s=0.2,
+        merge_gap_s=0.05)
+    assert len(segs) == 2
+    # boundary between the two segments is contiguous and falls in the velocity
+    # valley between the two humps (peaks ~550 and ~1250).
+    assert segs[0][1] == segs[1][0]
+    assert 690 <= segs[0][1] <= 1100
+
+
+def test_velocity_peak_segments_static_signal_yields_nothing():
+    # Flat low signal: no peak clears the detect threshold -> no segments.
+    fs = 1000
+    spd = np.full(3000, 0.5)
+    segs, apex = velocity_peak_segments(spd, fs, detect_thr=2.0)
+    assert segs == [] and apex == []

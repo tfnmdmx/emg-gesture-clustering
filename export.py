@@ -21,7 +21,9 @@ def _clean_label(value) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Stage 3: export labeled segments")
-    ap.add_argument("input_dir", help="same folder of .npz used in stage 1")
+    ap.add_argument("input_dir", nargs="?", default=None,
+                    help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
+                         "located via each row's source_path (no work_pool needed).")
     ap.add_argument("--out", default="out")
     ap.add_argument("--labels", default=None,
                     help="labels.csv path (default <out>/labels.csv)")
@@ -53,7 +55,9 @@ def main():
     # Process one source file at a time: export its labeled segments and draw
     # its labeled overview, then release it -- keeps memory flat for large sets.
     for fname, fdf in seg_df.groupby("source_file"):
-        info = io_utils.parse_file_info(os.path.join(args.input_dir, fname))
+        sp = fdf["source_path"].iloc[0] if "source_path" in fdf.columns else None
+        npz_path = io_utils.resolve_npz_path(fname, sp, args.input_dir)
+        info = io_utils.parse_file_info(npz_path)
         subj = info.subject or "NA"
         hand = info.hand or "NA"
         spans, labels = [], []
@@ -81,7 +85,7 @@ def main():
                 continue
             os.makedirs(out_d, exist_ok=True)
             if emg is None:
-                emg, ja = io_utils.load_npz(os.path.join(args.input_dir, fname))
+                emg, ja = io_utils.load_npz(npz_path)
             tmp = out_path + "._tmp_.npz"
             np.savez(
                 tmp,
@@ -101,8 +105,7 @@ def main():
                 pass
             else:
                 if emg is None:
-                    emg, ja = io_utils.load_npz(
-                        os.path.join(args.input_dir, fname))
+                    emg, ja = io_utils.load_npz(npz_path)
                 act = segmentation.emg_envelope(emg, cfg.fs, cfg.smooth_ms)
                 tmp = png + ".tmp.png"
                 plotting.plot_overview(emg, act, spans, cfg.fs, tmp,

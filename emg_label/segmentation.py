@@ -42,29 +42,40 @@ def _otsu_threshold(x, nbins: int = 256) -> float:
     return float(centers[int(np.argmax(sigma_b2))])
 
 
-def auto_thresholds(activity):
+def auto_thresholds(activity, enter_k: float = 0.8, exit_k: float = 0.4):
     """Bimodal (Otsu) split between rest and action activity levels.
 
-    Robust to how much of the recording is action: enter = Otsu valley,
-    exit = halfway between the rest-mode center and the valley (so the
-    detector exits cleanly back into rest without flickering). Falls back
-    to ``median + 1.5 * 1.4826 * MAD`` when Otsu collapses (e.g. near-uniform
-    signal) so the segmenter never silently returns zero segments on a usable
-    recording.
+    The Otsu valley ``t`` marks the gap between the rest mode and the action
+    mode. ``enter`` / ``exit`` are placed on the rest_center -> valley span by
+    ``enter_k`` / ``exit_k`` (0 = at rest_center, 1.0 = at the valley):
+
+        enter = rest_center + enter_k * (t - rest_center)
+        exit  = rest_center + exit_k  * (t - rest_center)
+
+    ``enter_k < 1.0`` lowers the enter threshold below the Otsu valley to catch
+    lower-amplitude bursts the valley alone would miss (recordings where a few
+    tall bursts drag the valley up); ``enter_k=1.0, exit_k=0.5`` reproduces the
+    original "enter at the valley, exit halfway" behaviour. The hysteresis (enter
+    high, exit low) keeps the detector from flickering near threshold.
+
+    Falls back to ``median + 1.2 * 1.4826 * MAD`` when Otsu collapses (e.g.
+    near-uniform signal) so the segmenter never silently returns zero segments
+    on a usable recording.
     """
     a = np.asarray(activity, dtype=float)
     t = _otsu_threshold(a)
     rest = a[a <= t]
     rest_center = float(np.median(rest)) if rest.size else float(a.min())
-    enter = float(t)
-    exit_thr = float(rest_center + 0.5 * (t - rest_center))
-    if enter <= exit_thr:
+    span = t - rest_center
+    enter = float(rest_center + enter_k * span)
+    exit_thr = float(rest_center + exit_k * span)
+    if enter <= exit_thr or span <= 0:
         # Otsu degenerate: rest_center sits at/above the valley. Use a robust
         # outlier-style threshold instead -- single-mode safe.
         median = float(np.median(a))
         mad_sigma = 1.4826 * float(np.median(np.abs(a - median)))
         if mad_sigma > 0:
-            enter = median + 1.5 * mad_sigma
+            enter = median + 1.2 * mad_sigma
             exit_thr = median + 0.5 * mad_sigma
     return enter, exit_thr
 
@@ -129,7 +140,8 @@ def segment_emg(emg, config):
     if config.enter_thresh is not None and config.exit_thresh is not None:
         enter, exit_thr = config.enter_thresh, config.exit_thresh
     else:
-        enter, exit_thr = auto_thresholds(activity)
+        enter, exit_thr = auto_thresholds(
+            activity, config.emg_enter_k, config.emg_exit_k)
     if enter <= exit_thr:
         # Degenerate (e.g. constant/silent signal): no usable rest/action split.
         return [], activity, enter, exit_thr

@@ -1,6 +1,58 @@
+import os
+
 import warnings
 
-from emg_label.io_utils import parse_file_info, group_files
+from emg_label.io_utils import (group_files, parse_file_info,
+                                resolve_npz_path)
+
+
+def test_resolve_npz_path_prefers_existing_source_path(tmp_path):
+    real = tmp_path / "rec.npz"
+    real.write_bytes(b"x")
+    # an existing source_path wins over the input_dir fallback
+    assert resolve_npz_path("rec.npz", str(real), "/pool") == str(real)
+
+
+def test_resolve_npz_path_falls_back_to_input_dir():
+    # missing/NaN/None source_path -> input_dir/source_file (legacy pool)
+    assert resolve_npz_path("a.npz", None, "/pool") == os.path.join("/pool", "a.npz")
+    assert resolve_npz_path("a.npz", float("nan"), "/pool") == os.path.join("/pool", "a.npz")
+    assert resolve_npz_path("a.npz", "/gone/x.npz", "/pool") == os.path.join("/pool", "a.npz")
+
+
+def test_resolve_npz_path_bare_filename_when_nothing_given():
+    assert resolve_npz_path("a.npz", None, None) == "a.npz"
+
+
+def test_normalize_subject_strips_hyphen_and_case():
+    from emg_label.io_utils import normalize_subject
+    assert normalize_subject("fgw-0917") == "fgw0917"
+    assert normalize_subject("fgw0917") == "fgw0917"
+    assert normalize_subject("FGW-0917") == "fgw0917"
+    assert normalize_subject(None) == ""
+    # canonical and batch-dir forms collapse to the same key
+    assert normalize_subject("zyb-0201") == normalize_subject("zyb0201")
+
+
+def test_parse_processed_batch_dir_timestamp_file():
+    # processed_data/<subj><date>_<hand>/<timestamp>.npz -- subject in dir name,
+    # no hyphen, bare-timestamp filename.
+    info = parse_file_info(
+        "/data/processed_data/fgw0917_0502_left/20260502_115218.npz")
+    assert info.subject == "fgw-0917"      # re-hyphenated to canonical
+    assert info.hand == "left"
+    assert info.group == "fgw-0917-left"
+    assert info.parsed is True
+    assert info.stem == "fgw-0917__fgw0917_0502_left__20260502_115218"  # unique
+
+
+def test_parse_processed_batch_dir_no_hand():
+    info = parse_file_info(
+        "/data/processed_data/zyb0201_20260514/20260514_175435.npz")
+    assert info.subject == "zyb-0201"
+    assert info.hand is None
+    assert info.group == "zyb-0201"
+    assert info.parsed is True
 
 
 def test_parse_standard_name():
