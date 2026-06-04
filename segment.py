@@ -3,46 +3,38 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
-import glob
+import hashlib
+import json
 import os
 
 import numpy as np
-import pandas as pd
 
 from emg_label import (action_segmentation, features, io_utils, plotting,
-                       pose_segmentation, qc, segmentation)
+                       pose_segmentation, qc, segmentation, store)
 from emg_label.config import Config
 
 
-SEG_FIELDS = ["source_file", "source_path", "group", "seg_idx",
-              "start_sample", "end_sample", "hold_end_sample",
-              "apex_sample", "duration_s", "emg_rms", "envelope_peak",
-              "pose_range", "matched_clip_id"]
+# Shard CSV schemas are the single source of truth in emg_label.store (the db
+# tables mirror them). bursts.csv = EMG activations (formerly the mis-named
+# segments.csv); clips.csv = pose action segments = the labelling/clustering unit.
+BURST_FIELDS = store.BURST_COLS   # source_file, burst_idx, group, start/end, ...
+CLIP_FIELDS = store.CLIP_COLS     # source_file, clip_id, start/end, hold_*, ...
+REC_FIELDS = store.REC_COLS       # ... + seg_version
 
-CLIP_FIELDS = ["source_file", "source_path", "group", "subject", "hand",
-               "clip_id",
-               "clip_start_sample", "clip_end_sample",
-               "static_in_start_sample", "static_in_end_sample",
-               "motion_start_sample", "motion_end_sample",
-               "static_out_start_sample", "static_out_end_sample",
-               # static_out_* IS the real hold now (motion+hold segment); the
-               # hold_* aliases name it explicitly. static_in_* is zero-width
-               # (no pre-motion pad -- the previous gesture's hold is its own seg).
-               "hold_start_sample", "hold_end_sample",
-               "apex_sample", "duration_s", "motion_duration_s",
-               "hold_duration_s",
-               "emg_rms", "envelope_peak",
-               "mean_pose_speed", "max_pose_speed", "pose_range",
-               "matched_emg_seg_idx", "fusion_type",
-               "review_flag", "gesture_label"]
 
-REC_FIELDS = ["source_file", "source_path", "group", "subject", "hand",
-              "n_samples", "duration_s", "n_bursts", "n_clips",
-              "n_burst_only", "n_clip_only",
-              "emg_pose_lag_s", "emg_pose_corr", "lag_flag",
-              "pose_nan_frac", "emg_nan_frac",
-              "enter_thresh", "exit_thresh", "pose_thresh", "pose_exit_thresh",
-              "rec_pose_range", "pose_static"]
+def _seg_version(cfg: Config) -> str:
+    """Short deterministic hash of the segmentation-relevant Config params, so a
+    label captured under one parameterization can be detected as stale and
+    remapped after a re-segmentation (see store.remap_annotations)."""
+    keys = ("fs", "smooth_ms", "min_action_s", "min_rest_gap_s", "emg_enter_k",
+            "emg_exit_k", "pose_smooth_ms", "pose_pct", "pose_mad",
+            "min_static_s", "min_motion_s", "move_enter", "move_exit",
+            "settle_frac", "auto_move_thresh", "move_exit_frac", "enable_r2",
+            "enable_r7", "max_hold_s", "snap_window_s", "nan_max_gap_s",
+            "min_finite_frac", "pose_min_range", "pose_long_seg_s")
+    blob = json.dumps({k: getattr(cfg, k) for k in keys}, sort_keys=True,
+                      default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()[:8]
 
 
 # ---------- atomic write helpers --------------------------------------------
@@ -99,7 +91,7 @@ def _shard_paths(out_dir: str, stem: str) -> dict:
     return {
         "dir": shard_dir,
         "overview": os.path.join(shard_dir, "overview.png"),
-        "segments": os.path.join(shard_dir, "segments.csv"),
+        "bursts": os.path.join(shard_dir, "bursts.csv"),
         "clips": os.path.join(shard_dir, "clips.csv"),
         "recording": os.path.join(shard_dir, "recording.csv"),
         "features": os.path.join(out_dir, "features", stem + ".npz"),
@@ -182,15 +174,15 @@ def process_one(path: str, info, cfg: Config,
     clip_to_burst = pose_segmentation.match_clips_to_bursts(clips, segs)
 
     # --- Build CSV rows -----------------------------------------------------
-    seg_rows = []
-    for seg_idx, ((s, e), he, ap, mc) in enumerate(
+    seg_version = _seg_version(cfg)
+    burst_rows = []
+    for burst_idx, ((s, e), he, ap, mc) in enumerate(
             zip(segs, hold_ends, burst_apexes, burst_to_clip)):
         m = _qc((s, e), emg, env, ja, spd, cfg.fs)
-        seg_rows.append({
+        burst_rows.append({
             "source_file": info.stem + ".npz",
-            "source_path": path,
             "group": info.group,
-            "seg_idx": seg_idx,
+            "burst_idx": burst_idx,
             "start_sample": s,
             "end_sample": e,
             "hold_end_sample": he,
@@ -212,19 +204,14 @@ def process_one(path: str, info, cfg: Config,
                      emg, env, ja, spd, cfg.fs)
         clip_rows.append({
             "source_file": info.stem + ".npz",
-            "source_path": path,
             "group": info.group,
             "subject": info.subject or "",
             "hand": info.hand or "",
             "clip_id": c["clip_id"],
-            "clip_start_sample": c["clip_start"],
-            "clip_end_sample": c["clip_end"],
-            "static_in_start_sample": c["static_in_start"],
-            "static_in_end_sample": c["static_in_end"],
+            "start_sample": c["clip_start"],
+            "end_sample": c["clip_end"],
             "motion_start_sample": c["motion_start"],
             "motion_end_sample": c["motion_end"],
-            "static_out_start_sample": c["static_out_start"],
-            "static_out_end_sample": c["static_out_end"],
             "hold_start_sample": c["hold_start"],
             "hold_end_sample": c["hold_end"],
             "apex_sample": ap,
@@ -236,10 +223,10 @@ def process_one(path: str, info, cfg: Config,
             "mean_pose_speed": round(m_clip["mean_pose_speed"], 4),
             "max_pose_speed": round(m_clip["max_pose_speed"], 4),
             "pose_range": round(m_clip["pose_range"], 4),
-            "matched_emg_seg_idx": mb,
+            "matched_burst_idx": mb,
             "fusion_type": c["fusion_type"],
             "review_flag": c["review_flag"],
-            "gesture_label": "",
+            "seg_version": seg_version,
         })
 
     # --- Recording-level QC -------------------------------------------------
@@ -272,27 +259,28 @@ def process_one(path: str, info, cfg: Config,
         "pose_exit_thresh": round(float(pose_exit_thr), 6),
         "rec_pose_range": round(rec_pose_range, 4),
         "pose_static": int(pose_static),
+        "seg_version": seg_version,
     }
 
-    # --- Stage-2 features cache (apex pose vectors, one per burst) ---------
-    # Computed here so cluster.py never has to reload the npz to redo this
-    # deterministic transform.
-    if segs:
+    # --- Stage-2 features cache (apex pose vector, one per CLIP) -----------
+    # The clustering unit is the clip, so cache the clip-apex feature keyed by
+    # clip_id; cluster.py reads it without reloading the npz. (Computed from each
+    # clip's already-located apex_sample within its hold.)
+    if clips:
         feat_arr = np.stack([
-            features.apex_pose_feature(ja, s, he, rest, cfg.fs)
-            for (s, _), he in zip(segs, hold_ends)
+            features.clip_apex_feature(ja, ap, cfg.fs) for ap in clip_apexes
         ]).astype(np.float32)
     else:
         feat_arr = np.empty((0, ja.shape[1]), dtype=np.float32)
     _atomic_savez(
         paths["features"],
-        seg_idx=np.arange(len(segs), dtype=np.int64),
+        clip_id=np.arange(len(clips), dtype=np.int64),
         feature=feat_arr,
         rest=rest.astype(np.float32),
     )
 
     # --- Shard atomic writes (recording.csv LAST = commit point) -----------
-    _atomic_write_csv(paths["segments"], SEG_FIELDS, seg_rows)
+    _atomic_write_csv(paths["bursts"], BURST_FIELDS, burst_rows)
     _atomic_write_csv(paths["clips"], CLIP_FIELDS, clip_rows)
     if write_overview:
         _atomic_plot_overview(
@@ -317,36 +305,15 @@ def process_one(path: str, info, cfg: Config,
 # ---------- top-level index assembly ---------------------------------------
 
 def rebuild_index(out_dir: str) -> None:
-    """Concat all shards/*/{segments,clips,recording}.csv into the three
-    top-level CSVs that the rest of the pipeline reads."""
-    mapping = [
-        ("segments.csv", "segments.csv", SEG_FIELDS,
-         ["source_file", "seg_idx"]),
-        ("clips.csv", "clips.csv", CLIP_FIELDS,
-         ["source_file", "clip_id"]),
-        ("recording.csv", "recordings.csv", REC_FIELDS,
-         ["source_file"]),
-    ]
-    n_rec = 0
-    for shard_name, top_name, fields, sort_by in mapping:
-        paths = sorted(glob.glob(
-            os.path.join(out_dir, "shards", "*", shard_name)))
-        if paths:
-            dfs = [pd.read_csv(p, dtype={"source_file": str}) for p in paths]
-            df = pd.concat(dfs, ignore_index=True)
-            df = df.sort_values(sort_by, kind="stable").reset_index(drop=True)
-            df = df[fields]
-        else:
-            df = pd.DataFrame(columns=fields)
-        df.to_csv(os.path.join(out_dir, top_name), index=False)
-        if top_name == "recordings.csv":
-            n_rec = len(df)
-            n_lag_ok = int((df.get("lag_flag", pd.Series(dtype=str))
-                            == "ok").sum())
-    print(f"Wrote {os.path.join(out_dir, 'segments.csv')}")
-    print(f"Wrote {os.path.join(out_dir, 'clips.csv')}")
-    print(f"Wrote {os.path.join(out_dir, 'recordings.csv')} "
-          f"({n_rec} recordings, {n_lag_ok}/{n_rec} ok lag)")
+    """Rebuild the SQLite index (OUT/index.db) from every shard, then dump the
+    top-level convenience CSVs (recordings/bursts/clips.csv). Tombstoned
+    recordings are skipped by store.build_index. The db is the authoritative
+    index; the CSVs are a derived courtesy for flat-file dev tools."""
+    counts = store.build_index(out_dir)
+    store.export_csv(out_dir)
+    print(f"Indexed {counts['recordings']} recordings, {counts['bursts']} "
+          f"bursts, {counts['clips']} clips into {store.db_path(out_dir)}")
+    print(f"Wrote convenience CSVs: {out_dir}/recordings.csv, bursts.csv, clips.csv")
 
 
 # ---------- CLI -------------------------------------------------------------
@@ -511,6 +478,18 @@ def main():
     if not work:
         print("No work after --only-* filters.")
         return
+
+    # Skip tombstoned recordings (permanently dropped via the label UI) so a
+    # re-segmentation never resurrects them. Tombstone = hard "do not process".
+    tomb = store.tombstoned(cfg.out_dir)
+    if tomb:
+        before = len(work)
+        work = [(p, i) for p, i in work if (i.stem + ".npz") not in tomb]
+        if before != len(work):
+            print(f"SKIP {before - len(work)} tombstoned recording(s)")
+        if not work:
+            print("All work tombstoned; nothing to do.")
+            return
 
     # Pre-filter cached shards so workers never spawn for already-done items
     # (each pool worker startup costs ~50-100ms; not worth paying for a no-op).

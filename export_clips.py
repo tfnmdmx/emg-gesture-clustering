@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-"""Export each clip in clips.csv as a npz + 6-keyframe PNG for hand-labelling.
+"""Export each clip as a npz + 6-keyframe PNG for visual review.
 
 Workflow for building a ground-truth test set:
-    1. ``python segment.py <input_dir> --out <out>``     -> writes clips.csv
-    2. ``python export_clips.py <input_dir> --out <out>`` -> writes per-clip
-       npz/png and ``index.html`` under ``<out>/clips_export/``.
-    3. Open ``index.html`` to scan keyframes; fill the ``gesture_label`` column
-       in ``<out>/clips.csv`` while browsing.
+    1. ``python segment.py <input_dir> --out <out>``     -> writes index.db (+ clips.csv)
+    2. ``python export_clips.py --out <out>`` -> writes per-clip npz/png and
+       ``index.html`` under ``<out>/clips_export/`` (a static keyframe gallery).
+    3. Hand-label clips in the interactive web UI (``./pulse.sh label``), which
+       writes per-clip labels to the index.db annotations table. (This static
+       gallery is for offline scanning; labels are NOT entered by editing a CSV.)
 
 Each clip gets one PNG showing 6 hand poses (start, pre-motion, motion 1/3,
 motion 2/3, apex, end) -- enough to recognise the gesture without opening a
@@ -61,7 +62,7 @@ def _clip_paths(export_dir: str, stem: str, clip_id) -> dict:
 def _keyframe_indices(row, n_clip: int):
     """Six within-clip sample indices: start, pre-motion, motion 1/3, motion 2/3,
     apex, end-1. Returned in clip-local coordinates (0..n_clip-1)."""
-    cs = int(row["clip_start_sample"])
+    cs = int(row["start_sample"])
     ms = int(row["motion_start_sample"])
     me = int(row["motion_end_sample"])
     ap = int(row["apex_sample"])
@@ -158,7 +159,7 @@ def _write_index(path: str, entries_by_source: dict, fs: int) -> None:
         parts.append("<table><tr><th>clip</th><th>QC</th><th>keyframes (start &rarr; pre-motion &rarr; 1/3 &rarr; 2/3 &rarr; apex &rarr; end)</th></tr>")
         for e in sorted(ents, key=lambda x: int(x["row"]["clip_id"])):
             row = e["row"]
-            matched = int(row["matched_emg_seg_idx"])
+            matched = int(row["matched_burst_idx"])
             matched_html = (f"<span class=warn>burst -1</span>" if matched < 0
                             else f"burst {matched}")
             qc = (f"dur {row['duration_s']:.2f}s &middot; "
@@ -282,8 +283,8 @@ def main():
                 })
                 continue
 
-            cs = int(row["clip_start_sample"])
-            ce = int(row["clip_end_sample"])
+            cs = int(row["start_sample"])
+            ce = int(row["end_sample"])
             n_clip = ce - cs
 
             # --- Write the slice ------------------------------------------
@@ -294,19 +295,17 @@ def main():
                     emg=emg[cs:ce], joint_angles=ja[cs:ce],
                     fs=int(args.fs),
                     clip_start=cs, clip_end=ce,
-                    static_in_start=int(row["static_in_start_sample"]),
-                    static_in_end=int(row["static_in_end_sample"]),
                     motion_start=int(row["motion_start_sample"]),
                     motion_end=int(row["motion_end_sample"]),
-                    static_out_start=int(row["static_out_start_sample"]),
-                    static_out_end=int(row["static_out_end_sample"]),
+                    hold_start=int(row["hold_start_sample"]),
+                    hold_end=int(row["hold_end_sample"]),
                     apex=int(row["apex_sample"]),
                     source_file=str(source_file),
                     group=str(row["group"]),
                     subject=str(row.get("subject", "")),
                     hand=str(row.get("hand", side)),
                     clip_id=int(row["clip_id"]),
-                    matched_emg_seg_idx=int(row.get("matched_emg_seg_idx", -1)),
+                    matched_burst_idx=int(row.get("matched_burst_idx", -1)),
                 )
                 os.replace(tmp, npz_out)
                 n_npz += 1
@@ -374,7 +373,8 @@ def main():
     print(f"Wrote {n_npz} npz ({n_npz_cached} cached), "
           f"{n_png} PNGs ({n_png_cached} cached, {n_png_failed} failed) "
           f"to {export_dir}")
-    print(f"Open {index_path} and fill `gesture_label` in {clips_path}")
+    print(f"Open {index_path} to scan keyframes; hand-label via ./pulse.sh label "
+          f"(writes index.db annotations).")
 
 
 if __name__ == "__main__":

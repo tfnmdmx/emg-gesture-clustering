@@ -1,80 +1,87 @@
 from __future__ import annotations
 
-"""Stage 2.5: evaluate a pooled multi-subject clustering for subject-invariance.
+"""Stage 2.5: evaluate ONE clustering run -- label-driven + subject-invariance.
 
-The end goal is subject-INDEPENDENT gesture recognition: clusters should be
-gestures, not people. Plain silhouette can't tell those apart (one person's
-data is naturally tight, so optimizing silhouette can even reward clustering
-by person). This script turns "does it generalize across people" into numbers,
-using only the data we already have -- no gesture ground-truth required.
+Evaluates a run registered in ``OUT/index.db`` (apex or trajectory channel)
+against the human clip labels in ``annotations`` -- the real "用打标评估聚类".
+Because the clustering unit and the labelling unit are both the clip
+``(source_file, clip_id)``, this is a single JOIN (store.clusters_with_labels).
 
-For each ``group`` in ``<out>/segments_clustered.csv`` it reports:
+Reports (written to ``cluster_runs/{run_id}/metrics.json``):
 
-  1. Cluster quality   -- overall + weakest per-cluster silhouette.
-  2. Subject contamination -- dominant-subject fraction per cluster and how many
-     clusters are dominated by one person. Lower = better (closer to balanced).
-  3. Subject LEAKAGE   -- accuracy of a classifier predicting *which subject*
-     a segment came from, using the pose features (stratified 5-fold CV).
-     Near the random baseline = features carry little identity = good.
-     Well above baseline = features encode the person, not just the gesture.
-  4. LOSO transfer     -- leave-one-subject-out: cluster on N-1 subjects, drop
-     the held-out subject onto the nearest centroid, and measure how tightly
-     the held-out poses fit the learned gesture structure (transfer ratio).
-     Ratio near 1.0 = the held-out person lands as cleanly as training people.
-
-Headline numbers to drive down over iterations: subject-leakage accuracy and
-mean dominant-subject fraction, both toward the random baseline, while keeping
-silhouette up and the LOSO transfer ratio near 1.0.
+  A. LABEL-DRIVEN (on the labelled subset; needs >=2 labelled clips & >=2
+     gesture classes): Adjusted Rand Index, Normalized Mutual Info, cluster
+     purity, and per-cluster dominant-gesture fraction. NaN/None when too few
+     labels (does NOT crash).
+  B. SUBJECT CONTAMINATION -- dominant-subject fraction per cluster (no labels
+     needed): clusters should be gestures, not people.
+  C. POSE-SPACE QUALITY -- silhouette + subject-leakage + LOSO transfer computed
+     on the apex pose representation (a generic pose-space probe; for the
+     trajectory channel this is an auxiliary view, not its own feature space).
 
 Usage:
-    python evaluate.py <input_dir> [--out out] [--fs 2000] [--force]
+    python evaluate.py --out out [--run <run_id>] [--fs 2000] [--subject-norm none]
+    (--run defaults to the latest run in the db)
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import silhouette_samples, silhouette_score
+from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
+                             silhouette_score)
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
 
-from emg_label import features, io_utils
+from emg_label import features, store
 
 
-def _subject(source_file: str) -> str:
-    return str(source_file).split("__")[0]
+def _pose_features(out_dir, cw, fs):
+    """Apex pose-feature matrix for a run's clips, aligned row-for-row with `cw`
+    (a pose-space probe for silhouette/leakage/LOSO). Reads the OUT/features
+    cache (clip-keyed); recomputes from the npz on miss. Torch-free."""
+    features_dir = os.path.join(out_dir, "features")
+    conn = store.connect(out_dir)
+    srcp = {r["source_file"]: r["source_path"]
+            for r in conn.execute("SELECT source_file, source_path FROM recordings")}
+    feat = {}
+    for sf, g in cw.groupby("source_file"):
+        cdf = pd.DataFrame(store.clips_for_recording(conn, sf))  # has apex_sample
+        if cdf.empty:
+            continue
+        fb, _ = features.clip_features_for(sf, cdf, fs, features_dir,
+                                           source_path=srcp.get(sf))
+        for cid in g["clip_id"]:
+            if int(cid) in fb:
+                feat[(sf, int(cid))] = fb[int(cid)]
+    conn.close()
+    return np.asarray([feat.get((r["source_file"], int(r["clip_id"])))
+                       for _, r in cw.iterrows()
+                       if (r["source_file"], int(r["clip_id"])) in feat], dtype=float)
 
 
-def _group_features(input_dir, gdf, fs, features_dir=None):
-    """(X, cluster_ids, subjects) for one group, aligned row-for-row.
-
-    Uses the shared features.feature_by_seg extractor so it scores EXACTLY the
-    apex features cluster.py clustered (same out/features cache, same nan-aware
-    rest) rather than an independently recomputed variant.
-    """
-    feats, cids, subs = [], [], []
-    for fname, fdf in gdf.groupby("source_file"):
-        fdf = fdf.sort_values("start_sample")
-        subj = _subject(fname)
-        feat_by_seg, _ = features.feature_by_seg(
-            fname, fdf, fs, features_dir, input_dir)
-        for _, row in fdf.iterrows():
-            feats.append(feat_by_seg[int(row["seg_idx"])])
-            cids.append(int(row["cluster_id"]))
-            subs.append(subj)
-    return np.asarray(feats), np.asarray(cids), np.asarray(subs)
-
-
-def _cluster_quality(Xz, cids):
-    uniq = sorted(set(int(c) for c in cids))
-    sil = silhouette_score(Xz, cids)
-    ss = silhouette_samples(Xz, cids)
-    per = {c: float(ss[cids == c].mean()) for c in uniq}
-    weak = sorted(per.items(), key=lambda kv: kv[1])[:3]
-    return sil, per, weak
+def _label_metrics(cw) -> dict:
+    """Label-driven cluster scores on the labelled subset of `cw`
+    (gesture_label non-empty). None when too few labels/classes."""
+    lab = cw[cw["gesture_label"].notna()
+             & (cw["gesture_label"].astype(str).str.len() > 0)]
+    n_lab, n_cls = len(lab), lab["gesture_label"].nunique()
+    if n_lab < 2 or n_cls < 2:
+        return {"n_labeled": int(n_lab), "n_classes": int(n_cls),
+                "ari": None, "nmi": None, "purity": None}
+    y = lab["gesture_label"].to_numpy()
+    c = lab["cluster_id"].to_numpy()
+    purity = sum(int((y[c == cid] == m).sum())
+                 for cid in set(c)
+                 for m in [pd.Series(y[c == cid]).value_counts().index[0]]) / n_lab
+    return {"n_labeled": int(n_lab), "n_classes": int(n_cls),
+            "ari": round(float(adjusted_rand_score(y, c)), 4),
+            "nmi": round(float(normalized_mutual_info_score(y, c)), 4),
+            "purity": round(float(purity), 4)}
 
 
 def _contamination(cids, subs):
@@ -137,109 +144,89 @@ def _loso_transfer(X, cids, subs, random_state=0):
     return out
 
 
-def evaluate_group(group, X, cids, subs, subject_norm="none"):
-    # Measure the SAME representation that was clustered: optionally normalize
-    # each subject in feature space before z-scoring (and before LOSO, where it
-    # acts as test-time per-person normalization).
-    Xc = features.apply_subject_norm(X, subs, subject_norm)
-    Xz, _, _ = features.zscore(Xc)
-    uniq = sorted(set(int(c) for c in cids))
-    print(f"\n{'='*72}\nGROUP: {group}   N={len(X)}  k={len(uniq)}  "
-          f"subjects={sorted(set(subs))}")
-
-    sil, per, weak = _cluster_quality(Xz, cids)
-    print(f"\n[1] CLUSTER QUALITY")
-    print(f"    overall silhouette : {sil:.3f}   (>0.30 = reasonable structure)")
-    print(f"    weakest clusters   : " +
-          ", ".join(f"c{c}={v:.3f}" for c, v in weak))
-
-    if len(set(subs)) < 2:
-        print("\n    (single-subject group -- subject metrics N/A)")
-        return {"group": group, "silhouette": sil, "n_subjects": 1}
-
-    rows, fracs, n_subj = _contamination(cids, subs)
-    heavy50 = int((fracs > 0.50).sum())
-    heavy77 = int((fracs > 0.77).sum())
-    print(f"\n[2] SUBJECT CONTAMINATION   (ideal dominant frac ~{1/n_subj:.2f})")
-    print(f"    mean dominant-subject fraction : {fracs.mean():.3f}")
-    print(f"    clusters >50% one subject      : {heavy50}/{len(uniq)}")
-    print(f"    clusters >77% one subject      : {heavy77}/{len(uniq)}")
-    worst = sorted(rows, key=lambda r: -r[3])[:5]
-    print(f"    most contaminated: " +
-          ", ".join(f"c{c}({_subject(sj).split('-')[0]} {fr:.0%})"
-                    for c, _, sj, fr in worst))
-
-    leak = _subject_leakage(Xz, subs)
-    acc, rb, maj = leak
-    print(f"\n[3] SUBJECT LEAKAGE   (lower = more subject-invariant)")
-    print(f"    classifier predicts subject : {acc:.3f}")
-    print(f"    random baseline             : {rb:.3f}")
-    print(f"    majority-class baseline     : {maj:.3f}")
-    print(f"    -> leakage above random     : +{acc-rb:.3f}  "
-          f"({'HIGH' if acc-rb > 0.2 else 'moderate' if acc-rb > 0.1 else 'low'})")
-
-    loso = _loso_transfer(Xc, cids, subs)
-    ratios = [r[2] for r in loso]
-    print(f"\n[4] LOSO TRANSFER   (ratio~1.0 = held-out person fits as tightly as train)")
-    for s, n, ratio in loso:
-        print(f"    hold out {s.split('-')[0]:>4} (n={n:>5}): transfer ratio={ratio:.2f}")
-    print(f"    mean transfer ratio={np.mean(ratios):.2f}")
-
-    return {
-        "group": group, "silhouette": sil, "n_subjects": n_subj,
-        "mean_dominant_frac": float(fracs.mean()),
-        "heavy50": heavy50, "heavy77": heavy77,
-        "subject_leak_acc": acc, "random_baseline": rb,
-        "loso_transfer_ratio": float(np.mean(ratios)),
-    }
-
-
 def main():
     ap = argparse.ArgumentParser(
-        description="Evaluate pooled clustering for subject-invariance")
-    ap.add_argument("input_dir", nargs="?", default=None,
-                    help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
-                         "located via each row's source_path (no work_pool needed).")
+        description="Evaluate one clustering run: label-driven + subject-invariance")
     ap.add_argument("--out", default="out")
+    ap.add_argument("--run", default=None,
+                    help="run_id under cluster_runs/ (default: latest in the db)")
     ap.add_argument("--fs", type=int, default=2000)
-    ap.add_argument("--force", action="store_true",
-                    help="recompute features even if eval cache exists")
     ap.add_argument("--subject-norm", choices=["none", "center", "zscore"],
                     default="none",
-                    help="evaluate the per-subject normalized representation "
+                    help="per-subject feature norm for the pose-space probe "
                          "(match cluster.py --subject-norm)")
     args = ap.parse_args()
 
-    clu = pd.read_csv(os.path.join(args.out, "segments_clustered.csv"))
-    invalid = io_utils.load_invalid_recordings(args.out)
-    if invalid:
-        clu = clu[~clu["source_file"].astype(str).isin(invalid)] \
-            .reset_index(drop=True)
-    cache_dir = os.path.join(args.out, "eval_cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    conn = store.connect(args.out)
+    run = args.run or store.latest_run(conn)
+    if not run:
+        raise SystemExit(f"no cluster runs in {store.db_path(args.out)}; "
+                         f"run cluster.py / cluster_traj.py first")
+    meta = conn.execute("SELECT channel, params_json FROM cluster_runs WHERE run_id=?",
+                        (run,)).fetchone()
+    channel = meta["channel"] if meta else "?"
+    cw = store.clusters_with_labels(conn, run)
+    conn.close()
+    if cw.empty:
+        raise SystemExit(f"run {run} has no assignments")
+    cw["subject"] = cw["subject"].fillna("").astype(str)
+    cids = cw["cluster_id"].to_numpy()
+    subs = cw["subject"].to_numpy()
+    uniq = sorted(set(int(c) for c in cids))
+    print(f"{'='*72}\nRUN {run}  channel={channel}  N={len(cw)}  k={len(uniq)}")
 
-    summary = []
-    for group, gdf in clu.groupby("group"):
-        cache = os.path.join(cache_dir, f"{group}.npz")
-        if os.path.exists(cache) and not args.force:
-            z = np.load(cache, allow_pickle=True)
-            X, cids, subs = z["X"], z["cids"], z["subs"]
-            print(f"[{group}] loaded cached features {X.shape}")
-        else:
-            print(f"[{group}] computing features ...")
-            X, cids, subs = _group_features(
-                args.input_dir, gdf, args.fs,
-                features_dir=os.path.join(args.out, "features"))
-            np.savez(cache, X=X, cids=cids, subs=subs)
-        summary.append(evaluate_group(group, X, cids, subs,
-                                       subject_norm=args.subject_norm))
+    # --- A. label-driven (the point: 用打标评估聚类) -----------------------
+    lab = _label_metrics(cw)
+    print(f"\n[A] LABEL-DRIVEN  (labelled clips: {lab['n_labeled']}, "
+          f"gestures: {lab['n_classes']})")
+    if lab["ari"] is None:
+        print("    too few labelled clips / classes -- ARI/NMI/purity = N/A")
+    else:
+        print(f"    ARI={lab['ari']}  NMI={lab['nmi']}  purity={lab['purity']}")
 
-    print(f"\n{'='*72}\nSUMMARY")
-    sdf = pd.DataFrame(summary)
-    print(sdf.to_string(index=False))
-    out_csv = os.path.join(args.out, "eval_metrics.csv")
-    sdf.to_csv(out_csv, index=False)
-    print(f"\nWrote {out_csv}")
+    # --- B. subject contamination (label-free) ----------------------------
+    n_subj = len(set(subs) - {""})
+    contam = {}
+    if n_subj >= 2:
+        rows, fracs, ns = _contamination(cids, subs)
+        contam = {"mean_dominant_subject_frac": round(float(fracs.mean()), 4),
+                  "heavy50": int((fracs > 0.50).sum()),
+                  "heavy77": int((fracs > 0.77).sum()), "n_subjects": ns}
+        print(f"\n[B] SUBJECT CONTAMINATION (ideal dominant frac ~{1/ns:.2f})")
+        print(f"    mean dominant-subject fraction: {fracs.mean():.3f}  "
+              f"heavy>50%: {contam['heavy50']}/{len(uniq)}")
+
+    # --- C. pose-space quality (silhouette/leakage/LOSO; auxiliary) --------
+    pose = {}
+    X = _pose_features(args.out, cw, args.fs)
+    if len(X) == len(cw) and len(uniq) >= 2 and len(X) > len(uniq):
+        Xc = features.apply_subject_norm(X, subs, args.subject_norm)
+        Xz, _, _ = features.zscore(Xc)
+        sil = float(silhouette_score(Xz, cids))
+        pose["pose_silhouette"] = round(sil, 4)
+        print(f"\n[C] POSE-SPACE (apex probe)  silhouette={sil:.3f}")
+        if n_subj >= 2:
+            leak = _subject_leakage(Xz, subs)
+            if leak:
+                pose["subject_leak_acc"] = round(leak[0], 4)
+                pose["random_baseline"] = round(leak[1], 4)
+                print(f"    subject-leakage acc={leak[0]:.3f} "
+                      f"(random {leak[1]:.3f})")
+            loso = _loso_transfer(Xc, cids, subs)
+            if loso:
+                pose["loso_transfer_ratio"] = round(float(np.mean([r[2] for r in loso])), 3)
+                print(f"    LOSO transfer ratio={pose['loso_transfer_ratio']}")
+    else:
+        print("\n[C] POSE-SPACE: skipped (insufficient/aligned features)")
+
+    metrics = {"run_id": run, "channel": channel, "n_clips": int(len(cw)),
+               "k": len(uniq), "label_driven": lab,
+               "subject_contamination": contam, "pose_space": pose}
+    run_dir = os.path.join(args.out, "cluster_runs", run)
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2, default=str)
+    print(f"\nWrote {os.path.join(run_dir, 'metrics.json')}")
 
 
 if __name__ == "__main__":

@@ -29,20 +29,33 @@ from sklearn.decomposition import PCA  # noqa: E402
 from sklearn.manifold import TSNE  # noqa: E402
 from sklearn.metrics import silhouette_samples  # noqa: E402
 
-from emg_label import features  # noqa: E402
+from emg_label import features, store  # noqa: E402
 
 
-def _group_features(input_dir, gdf, fs, features_dir=None):
-    """(X, cluster_ids) for one group via the shared features.feature_by_seg
-    extractor (same cache + nan-aware rest as cluster.py / evaluate.py)."""
+def _run_features(out_dir, cw, fs):
+    """(X clip-apex features, cluster_ids) for one run's clips, aligned with the
+    cluster-assignment rows `cw` (source_file, clip_id, cluster_id). Drops rows
+    whose feature is missing. Same clip-apex cache as cluster.py/evaluate.py."""
+    features_dir = os.path.join(out_dir, "features")
+    conn = store.connect(out_dir)
+    srcp = {r["source_file"]: r["source_path"]
+            for r in conn.execute("SELECT source_file, source_path FROM recordings")}
+    feat = {}
+    for sf, g in cw.groupby("source_file"):
+        cdf = pd.DataFrame(store.clips_for_recording(conn, sf))
+        if cdf.empty:
+            continue
+        fb, _ = features.clip_features_for(sf, cdf, fs, features_dir,
+                                           source_path=srcp.get(sf))
+        for cid in g["clip_id"]:
+            if int(cid) in fb:
+                feat[(sf, int(cid))] = fb[int(cid)]
+    conn.close()
     feats, cids = [], []
-    for fname, fdf in gdf.groupby("source_file"):
-        fdf = fdf.sort_values("start_sample")
-        feat_by_seg, _ = features.feature_by_seg(
-            fname, fdf, fs, features_dir, input_dir)
-        for _, row in fdf.iterrows():
-            feats.append(feat_by_seg[int(row["seg_idx"])])
-            cids.append(int(row["cluster_id"]))
+    for _, r in cw.iterrows():
+        key = (r["source_file"], int(r["clip_id"]))
+        if key in feat:
+            feats.append(feat[key]); cids.append(int(r["cluster_id"]))
     return np.asarray(feats), np.asarray(cids)
 
 
@@ -144,40 +157,34 @@ def plot_group(group, X, cids, out_path, do_tsne=True):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Plot clustering feature space per group")
-    ap.add_argument("input_dir", nargs="?", default=None,
-                    help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
-                         "located via each row's source_path (no work_pool needed).")
+        description="Plot a clustering run's feature space (PCA/t-SNE/heatmap)")
     ap.add_argument("--out", default="out")
+    ap.add_argument("--run", default=None,
+                    help="run_id under cluster_runs/ (default: latest in the db)")
     ap.add_argument("--fs", type=int, default=2000)
     ap.add_argument("--no-tsne", action="store_true")
-    ap.add_argument("--force", action="store_true",
-                    help="recompute features even if cache exists")
+    ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
-    clu = pd.read_csv(os.path.join(args.out, "segments_clustered.csv"))
-    fmap_dir = os.path.join(args.out, "feature_maps")
-    cache_dir = os.path.join(args.out, "feature_cache")
-    features_dir = os.path.join(args.out, "features")
-    os.makedirs(fmap_dir, exist_ok=True)
-    os.makedirs(cache_dir, exist_ok=True)
-
-    for group, gdf in clu.groupby("group"):
-        out_path = os.path.join(fmap_dir, f"{group}_features.png")
-        if os.path.exists(out_path) and not args.force:
-            print(f"[{group}] CACHED {out_path}")
-            continue
-        cache = os.path.join(cache_dir, f"{group}.npz")
-        if os.path.exists(cache) and not args.force:
-            z = np.load(cache)
-            X, cids = z["X"], z["cids"]
-            print(f"[{group}] loaded cached features {X.shape}")
-        else:
-            print(f"[{group}] computing features ...")
-            X, cids = _group_features(args.input_dir, gdf, args.fs,
-                                      features_dir=features_dir)
-            np.savez(cache, X=X, cids=cids)
-        plot_group(group, X, cids, out_path, do_tsne=not args.no_tsne)
+    conn = store.connect(args.out)
+    run = args.run or store.latest_run(conn)
+    if not run:
+        raise SystemExit(f"no cluster runs in {store.db_path(args.out)}; "
+                         f"run cluster.py / cluster_traj.py first")
+    cw = store.clusters_with_labels(conn, run)
+    conn.close()
+    if cw.empty:
+        raise SystemExit(f"run {run} has no assignments")
+    out_path = os.path.join(args.out, "cluster_runs", run, "feature_maps.png")
+    if os.path.exists(out_path) and not args.force:
+        print(f"CACHED {out_path}")
+        return
+    print(f"[{run}] computing clip-apex features ...")
+    X, cids = _run_features(args.out, cw, args.fs)
+    if len(X) < 2 or len(set(cids)) < 2:
+        print("too few clips/clusters to plot"); return
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plot_group(run, X, cids, out_path, do_tsne=not args.no_tsne)
 
 
 if __name__ == "__main__":

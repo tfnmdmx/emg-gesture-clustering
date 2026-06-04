@@ -4,16 +4,18 @@
 Run:  $PY label_server.py --out out_pose --port 8000
 Then open http://127.0.0.1:8000
 
-Reads out/clips.csv (+ recordings.csv, shard overviews, source npz for 3D),
-writes out/clip_labels.csv on each label, out/clips_labeled.csv on export.
-(clip_labels.csv is per-clip gesture labels; distinct from flow-B's labels.csv
-which is per-cluster names read by export.py. A legacy labels.csv is migrated
-on first load.) Uses matplotlib + emg2pose for server-side 3D, like export_clips.
+Reads clips/recordings/bursts + shard overviews + source npz (for 3D) from
+out/index.db (emg_label.store). Per-clip gesture labels, per-clip invalid marks
+and whole-recording invalid marks are written to the db `annotations` table
+(scope clip|recording, kind label|invalid), carrying a re-segmentation-stable
+anchor (clip_start_sample, clip_end_sample, seg_version). /api/export writes
+clips_labeled.csv (clips JOIN annotations). /api/drop_recording permanently
+deletes a recording (rows + annotations + tombstone + shard). Uses matplotlib +
+emg2pose for server-side 3D, like export_clips.
 """
 from __future__ import annotations
 
 import argparse
-import csv as _csv
 import json
 import os
 import re
@@ -37,6 +39,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: E402,F401  (registers 3d proj)
 warnings.filterwarnings("ignore", message="Cannot parse filename")
 
 from emg_label import io_utils, plotting  # noqa: E402
+from emg_label import store as dbmod  # noqa: E402  (db layer; handler's `store` = Store instance)
 
 # NOTE: hand rendering is the emg2pose Plotly Mesh3d path (skin_vertices_np ->
 # per-frame vertex JSON, drawn client-side). The old matplotlib skeleton path
@@ -150,12 +153,10 @@ class Store:
     def __init__(self, out_dir: str):
         self.out = out_dir
         self.lock = threading.Lock()
-        self.clips_path = os.path.join(out_dir, "clips.csv")
-        # Per-clip labels. Named clip_labels.csv so it can never be confused with
-        # flow-B's per-cluster labels.csv (read by export.py). A pre-rename
-        # labels.csv with the per-clip schema is migrated on load (see below).
-        self.labels_path = os.path.join(out_dir, "clip_labels.csv")
-        self._legacy_labels_path = os.path.join(out_dir, "labels.csv")
+        # The index db is the source of clips/bursts/recordings; the annotations
+        # table is the label/invalid truth. One shared connection (writes are
+        # serialized behind self.lock).
+        self.conn = dbmod.connect(out_dir)
         # All render caches live under one umbrella dir (out/cache/) so the
         # output root stays tidy; makedirs creates the parent on first run.
         cache_root = os.path.join(out_dir, "cache")
@@ -167,29 +168,33 @@ class Store:
         os.makedirs(self.hand_dir, exist_ok=True)
         self.overview_cache_dir = os.path.join(cache_root, "overview_cache")
         os.makedirs(self.overview_cache_dir, exist_ok=True)
-        self.segments_path = os.path.join(out_dir, "segments.csv")
         self.regen_always = os.environ.get("OVERVIEW_REGEN") == "1"
-        self._segs_by_source = None      # lazy burst spans from segments.csv
+        self._segs_by_source = None      # lazy burst spans from db bursts table
         self._segs_lock = threading.Lock()
         self._overview_scan = None       # lazy source_file -> overview.png map
         self._overview_scan_lock = threading.Lock()
         self._stem_cache: dict[str, str] = {}
 
-        if not os.path.isfile(self.clips_path):
-            raise SystemExit(f"missing {self.clips_path}; run segment.py first")
-        df = pd.read_csv(self.clips_path)
+        # Clips from the db (+ source_path joined from recordings). Rename the
+        # new schema columns to the names this server already uses internally, so
+        # the geometry/overview/export code is unchanged.
+        df = pd.read_sql_query(
+            "SELECT c.*, r.source_path FROM clips c "
+            "LEFT JOIN recordings r ON r.source_file = c.source_file", self.conn)
         if df.empty:
-            raise SystemExit(f"{self.clips_path} has no rows")
+            raise SystemExit(f"no clips in {dbmod.db_path(out_dir)}; run segment.py first")
+        df = df.rename(columns={"start_sample": "clip_start_sample",
+                                "end_sample": "clip_end_sample",
+                                "matched_burst_idx": "matched_emg_seg_idx"})
         df["clip_id"] = df["clip_id"].astype(int)
         df["source_file"] = df["source_file"].astype(str)
         self.df = df
 
-        # recording durations / pose threshold for timeline context
+        # recording durations / pose threshold for timeline context (from db)
         rec_dur, rec_pose_thr, rec_enter, rec_exit = {}, {}, {}, {}
         rec_pose_exit = {}
-        rec_path = os.path.join(out_dir, "recordings.csv")
-        if os.path.isfile(rec_path):
-            r = pd.read_csv(rec_path)
+        r = pd.read_sql_query("SELECT * FROM recordings", self.conn)
+        if not r.empty:
             sfk = r["source_file"].astype(str)
             rec_dur = dict(zip(sfk, r["duration_s"]))
             for col, dst in [("pose_thresh", rec_pose_thr),
@@ -236,6 +241,13 @@ class Store:
             }
             self.stem_to_source[stem] = sf
 
+        # (source_file, clip_id) -> (clip_start, clip_end, seg_version) for the
+        # re-segmentation-stable label anchor written into annotations.
+        self._clip_meta = {
+            (str(r.source_file), int(r.clip_id)):
+                (int(r.clip_start_sample), int(r.clip_end_sample), r.seg_version)
+            for r in self.df.itertuples()}
+
         self.labels: dict = {}           # (source_file, clip_id) -> label record
         self.labeled_count: dict = {}    # source_file -> non-empty gesture count
         self.invalid_count: dict = {}    # source_file -> clips marked invalid
@@ -243,8 +255,7 @@ class Store:
 
         # Whole-recording invalidation: source_file -> {labeler, marked_at, note}.
         # Such recordings drop out of labelling, export, clustering and eval.
-        self.invalid_rec_path = os.path.join(out_dir,
-                                             io_utils.INVALID_RECORDINGS_FILE)
+        # Stored as scope='recording', kind='invalid' annotations in the db.
         self.invalid_recordings: dict = {}
         self._load_invalid_recordings()
 
@@ -262,32 +273,24 @@ class Store:
         return stem, sf, int(cids)
 
     def _load_labels(self):
-        path = self.labels_path
-        if not os.path.isfile(path):
-            # Migrate a pre-rename per-clip labels.csv if present (the next flush
-            # writes clip_labels.csv). A flow-B per-cluster labels.csv lacks the
-            # clip_id column, so guard on it to avoid mis-reading that schema.
-            if os.path.isfile(self._legacy_labels_path):
-                head = pd.read_csv(self._legacy_labels_path, dtype=str, nrows=0)
-                if "clip_id" in head.columns:
-                    path = self._legacy_labels_path
-                    print(f"migrating legacy {path} -> {self.labels_path}")
-                else:
-                    return
-            else:
-                return
-        ldf = pd.read_csv(path, dtype=str).fillna("")
-        for _, r in ldf.iterrows():
-            sf = str(r["source_file"]); cid = int(float(r["clip_id"]))
-            inv = str(r.get("invalid", "")).strip() in ("1", "true", "True")
-            rec = {"gesture_label": r.get("gesture_label", ""), "invalid": inv,
-                   "labeler": r.get("labeler", ""),
-                   "labeled_at": r.get("labeled_at", ""),
-                   "note": r.get("note", "")}
-            self.labels[(sf, cid)] = rec
+        """Populate the in-memory label dict from clip-scope annotations in the
+        db (kind 'label' or 'invalid' -- mutually exclusive per clip)."""
+        for a in dbmod.get_annotations(self.conn, scope="clip"):
+            sf, cid = str(a["source_file"]), int(a["clip_id"])
+            rec = self.labels.setdefault(
+                (sf, cid), {"gesture_label": "", "invalid": False,
+                            "labeler": "", "labeled_at": "", "note": ""})
+            if a["kind"] == "label":
+                rec["gesture_label"] = a["value"] or ""
+            elif a["kind"] == "invalid":
+                rec["invalid"] = True
+            rec["labeler"] = a["labeler"] or rec["labeler"]
+            rec["labeled_at"] = a["labeled_at"] or rec["labeled_at"]
+            rec["note"] = a["note"] or rec["note"]
+        for (sf, _cid), rec in self.labels.items():
             if rec["gesture_label"]:
                 self.labeled_count[sf] = self.labeled_count.get(sf, 0) + 1
-            if inv:
+            if rec["invalid"]:
                 self.invalid_count[sf] = self.invalid_count.get(sf, 0) + 1
 
     def _hand_count(self, stem: str) -> int:
@@ -345,73 +348,88 @@ class Store:
                 self.invalid_count[sf] = self.invalid_count.get(sf, 0) + 1
             elif pi and not inv:
                 self.invalid_count[sf] = max(0, self.invalid_count.get(sf, 0) - 1)
-            self._flush_labels()
+            # Persist as a clip annotation (label & invalid are exclusive kinds);
+            # carry the sample interval + seg_version as a re-seg-stable anchor.
+            now = self.labels[(sf, cid)]["labeled_at"]
+            start, end, sv = self._clip_meta.get((sf, cid), (None, None, None))
+            dbmod.delete_annotation(self.conn, sf, cid, "clip", "label")
+            dbmod.delete_annotation(self.conn, sf, cid, "clip", "invalid")
+            if inv:
+                dbmod.set_annotation(self.conn, sf, cid, "clip", "invalid",
+                                     clip_start_sample=start, clip_end_sample=end,
+                                     seg_version=sv, labeler=labeler.strip(),
+                                     labeled_at=now, note=note.strip())
+            elif gl:
+                dbmod.set_annotation(self.conn, sf, cid, "clip", "label", value=gl,
+                                     clip_start_sample=start, clip_end_sample=end,
+                                     seg_version=sv, labeler=labeler.strip(),
+                                     labeled_at=now, note=note.strip())
         return {"ok": True, "total": int(len(self.df)),
                 "total_labeled": sum(self.labeled_count.values()),
                 "total_invalid": sum(self.invalid_count.values()),
                 "stem": stem, "stem_labeled": self.labeled_count.get(sf, 0),
                 "stem_invalid": self.invalid_count.get(sf, 0)}
 
-    def _flush_labels(self):
-        tmp = self.labels_path + ".tmp"
-        with open(tmp, "w", newline="") as f:
-            w = _csv.writer(f)
-            w.writerow(["source_file", "clip_id", "gesture_label", "invalid",
-                        "labeler", "labeled_at", "note"])
-            for (sf, cid), lab in self.labels.items():
-                w.writerow([sf, cid, lab["gesture_label"],
-                            1 if lab.get("invalid") else 0, lab["labeler"],
-                            lab["labeled_at"], lab["note"]])
-        os.replace(tmp, self.labels_path)
-
-    # --- whole-recording invalid flag ---------------------------------------
+    # --- whole-recording invalid flag (scope='recording' annotation) --------
     def _load_invalid_recordings(self):
-        if not os.path.isfile(self.invalid_rec_path):
-            return
-        try:
-            df = pd.read_csv(self.invalid_rec_path, dtype=str).fillna("")
-        except Exception:
-            return
-        for _, r in df.iterrows():
-            sf = str(r.get("source_file", "")).strip()
-            if sf:
-                self.invalid_recordings[sf] = {
-                    "labeler": r.get("labeler", ""),
-                    "marked_at": r.get("marked_at", ""),
-                    "note": r.get("note", ""),
-                }
+        for a in dbmod.get_annotations(self.conn, scope="recording", kind="invalid"):
+            self.invalid_recordings[str(a["source_file"])] = {
+                "labeler": a["labeler"] or "", "marked_at": a["labeled_at"] or "",
+                "note": a["note"] or ""}
 
     def set_recording_invalid(self, stem, invalid, labeler="", note="") -> dict:
-        """Mark/unmark a WHOLE recording invalid. Invalid recordings drop out of
-        labelling (treated as done), export, clustering and eval. Keyed by
-        source_file so it survives stem re-derivation."""
+        """Mark/unmark a WHOLE recording invalid (soft exclude -- distinct from
+        drop_recording, which permanently deletes). Invalid recordings drop out
+        of labelling, export, clustering and eval. Keyed by source_file."""
         sf = self.stem_to_source.get(stem)
         if sf is None:
             raise KeyError(stem)
         with self.lock:
             if invalid:
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 self.invalid_recordings[sf] = {
-                    "labeler": labeler.strip(),
-                    "marked_at": datetime.now(timezone.utc).isoformat(
-                        timespec="seconds"),
-                    "note": note.strip(),
-                }
+                    "labeler": labeler.strip(), "marked_at": now,
+                    "note": note.strip()}
+                dbmod.set_annotation(self.conn, sf, -1, "recording", "invalid",
+                                     labeler=labeler.strip(), labeled_at=now,
+                                     note=note.strip())
             else:
                 self.invalid_recordings.pop(sf, None)
-            self._flush_invalid_recordings()
+                dbmod.delete_annotation(self.conn, sf, -1, "recording", "invalid")
         return {"ok": True, "stem": stem,
                 "rec_invalid": sf in self.invalid_recordings,
                 "total_invalid_rec": len(self.invalid_recordings)}
 
-    def _flush_invalid_recordings(self):
-        tmp = self.invalid_rec_path + ".tmp"
-        with open(tmp, "w", newline="") as f:
-            w = _csv.writer(f)
-            w.writerow(["source_file", "labeler", "marked_at", "note"])
-            for sf, m in self.invalid_recordings.items():
-                w.writerow([sf, m.get("labeler", ""),
-                            m.get("marked_at", ""), m.get("note", "")])
-        os.replace(tmp, self.invalid_rec_path)
+    def drop_recording(self, stem) -> dict:
+        """PERMANENTLY delete a recording: remove its db rows + annotations,
+        tombstone it (so re-segmentation will not resurrect it), delete the
+        on-disk shard + feature cache, and drop it from the in-memory state."""
+        sf = self.stem_to_source.get(stem)
+        if sf is None:
+            raise KeyError(stem)
+        with self.lock:
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.conn.close()                      # drop_recording opens its own
+            dbmod.drop_recording(self.out, sf, dropped_at=now, note="dropped via UI")
+            self.conn = dbmod.connect(self.out)
+            import shutil
+            shutil.rmtree(os.path.join(self.out, "shards", stem), ignore_errors=True)
+            fc = os.path.join(self.out, "features", stem + ".npz")
+            if os.path.isfile(fc):
+                os.remove(fc)
+            # drop from in-memory state. Do NOT reset_index -- by_stem['row_idx']
+            # holds original index labels into self.df, used label-wise elsewhere.
+            self.df = self.df[self.df["source_file"] != sf]
+            self.by_stem.pop(stem, None)
+            self.stem_to_source.pop(stem, None)
+            self.invalid_recordings.pop(sf, None)
+            self.labeled_count.pop(sf, None)
+            self.invalid_count.pop(sf, None)
+            for k in [k for k in self.labels if k[0] == sf]:
+                self.labels.pop(k, None)
+            self._segs_by_source = None            # invalidate lazy burst cache
+        return {"ok": True, "stem": stem, "dropped": sf,
+                "total_clips": int(len(self.df))}
 
     @staticmethod
     def _folder_key(folder: str) -> str:
@@ -480,22 +498,25 @@ class Store:
             return (None, None)
 
     def _load_bursts(self, stem: str):
-        """Lazy burst spans from segments.csv -> (spans, apexes, segidx->pos)."""
+        """Lazy burst spans from the db bursts table -> (spans, apexes,
+        burst_idx->pos)."""
         if self._segs_by_source is None:
             with self._segs_lock:                  # double-checked; build then publish
                 if self._segs_by_source is None:
                     segs: dict = {}
-                    if os.path.isfile(self.segments_path):
-                        sdf = pd.read_csv(self.segments_path)
+                    sdf = pd.read_sql_query(
+                        "SELECT source_file, burst_idx, start_sample, "
+                        "end_sample, apex_sample FROM bursts", self.conn)
+                    if not sdf.empty:
                         sdf["source_file"] = sdf["source_file"].astype(str)
                         for sf, g in sdf.groupby("source_file", sort=False):
-                            g = g.sort_values("seg_idx")
+                            g = g.sort_values("burst_idx")
                             segs[sf] = (
                                 list(zip(g["start_sample"].astype(int),
                                          g["end_sample"].astype(int))),
                                 list(g["apex_sample"].astype(int)),
                                 {int(s): i for i, s
-                                 in enumerate(g["seg_idx"].astype(int))})
+                                 in enumerate(g["burst_idx"].astype(int))})
                     self._segs_by_source = segs    # publish fully-built map
         sf = self.by_stem[stem]["source_file"]
         return self._segs_by_source.get(sf, ([], [], {}))
@@ -929,12 +950,15 @@ def make_handler(store: Store):
 
         def do_POST(self):
             u = urlparse(self.path)
-            if u.path not in ("/api/label", "/api/invalid_recording"):
+            if u.path not in ("/api/label", "/api/invalid_recording",
+                              "/api/drop_recording"):
                 return self._send(404, {"error": "no route"})
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
             try:
-                if u.path == "/api/invalid_recording":
+                if u.path == "/api/drop_recording":
+                    res = store.drop_recording(data["stem"])
+                elif u.path == "/api/invalid_recording":
                     res = store.set_recording_invalid(
                         data["stem"], bool(data.get("invalid", False)),
                         data.get("labeler", ""), data.get("note", ""))

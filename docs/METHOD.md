@@ -1,10 +1,12 @@
 # 方法说明 — EMG 手势切分、聚类与真值集构建
 
-本文档解释切分/聚类/真值集构建的实现原理。当前流水线是**统一检测器 + 双产物**：
+本文档解释切分/聚类/真值集构建的实现原理。当前流水线是**统一检测器 + 单一 clip 单元 + SQLite 索引**：
 
-- **统一动作检测器**（live）：`emg_label/action_segmentation.segment_recording` 以 pose-speed 迟滞状态机为主干（spine）画出每次运动起点与手定型处，EMG 包络作为仲裁器（R2）拆分过长合并段；一个 action = 一段 motion run + 紧随其后的**真实 hold**，右边界落在下一个 onset，段与段**无缝拼接、不加 pad**。`segment.py` 对每条录制都调用它。
-- 该检测器把结果同时写成两份 CSV：`segments.csv`（EMG burst 路，交叉引用 + 聚类特征缓存）与 `clips.csv`（每个 action = motion+hold 段，作为打标单元；`static_in_*` 零宽、`static_out_*` 即真实 hold）。同时输出 `recordings.csv` 含每条录制的 QC 指标。
-- **聚类**只用 hold 内的静态 apex 姿态向量（`cluster.py` 是 live 聚类器）。
+- **统一动作检测器**（live）：`emg_label/action_segmentation.segment_recording` 以 pose-speed 迟滞状态机为主干（spine）画出每次运动起点与手定型处，EMG 包络作为仲裁器（R2）拆分过长合并段；一个 action = 一段 motion run + 紧随其后的**真实 hold**，右边界落在下一个 onset，段与段**无缝拼接、不加 pad**。`segment.py` 对每条录制都调用它，结果落成 `OUT/shards/{stem}/` 分片（segmentation 的真值），再汇总进 `OUT/index.db`。
+- 检测器为每条录制写一个分片目录 `shards/{stem}/{recording.csv, bursts.csv, clips.csv, overview.png}`：`bursts.csv`（EMG burst 路，交叉引用 + 聚类特征缓存的锚点）与 `clips.csv`（每个 action = motion+hold 段，作为**打标 / 聚类 / 评估的唯一单元** `(source_file, clip_id)`）。`recording.csv` 含该录制的 QC 指标。`segment.py` 末尾把全部分片汇总进 `OUT/index.db`（权威索引），并再 dump 顶层便捷 CSV `recordings.csv / bursts.csv / clips.csv`（给读平面文件的 dev 工具 diag_seg / cluster_traj / visualize_segment）。
+- **聚类**有**两条并存的通路**，都以 clip 为单元、都写 `OUT/cluster_runs/{run_id}/` 并登记进 db：`cluster.py` = **apex 通路**（每个 clip 在其 hold apex 的静态定型姿态，`features.clip_apex_feature`）；`cluster_traj.py` = **轨迹 / 时间序列通路**（保留为一等公民，持续深化）。
+- **选型 / 评估是打标驱动的**：`evaluate.py` 把某次 run 的 `cluster_assignments` 与 clip 标签 `annotations` 做 JOIN，算 ARI / NMI / purity（+ 被试污染 + pose-space 探针）。
+- **打标**走 `label_server.py` 网页 UI，写进 db 的 `annotations` 表（label 的真值）。**导出**走 `export.py`，按手势把已标 clip 归档到 `OUT/gestures/{label}/`。
 
 > 说明（已被取代）：早期设计把 pose 通路写成「关节速度 + 鲁棒阈值 → static_hold / transition_motion → 组装为独立的 `static→motion→static` clip（含 pre/post 静态裁剪与 pad）」，对应 `pose_segmentation.static_motion_intervals` / `build_smc_clips`。这两个函数**已不在 live 路径上**，仅供 `diag_seg.py` 做新旧对比，详见 §3。
 
@@ -14,11 +16,15 @@
 [emg_label/pose_segmentation.py](../emg_label/pose_segmentation.py)（pose_speed/robust_threshold 仍被 live 复用；static_motion_intervals/build_smc_clips/velocity_peak_segments 为 legacy/诊断用） ·
 [emg_label/features.py](../emg_label/features.py) ·
 [emg_label/qc.py](../emg_label/qc.py) ·
+[emg_label/store.py](../emg_label/store.py)（**SQLite 数据层 / index.db**） ·
 [emg_label/io_utils.py](../emg_label/io_utils.py) ·
 [emg_label/skeleton.py](../emg_label/skeleton.py) ·
 [segment.py](../segment.py) ·
-[cluster.py](../cluster.py) ·
-[export_clips.py](../export_clips.py)
+[cluster.py](../cluster.py)（apex 通路） ·
+[cluster_traj.py](../cluster_traj.py)（轨迹通路） ·
+[evaluate.py](../evaluate.py) ·
+[export.py](../export.py) ·
+[label_server.py](../label_server.py)
 
 ---
 
@@ -70,9 +76,9 @@
 
 - EMG burst 切分（§1, §2）—— reference 不切 EMG
 - 双信号交叉引用（§4）—— 双通路独有
-- 录制级 QC：EMG-pose lag、NaN 占比、`recordings.csv` 持久化（§5）
-- KMeans 聚类（§7）+ 按被试归一化（§7.2）
-- 结构化 CSV 输出 `segments.csv / clips.csv / recordings.csv`（§9）
+- 录制级 QC：EMG-pose lag、NaN 占比、`recordings` 表持久化（§5）
+- KMeans 聚类（§7）+ 按被试归一化（§7.2）；轨迹通路 `cluster_traj.py`
+- SQLite 索引 `OUT/index.db`（recordings/bursts/clips/annotations/cluster_runs/... 表）+ 顶层便捷 CSV `recordings.csv / bursts.csv / clips.csv`（§9）
 
 **算法差异点**单独说明：
 
@@ -151,9 +157,9 @@ exit  = median + 0.5 * 1.4826 * MAD
 
 ### 2.4 hold 窗口（聚类要用）
 
-[`segmentation.hold_windows`](../emg_label/segmentation.py)：每个 burst 之后的低肌电"持姿期"边界——`hold_end = next_burst_start`（末段为 `min(n, end + tail_samples)`，segment.py 传入 `tail_samples = fs`，即 1 s）。写到 `segments.csv` 的 `hold_end_sample` 列，供聚类阶段直接取，不用下游再重算。
+[`segmentation.hold_windows`](../emg_label/segmentation.py)：每个 burst 之后的低肌电"持姿期"边界——`hold_end = next_burst_start`（末段为 `min(n, end + tail_samples)`，segment.py 传入 `tail_samples = fs`，即 1 s）。写到 `bursts.csv` / `bursts` 表的 `hold_end_sample` 列，作为 burst 路特征缓存的锚点。
 
-每段 apex（`apex_sample` 列）= `[start, hold_end)` 内最大关节偏离帧；既是聚类特征锚点，也供 overview 图标红线。
+每个 burst 的 apex（`apex_sample` 列）= `[start, hold_end)` 内最大关节偏离帧。注意：burst 路只是交叉引用与缓存的辅助产物；真正的聚类单元是 clip，其 apex 在 clip 的 hold 内由检测器直接定出（见 §3.4 / §6）。
 
 ---
 
@@ -255,18 +261,18 @@ hold_start == motion_end
 hold_end == end == 下一个 onset (末段为 n)
 ```
 
-写到 `clips.csv` 时：`static_in_*` 设为**零宽**（`= start`，因为前一手势的 hold 已是它自己的段，不再回补 pre-motion 静态期），`static_out_*` **直接等于真实 hold**（并由新增的 `hold_start/hold_end` 列显式命名）。
+写到 `clips.csv` 时：clip 的区间用 `start_sample / end_sample`（完整 action `[start, 下一个 onset)`，无 pad），其内部子结构由 `motion_start/end_sample` 与 `hold_start/end_sample` 显式命名——即"motion run + 真实 hold"。**注意**：旧的 `static_in_*` / `static_out_*` 列已**从 schema 移除**（它们曾分别表示零宽 pre-motion 静态期与真实 hold，现在 hold 由 `hold_*` 直接命名，pre-motion pad 已不存在）；空的 `gesture_label` 列也已移除（标签现在只活在 `annotations` 表）。`clips` 行另带 `seg_version` 列（切分参数指纹，供重切分后 `store.remap_annotations` 把标签迁移到新 clip）。
 
-**apex** = `features.apex_index` 在 **hold 窗口内**取的最大偏离帧（held 姿态即手势本身；若在整段 `[start,end)` 上取，max-deviation 会落到 transition 而非 hold）。hold 退化（连续 run，`hold_end ≈ hold_start`）时回退到 `[start, hold_end)` 或直接取 `start`。
+**apex** = `features.apex_index` 在 **hold 窗口内**取的最大偏离帧（held 姿态即手势本身；若在整段 `[start,end)` 上取，max-deviation 会落到 transition 而非 hold），写入 clip 的 `apex_sample`。hold 退化（连续 run，`hold_end ≈ hold_start`）时回退到 `[start, hold_end)` 或直接取 `start`。
 
-**review_flag**（写入 `clips.csv` / `segments.csv` 邻接）取值：`long`（motion 超 `pose_long_seg_s`，连续手势）、`nohold`（无真实 hold）、`slow`（轻柔手势、rest 级 EMG，仍保留）、`long_static`（hold 超 `max_hold_s`，默认 4 s）、`''`（正常）。**fusion_type** = `both`（motion 区间内有 EMG burst 重叠）或 `pose_only`。
+**review_flag**（写入 `clips.csv` / `clips` 表）取值：`long`（motion 超 `pose_long_seg_s`，连续手势）、`nohold`（无真实 hold）、`slow`（轻柔手势、rest 级 EMG，仍保留）、`long_static`（hold 超 `max_hold_s`，默认 4 s）、`''`（正常）。**fusion_type** = `both`（motion 区间内有 EMG burst 重叠）或 `pose_only`。
 
 ### 3.5 burst ↔ clip 交叉引用
 
-EMG burst（`segment_emg` 的产出，写入 `segments.csv`）与 action/clip（统一检测器的产出，写入 `clips.csv`）各自独立产生。把两套段落按**时间重叠最多**做配对，写到两份 CSV 里：
+EMG burst（写入 `bursts.csv` / `bursts` 表）与 action/clip（统一检测器的产出，写入 `clips.csv` / `clips` 表）各自独立产生。把两套段落按**时间重叠最多**做配对，写到两边：
 
-- `segments.csv.matched_clip_id` — 该 burst 对应哪个 clip（`-1` = 无匹配）
-- `clips.csv.matched_emg_seg_idx` — 该 clip 对应哪个 burst（`-1` = EMG 没切出来）
+- `bursts.matched_clip_id` — 该 burst 对应哪个 clip（`-1` = 无匹配）
+- `clips.matched_burst_idx` — 该 clip 对应哪个 burst（`-1` = EMG 没切出来）
 
 代码 [`pose_segmentation.match_bursts_to_clips` / `match_clips_to_bursts`](../emg_label/pose_segmentation.py)。
 
@@ -278,9 +284,9 @@ EMG burst（`segment_emg` 的产出，写入 `segments.csv`）与 action/clip（
 |----------------------------------------------|--------------------------------------------------------------|------------------------------------------|
 | 互相匹配                                     | 高置信度手势：两个独立证据都确认                             | 直接进真值集                             |
 | `matched_clip_id == -1`（EMG 有、pose 没）   | 等长发力（手没动只在使劲）？或 EMG 噪声伪段？                | 人工复核                                 |
-| `matched_emg_seg_idx == -1`（pose 有、EMG 没）| 缓慢轻柔手势 EMG 没明显波动？或 EMG 阈值定太高？             | **优先复核**——往往是 EMG 单方案的真漏切 |
+| `matched_burst_idx == -1`（pose 有、EMG 没）  | 缓慢轻柔手势 EMG 没明显波动？或 EMG 阈值定太高？             | **优先复核**——往往是 EMG 单方案的真漏切 |
 
-`recordings.csv` 的 `n_burst_only` / `n_clip_only` 列汇总每条录制的分歧数量；轻柔手势多的录制 clip-only 通常远多于 burst-only，说明纯 EMG 会大量漏切，而 pose 主干能补回——这正是统一检测器以 pose-speed 为主干的原因。
+`recordings` 表（顶层便捷 `recordings.csv`）的 `n_burst_only` / `n_clip_only` 列汇总每条录制的分歧数量；轻柔手势多的录制 clip-only 通常远多于 burst-only，说明纯 EMG 会大量漏切，而 pose 主干能补回——这正是统一检测器以 pose-speed 为主干的原因。
 
 ### 3.6 EMG 包络 vs pose-speed 对比
 
@@ -320,7 +326,7 @@ EMG burst（`segment_emg` 的产出，写入 `segments.csv`）与 action/clip（
 
 ## 5. 录制级 QC — EMG-pose lag + NaN 占比
 
-新模块 [emg_label/qc.py](../emg_label/qc.py)，写到 `recordings.csv`（每录制一行）。
+新模块 [emg_label/qc.py](../emg_label/qc.py)，写到 `recordings` 表（每录制一行；`shards/{stem}/recording.csv` 是分片真值，顶层 `recordings.csv` 是 db 的便捷 dump）。
 
 ### 5.1 EMG-pose lag
 
@@ -345,7 +351,7 @@ NaN 鲁棒：内部把 NaN 替换为 0（z-score 后），全 NaN 切片直接�
 
 `pose_nan_frac` / `emg_nan_frac` = 任一通道为 NaN 的样本占比。原始 Manus 偶有遮挡丢帧。`process_one` 在 `pose_nan_frac > 0.01` 时打印告警（与下面 §5.3 的筛选阈值一致）；NaN 占比偏高的录制基本上是被插值"造"出来的，不建议进真值集。
 
-### 5.3 recordings.csv schema
+### 5.3 recordings 表 schema（= 顶层便捷 `recordings.csv`）
 
 | 列                                                                                  | 说明                                                   |
 |-------------------------------------------------------------------------------------|--------------------------------------------------------|
@@ -356,12 +362,13 @@ NaN 鲁棒：内部把 NaN 替换为 0（z-score 后），全 NaN 切片直接�
 | `pose_nan_frac, emg_nan_frac`                                                       | 完整性 QC                                              |
 | `enter_thresh, exit_thresh, pose_thresh, pose_exit_thresh`                           | 阈值快照（复盘用）：EMG 进/退阈 + 该录制的 `move_enter`/`move_exit`（自动 move 阈，rad/s）|
 | `rec_pose_range, pose_static`                                                       | 全录制关节偏移 `‖max-min‖`（rad）；`pose_static=1` 表示整条未过绝对偏移闸门（被判静态、返 0 段）|
+| `seg_version`                                                                       | 切分参数指纹（与 clips 同步；重切分后用于检测/迁移 stale 标签）|
 
-典型筛选：
+典型筛选（读 db 或便捷 CSV 皆可）：
 
 ```python
 import pandas as pd
-r = pd.read_csv("out/recordings.csv")
+r = pd.read_csv("out/recordings.csv")          # = SELECT * FROM recordings
 clean = r[(r.lag_flag == "ok") & (r.pose_nan_frac < 0.01)]   # 进真值集
 review = r[r.lag_flag.isin(["early", "late"])]               # 人工复核
 ```
@@ -388,44 +395,53 @@ review = r[r.lag_flag.isin(["early", "late"])]               # 人工复核
 
 聚类**不用** EMG 段切片，而是用每段"持姿期"里的代表性姿态向量——下面 §6.2 是具体怎么取的。
 
-### 6.2 apex 姿态特征
+### 6.2 apex 姿态特征（apex 通路 `cluster.py` 用）
 
-代码 [`features.apex_pose_feature`](../emg_label/features.py)（apex 帧由 [`features.apex_index`](../emg_label/features.py) 求得，两者共用同一帧，overview 图也标这帧）：
+聚类单元是 clip。检测器在切分时已经在每个 clip 的 hold 内定出 apex 帧并写进 `clips.apex_sample`（见 §3.4），所以 apex 通路**直接复用那一帧**取特征，代码 [`features.clip_apex_feature`](../emg_label/features.py)：
 
 ```python
-# hold 窗口 = [start, window_end)  ← segments 用 hold_end_sample，clip 用其 hold
-dev    = smooth(‖ja - rest‖)            # 每帧偏离中性多远（nan 帧置 -inf，绝不夺 argmax）
-apex   = argmax(nan_to_num(dev, -inf))  # 最到位的瞬间
-feature = nanmedian(ja[apex ± 50ms])    # 该帧附近 ±50ms 的 nan-aware 中位姿态 → (20,)
+# a = clips.apex_sample（检测器在 clip 的 hold 内已定好的最到位帧）
+feature = nanmedian(ja[a ± 50ms])    # 该帧附近 ±50ms 的 nan-aware 中位姿态 → (20,)
 ```
 
-- `rest = nanmedian(整条录制的 joint_angles)` ≈ 中性手姿态（nan-aware）。
+apex 帧本身由 [`features.apex_index`](../emg_label/features.py)（在 hold 窗口内取 `argmax(smooth(‖ja - rest‖))`、nan 帧置 -inf 绝不夺 argmax，`rest = nanmedian(整条录制 joint_angles)`）在切分阶段求得，overview 图也标这同一帧。`features.apex_pose_feature`（hold 窗口里现取 apex+特征）仍存在，用于 burst 路缓存写入与重算回退。
+
 - **为什么取 hold 而非段内？** motion run 是"手正在移动到位"的过程；真正能区分手势的定型姿态在其**之后**的低速持姿期。
 - **`nanmedian` 而非单帧**：抗抖动、抗坏帧，且 ±50ms 窗口内的少量丢帧不会把整条特征向量污染成 NaN（否则会传到 zscore/KMeans）。
 - **这个特征只用 joint_angles**，与 FK/emg2pose 无关。
-- **统一提取入口**：cluster.py / plot_cluster_features.py / evaluate.py **全部经 `features.feature_by_seg` 取特征**——它优先读 `out/features/{stem}.npz` 缓存（segment.py 写的、确定性 → 与重算逐位相同），缓存缺失或 stale 时回退用同一套 nan-aware `rest` 重算。这保证聚类、画图、评估打分的都是同一批特征。
+- **统一提取入口**：apex 通路的三个消费者（cluster.py / plot_cluster_features.py / evaluate.py 的 pose-space 探针）**全部经 `features.clip_features_for` 按 clip 取特征**——它优先读 `out/features/{stem}.npz` 缓存（segment.py 写的、键为 `clip_id`、确定性 → 与重算逐位相同），缓存缺失或 stale 时从 `source_path` 的 npz 按 `apex_sample` 重算。这保证聚类、画图、评估打分的都是同一批 clip-apex 特征。
 
 ---
 
-## 7. 聚类（无监督 + 事后命名）
+## 7. 聚类（无监督 + 打标驱动评估）
 
 整个聚类**没有任何标签参与训练**：
 
 - 切分纯信号处理（阈值检测）。
-- 聚类是 **KMeans**，只看"哪些段的姿态向量彼此像"。
+- 聚类只看"哪些 clip 的特征彼此像"。
 - 选 k 用 **silhouette**（内部指标，不需要真值）。
-- 唯一人工介入：聚类**之后**看每簇代表姿态给簇起名（`labels.csv`）。
+- **打标不再用于"给簇命名"**：标签独立写在 `annotations` 表（网页 UI 打的 clip 标签），评估时用 `evaluate.py` 把某次 run 的簇分配与 clip 标签做 JOIN 算 ARI/NMI/purity（§7.4）。导出 `export.py` 也直接按 clip 标签归档，**不经过簇**。
 
-### 7.1 分组：每个 (被试,手) 各跑一次 KMeans
+### 7.0 两条聚类通路（都以 clip 为单元，都写 `cluster_runs/{run_id}/`）
+
+| 通路        | 代码              | 特征                                                       | 算法                                  |
+|-------------|-------------------|------------------------------------------------------------|---------------------------------------|
+| **apex**    | `cluster.py`      | clip hold apex 的单帧静态定型姿态（`clip_apex_feature`，20 维）| 分组 KMeans + silhouette 选 k（§7.1-7.3）|
+| **轨迹**    | `cluster_traj.py` | clip motion 区间重采样到 L 帧的关节角**轨迹**（centered / velocity / raw，`--repr`）| zscore → PCA → MiniBatchKMeans         |
+
+两通路共用契约：每次 run 落地 `OUT/cluster_runs/{run_id}/`（`params.json` + `clusters.csv`，列 `source_file, clip_id, cluster_id`），同时由 `store.save_run` 登记进 db 的 `cluster_runs` + `cluster_assignments`。`run_id = '{YYYYMMDD-HHMMSS}__{paramhash8}'`（时间戳可读 + 参数哈希可复现）。两者都是一等公民，apex 是当前主推（更高 silhouette），轨迹通路保留作持续深化。
+
+### 7.1 apex 通路分组：每个 (被试,手) 各跑一次 KMeans
 
 ```python
-for group, gdf in seg_df.groupby("group"):    # group = "subject-hand"
-    X  = [apex_pose_feature(...) for seg in gdf]
-    Xz = zscore(X)
-    labels = KMeans(n_clusters=k, n_init=10).fit_predict(Xz)
+clips = store.labeled_view(conn)        # 已剔除 invalid 录制 / clip；不看 gesture_label
+for group, gdf in clips.groupby("group"):    # group = "subject-hand"
+    X  = [clip_apex_feature(ja, clip.apex_sample, fs) for clip in gdf]
+    Xz = zscore(apply_subject_norm(X, subjects, mode))
+    labels = clustering.select_k_and_cluster(Xz, k_min, k_max)
 ```
 
-为什么分组：不同被试手型/标定不同，左右手是镜像。混在一起 KMeans 会先按"谁的手"分。
+为什么分组：不同被试手型/标定不同，左右手是镜像。混在一起 KMeans 会先按"谁的手"分。`--group-by subject-hand|hand|all` 切换粒度，跨组 cluster_id 用全局偏移保证唯一。
 
 ### 7.2 跨被试合聚 + 按被试归一化
 
@@ -435,29 +451,39 @@ for group, gdf in seg_df.groupby("group"):    # group = "subject-hand"
 
 - 手动 `--k 18`（覆盖 `--k-min`/`--k-max`），或不传走 silhouette 在 `[k_min, k_max]`（默认 `[12, 30]`）扫。
 - 固定 `--k` 若大于该组样本数会被 `clustering.select_k_and_cluster` 钳到 `n-1` 并打印告警。
-- **K 宁大勿小**：过聚类（同一手势拆两簇）可恢复——标注时填相同名字即合并；欠聚类（两手势并一簇）不可恢复。
+- **K 宁大勿小**：过聚类（同一手势拆两簇）影响小——标签独立于簇，评估时两簇都映射到同一手势仍算正确；欠聚类（两手势并一簇）才真正损失信息、不可恢复。
+
+### 7.4 打标驱动评估（`evaluate.py`，按 run）
+
+[`evaluate.py`](../evaluate.py) 针对**某一次 run**（`--run`，缺省取 db 里最新一次）评估，因为聚类单元与打标单元都是 clip `(source_file, clip_id)`，评估就是一次 JOIN（`store.clusters_with_labels` = `cluster_assignments` LEFT JOIN clip 标签 `annotations`）。三组指标，写到 `cluster_runs/{run}/metrics.json`：
+
+- **A. 打标驱动**（在有标签的 clip 子集上，需 ≥2 标注 clip 且 ≥2 手势类）：Adjusted Rand Index / Normalized Mutual Info / cluster purity；标签太少时返回 N/A（不崩）。这就是"用打标评估聚类"。
+- **B. 被试污染**（无需标签）：每簇主导被试占比——簇应当是"手势"而非"人"。
+- **C. pose-space 质量**：在 apex pose 表征上算 silhouette + subject-leakage + LOSO transfer（一个通用 pose-space 探针；对轨迹通路这只是辅助视角，不是它自己的特征空间）。
 
 ---
 
 ## 8. 真值集构建工作流（推荐主路径）
 
 ```
-segment.py ──► segments.csv (burst)
-            ├► clips.csv    (clip = motion run + 真实 hold，打标单元)
-            └► recordings.csv (lag / NaN / 阈值快照)
+segment.py ──► OUT/shards/{stem}/{recording,bursts,clips}.csv + overview.png
+            └► OUT/index.db  (recordings / bursts / clips 表)  ← 权威索引
+            └► 顶层便捷 OUT/{recordings,bursts,clips}.csv
 
-      ↓ 按 lag_flag、pose_nan_frac 筛 recordings.csv
+      ↓ ./pulse.sh label  (label_server.py 网页 UI，读 index.db 的 clips)
 
-export_clips.py ──► clips_export/{stem}/c0000.npz   (每条录制一个子目录)
-                ├► clips_export/{stem}/c0000.png   (6 帧关键帧)
-                └► clips_export/index.html         (跨录制总览 + QC 摘要 + matched_burst 标红)
+annotations 表  ← 每个 clip 的 gesture_label / invalid（带 seg_version anchor）
+                  + 整条录制 invalid（软排除）/ drop（永久删 + tombstone）
 
-      ↓ 人浏览 index.html，在 clips.csv 填 gesture_label 列
+      ↓ ./pulse.sh export  (export.py 读 annotations JOIN clips)
 
-→ clips_labeled.csv  (真值集)
+OUT/gestures/{label}/{label}__{subject}-{hand}__{stem}__clip{cid:04d}.npz  (真值集)
+OUT/labeled_overview/{stem}.png   (每录制已标 clip 的 overview)
 ```
 
-每个 clip 的 6 帧 PNG = `clip_start → pre-motion → motion 1/3 → motion 2/3 → apex → clip_end`，足够标注员一眼辨识手势。
+打标的真值活在 `annotations` 表，**不再**回填到 clips.csv 的 gesture_label 列（该列已移除）。`store.labeled_view` 把 clips 与标签 LEFT JOIN 成实时视图，并已剔除 invalid 录制/clip。
+
+> 旁路（flow A，raw 数据浏览）：`export_clips.py` 把每个 clip 导成 `clips_export/{stem}/c0000.npz` + 6 帧关键帧 PNG + `index.html` 总览（`clip_start → pre-motion → motion 1/3 → motion 2/3 → apex → clip_end`），用于无 UI 时的离线浏览（`./pulse.sh raw-export`）。**注意**：它读顶层 `clips.csv` 时仍按**旧列名**（`clip_start_sample` / `static_in_*` / `static_out_*` / `matched_emg_seg_idx`），这些列已在新 schema 中移除（§9.2），故该旁路目前与新 `clips.csv` 不兼容；统一打标 UI（`./pulse.sh label`）是推荐路径。
 
 ### 8.1 6 帧渲染的两条路径
 
@@ -472,49 +498,78 @@ export_clips.py ──► clips_export/{stem}/c0000.npz   (每条录制一个子
 
 ## 9. 输出 schema 速查
 
-### 9.1 `segments.csv`（每个 EMG burst 一行）
+数据层是 SQLite [`emg_label/store.py`](../emg_label/store.py)。`OUT/index.db` 是权威索引；`OUT/shards/{stem}/` 是 segmentation 真值，`annotations` / `cluster_runs` 是各自的真值。顶层 `recordings.csv / bursts.csv / clips.csv` 只是 db 表的便捷 dump（给读平面文件的 dev 工具；`bursts/clips` 的 dump 额外 JOIN 回 `source_path` 以便定位 npz）。
+
+### 9.0 `OUT/index.db` 表
+
+| 表                     | 主键                                  | 内容                                                              |
+|------------------------|---------------------------------------|-------------------------------------------------------------------|
+| `recordings`           | `source_file`                         | 每录制一行 + QC（§5.3）+ `seg_version`                            |
+| `bursts`               | `(source_file, burst_idx)`            | 每个 EMG burst 一行（§9.1）                                       |
+| `clips`                | `(source_file, clip_id)`              | 每个 clip 一行 — 打标/聚类/评估单元（§9.2）                       |
+| `annotations`          | `(source_file, clip_id, scope, kind)` | 标签真值：`scope ∈ {clip, recording}`、`kind ∈ {label, invalid}`，带 `clip_start_sample/clip_end_sample/seg_version` anchor（§9.3）|
+| `cluster_runs`         | `run_id`                              | 每次聚类 run 一行：`created_at, channel(apex/trajectory), params_json`|
+| `cluster_assignments`  | `(run_id, source_file, clip_id)`      | 每次 run 的 `cluster_id` 分配（与 clips/annotations 同键 → JOIN）  |
+| `tombstones`           | `source_file`                         | 永久删除的录制（重切分不复活）                                    |
+
+### 9.1 `bursts`（每个 EMG burst 一行；便捷 `bursts.csv`，曾名 `segments.csv`）
 
 | 列                                                                                       | 含义                                          |
 |------------------------------------------------------------------------------------------|-----------------------------------------------|
-| `source_file, source_path, group, seg_idx`                                               | 溯源                                          |
+| `source_file, group, burst_idx`                                                          | 溯源（便捷 CSV 额外 JOIN `source_path`）      |
 | `start_sample, end_sample`                                                               | burst 区间                                    |
-| `hold_end_sample`                                                                        | hold 窗口终点（聚类直接读）                   |
+| `hold_end_sample`                                                                        | hold 窗口终点（burst 路特征缓存锚点）         |
 | `apex_sample`                                                                            | hold 内最大偏离帧                             |
 | `duration_s, emg_rms, envelope_peak, pose_range`                                         | QC                                            |
 | `matched_clip_id`                                                                        | 该 burst 对应的 clip（-1 = 无）               |
 
-### 9.2 `clips.csv`（每个 pose clip 一行 — 打标单元）
+### 9.2 `clips`（每个 pose clip 一行 — 打标 / 聚类 / 评估单元；便捷 `clips.csv`）
 
 | 列                                                                                                                                       | 含义                                            |
 |------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|
-| `source_file, source_path, group, subject, hand, clip_id`                                                                                | 溯源                                            |
-| `clip_start_sample, clip_end_sample`                                                                                                     | 完整 action 区间（= `[start, 下一个 onset)`，无 pad）|
-| `static_in_start/end_sample`                                                                                                            | **零宽**（`= clip_start`，无 pre-motion 静态期）|
-| `motion_start/end_sample, static_out_start/end_sample`                                                                                   | motion 段 + 真实 hold（`static_out_* == hold_*`）|
-| `hold_start_sample, hold_end_sample`                                                                                                     | 真实 hold 区间（显式命名 `static_out_*` 的别名）|
-| `apex_sample`                                                                                                                            | hold 内最稳帧                                   |
+| `source_file, group, subject, hand, clip_id`                                                                                             | 溯源（便捷 CSV 额外 JOIN `source_path`）        |
+| `start_sample, end_sample`                                                                                                               | 完整 action 区间（= `[start, 下一个 onset)`，无 pad）|
+| `motion_start_sample, motion_end_sample`                                                                                                 | motion run                                      |
+| `hold_start_sample, hold_end_sample`                                                                                                     | 真实 hold 区间                                  |
+| `apex_sample`                                                                                                                            | hold 内最稳帧（聚类特征锚点）                   |
 | `duration_s, motion_duration_s, hold_duration_s, emg_rms, envelope_peak, mean_pose_speed, max_pose_speed, pose_range`                    | QC                                              |
-| `matched_emg_seg_idx`                                                                                                                    | 该 clip 对应的 burst（-1 = EMG 漏切）           |
+| `matched_burst_idx`                                                                                                                      | 该 clip 对应的 burst（-1 = EMG 漏切）           |
 | `fusion_type`                                                                                                                            | `both`（motion 内有 EMG burst）/ `pose_only`    |
 | `review_flag`                                                                                                                            | `long`/`nohold`/`slow`/`long_static`/`''`       |
-| `gesture_label`                                                                                                                          | **空，等人填**                                  |
+| `seg_version`                                                                                                                            | 切分参数指纹（重切分后迁移标签用）              |
 
-### 9.3 `recordings.csv`（每条录制一行）
+> 已移除（旧 schema）：`static_in_start/end_sample`、`static_out_start/end_sample`（hold 现由 `hold_*` 直接命名）、空的 `gesture_label` 列（标签移到 `annotations`）。
 
-见 §5.3。
+### 9.3 `recordings` 表 + `annotations` 表
 
-### 9.4 `segments_clustered.csv`（聚类后）
+`recordings` 见 §5.3。`annotations`（标签真值）列：`source_file, clip_id, scope, kind, value, clip_start_sample, clip_end_sample, seg_version, labeler, labeled_at, note`。`scope='recording'` 时 `clip_id=-1`；clip 的 `gesture_label` 存在 `kind='label'` 的 `value`，软无效是 `kind='invalid'`（与 label 互斥）。
 
-= `segments.csv` + `cluster_id` 列。供 `export.py` 按 (group, cluster_id) → label 映射归档。
+### 9.4 聚类 run 产物：`cluster_runs/{run_id}/`（替代旧 `segments_clustered.csv`）
 
-### 9.5 单段导出 npz（`export.py`）
+每次 apex / 轨迹聚类（`cluster.py` / `cluster_traj.py`）写一个 run 目录并登记进 db：
+
+| 路径                                      | 内容                                                            |
+|-------------------------------------------|-----------------------------------------------------------------|
+| `cluster_runs/{run_id}/params.json`       | `run_id, channel, created_at, params`                           |
+| `cluster_runs/{run_id}/clusters.csv`      | `source_file, clip_id, cluster_id`（同步进 `cluster_assignments` 表）|
+| `cluster_runs/{run_id}/metrics.json`      | `evaluate.py` 写：label-driven ARI/NMI/purity + 被试污染 + pose-space（§7.4）|
+| `cluster_runs/{run_id}/feature_maps.png`  | `plot_cluster_features.py` 写：该 run clip-apex 特征的 PCA/t-SNE/heatmap/silhouette|
+| `cluster_runs/{run_id}/gallery/`          | 每簇 3D 手部 montage（apex）或 medoid 关键帧条 + index.html（轨迹）|
+
+`run_id = '{YYYYMMDD-HHMMSS}__{paramhash8}'`。
+
+### 9.5 单 clip 导出 npz（`export.py` → `OUT/gestures/{label}/`）
+
+文件名 `{label}__{subject}-{hand}__{stem}__clip{cid:04d}.npz`，键：
 
 | 键                                                                                              | 内容                                                 |
 |-------------------------------------------------------------------------------------------------|------------------------------------------------------|
-| `emg, joint_angles`                                                                             | (seg_len, 16)+(seg_len, 20) 该 burst 切片            |
-| `label, cluster_id, group, source_file, seg_idx, start_sample, end_sample, fs, hand`            | 标注与溯源（`hand` 显式写入，下游 `visualize_segment.py`/`animate_segment.py` 用 `io_utils.side_from_meta` 取它）|
+| `emg, joint_angles`                                                                             | (clip_len, 16)+(clip_len, 20) 完整 clip 切片         |
+| `label, source_file, clip_id, start_sample, end_sample, fs, hand`                               | 标注与溯源（`hand` 显式写入，供下游可视化取镜像侧）  |
 
-### 9.6 单 clip 导出 npz（`export_clips.py`）
+（按手势归档；旧的"按簇 (group, cluster_id)→label 映射、导出到 `segments/<label>/`"流程已废除。）
+
+### 9.6 单 clip 导出 npz（`export_clips.py`，flow A 浏览旁路）
 
 | 键                                                                                                                              | 内容                                                   |
 |---------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------|
@@ -536,7 +591,7 @@ export_clips.py ──► clips_export/{stem}/c0000.npz   (每条录制一个子
                     │
 io_utils.load_npz   │   ← 自动识别 + 对齐 pose 到 EMG 轴 + 度→弧度
                     ▼
-   action_segmentation.segment_recording  (统一检测器)
+   segment.py → action_segmentation.segment_recording  (统一检测器)
         pose_speed (主干) + robust_threshold 自动 move 阈
         + EMG envelope/burst (仲裁器 R2)  +  dip-merge / NaN 填补
                     │
@@ -546,23 +601,31 @@ io_utils.load_npz   │   ← 自动识别 + 对齐 pose 到 EMG 轴 + 度→弧
         │                        │
         │  ←── burst ↔ clip 匹配 ──→
         ▼                        ▼
-   segments.csv             clips.csv  ←──── 打标 gesture_label
-   (+ features/{stem}.npz 缓存)        │
-        │ (聚类路径)               │ (真值集路径)
-        ▼                          ▼
-  cluster.py → KMeans         export_clips.py
-        │                          │
-        ▼                          ▼
-  segments_clustered.csv      clips_export/{stem}/c*.npz + c*.png + index.html
-        │                          │
-  填 labels.csv 命名簇         浏览 index.html 填 clips.csv（或用 label_server 写 clip_labels.csv）
-        │                          │
-        ▼                          ▼
-  export.py → segments/<label>/*    clips_labeled.csv (= 真值集)
-                                 ┌────────────────────────────┐
-                                 │ recordings.csv （全局 QC） │
-                                 │ lag_flag, pose_nan_frac    │
-                                 └────────────────────────────┘
+  shards/{stem}/{recording,bursts,clips}.csv + overview.png   (分片真值)
+        │   (+ features/{stem}.npz 每 clip apex 缓存)
+        ▼
+  OUT/index.db   (recordings / bursts / clips 表)  ← 权威索引
+        │            (+ 顶层便捷 recordings/bursts/clips.csv)
+        │
+        ├──────────────────────────────┬───────────────────────────┐
+        │ (打标)                         │ (聚类，单元 = clip)         │
+        ▼                              ▼                           ▼
+  label_server.py (网页 UI)      cluster.py (apex)          cluster_traj.py (轨迹)
+        │ 写 annotations 表             │  clip_apex_feature        │  轨迹 + PCA + MBKMeans
+        │ (label / invalid /            └─────────┬─────────────────┘
+        │  drop+tombstone)                        ▼
+        │                              cluster_runs/{run_id}/ (params + clusters.csv)
+        │                                         │  + 登记 cluster_assignments 表
+        │                                         ▼
+        │                              evaluate.py: clusters JOIN 标签
+        │                              → metrics.json (ARI/NMI/purity + 污染 + pose-space)
+        │                              plot_cluster_features.py → feature_maps.png
+        ▼
+  export.py: annotations JOIN clips
+  → OUT/gestures/{label}/*.npz  (= 真值集) + labeled_overview/
+        │
+        ▼
+  build_anim_gallery.py → OUT/hand_anim/  (每手势动画)
 ```
 
-具体命令、参数、典型场景见 [RUNBOOK.md](RUNBOOK.md)。
+`store.remap_annotations`：重切分后（`seg_version` 变化）按 clip 的 sample 区间重叠把旧标签迁移到新 clip；重叠不足只标 `note='待复核'`，绝不静默丢弃。具体命令、参数、典型场景见 [RUNBOOK.md](RUNBOOK.md)。

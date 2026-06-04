@@ -2,7 +2,7 @@
 
 > 目标：把现有"静态 `index.html` 浏览 + 手动编辑 `clips.csv`"的真值集打标流程，
 > 升级为一个**交互式网页**：左边 clip 队列，中间 overview 图 + 可旋转/可播放的 3D 手势，
-> 右边填手势真值标签，**点一下即写回 CSV**。覆盖 RUNBOOK §A.5 那一步。
+> 右边填手势真值标签，**点一下即写回 `OUT/index.db`（annotations 表）**。覆盖 RUNBOOK §A.5 那一步。
 
 本文是设计 + 落地文档，代码块基本可直接复制使用。先读 [METHOD.md](METHOD.md) / [RUNBOOK.md](RUNBOOK.md) 了解上游产物。
 
@@ -23,7 +23,7 @@
 | 只有 6 帧静态图 | 快速/细微手势 6 帧不够辨识，缺一个能旋转、能逐帧播放的 3D 视图 |
 | 没有 overview 上下文 | 看不到这个 clip 在整条录制时间轴上的位置、和相邻 burst/clip 的关系 |
 | 无进度/无校验 | 不知道标了多少、哪些是"优先复核"（`matched_burst=-1`）、标签拼写无约束 |
-| 手改 `clips.csv` 危险 | 脚本会重写 `clips.csv` 其它列，直接编辑容易被覆盖（RUNBOOK 已警告要先 `cp`） |
+| 手改 `clips.csv` 危险 | 重切会重写 shard 里的 `clips.csv`（再由 `store` 重建 `OUT/index.db`），直接编辑容易被覆盖；而且现在 clips.csv 已**不含 `gesture_label` 列**（标签独立存 annotations 表） |
 
 ---
 
@@ -35,11 +35,11 @@
 |------|--------|-------------|---------|--------|------|
 | **A. 纯静态 HTML** | 在现有 `index.html` 上加 JS，标签存 `localStorage`，最后导出下载一个 csv | ✗ 只能"下载"到浏览器下载目录，无法原地写 `out_pose/`，多人/断点续标乱 | 可（Plotly.js）但 3D 坐标得预先烘进 HTML，体积爆炸 | 低 | 不推荐 |
 | **B. 静态 + File System Access API** | 用浏览器新 API 让用户授权写本地文件 | △ 仅 Chrome/Edge，需每次授权，路径不可控，非 https 受限 | 同 A | 中 | 不推荐 |
-| **C. 本地轻服务端**（推荐） | 一个本地 Python 进程读 `out_pose/`、按需算 3D、`POST` 写回 CSV，浏览器只当前端 | ✓ 服务端直接原子写 `clip_labels.csv`，断点续标天然支持 | ✓ 3D 顶点**按需**算 + 缓存，前端 Plotly.js `Mesh3d` 渲染 | 中 | **推荐（已落地）** |
+| **C. 本地轻服务端**（推荐） | 一个本地 Python 进程从 `OUT/index.db` 读 clips/recordings/bursts、按需算 3D、`POST` 写回 db | ✓ 服务端直接写 annotations 表（事务持久化），断点续标天然支持 | ✓ 3D 顶点**按需**算 + 缓存，前端 Plotly.js `Mesh3d` 渲染 | 中 | **推荐（已落地）** |
 
 **为什么是 C：**（结论 C 已落地，但下面的实现细节已演进——以 §6.5 为准）
 
-- 写 CSV 是核心诉求，只有服务端能稳妥地原地写 `out_pose/clip_labels.csv`（原子写、可加 labeler/时间戳、断点续标）。
+- 持久化标签是核心诉求，只有服务端能稳妥地写 `OUT/index.db` 的 annotations 表（事务、可加 labeler/时间戳、断点续标、带 re-seg-stable 锚点）。
 - ~~3D 优先 `io_utils.load_skeleton`（无需 torch）、回退 FK~~ —— **已改**：当前服务端统一走 emg2pose `skin_vertices_np` 手部**网格**（更清晰、可旋转），**需要 torch + emg2pose**，没有"无 torch skeleton 路径"。
 - HTTP 用 **`http.server`**（仍是标准库 server），但**不是 stdlib-only**：进程 import `matplotlib`（Agg，画/检测 overview）+ emg2pose（蒙皮）。用 emg2pose 的 python 直接跑。前端 3D 用 Plotly.js `Mesh3d`（`plotly.min.js` 本地 vendored 或 CDN 兜底，未提交）。
 
@@ -49,29 +49,32 @@
 
 ## 2. 架构总览
 
-> 注：下图与 §3–§5、§9 描述的是**最初原型**的数据流；实现已演进为**录制级懒加载 + emg2pose 手部网格 + 实时同步播放**（见 §6.5、§10）。当前真实路由/产物：标签写 `out_pose/clip_labels.csv`（非 `labels.csv`，见 §3.2），3D 缓存为 `out_pose/cache/mesh_cache_v3/{stem}/f{i:04d}.json`（非 `pose_cache/{key}.json`），并使用 emg2pose Mesh3d 顶点而非 skeleton 点线。
+> 注：下图与 §3–§5、§9 描述的是**最初原型**的数据流；实现已演进为**录制级懒加载 + emg2pose 手部网格 + 实时同步播放**（见 §6.5、§10）。当前真实路由/产物：clips/recordings/bursts 全部从 `OUT/index.db` 读（不再把 `clips.csv` 整张读进内存）；标签/无效写 `OUT/index.db` 的 **annotations 表**（非 `clip_labels.csv`/`invalid_recordings.csv`，见 §3.2），3D 缓存为 `out_pose/cache/mesh_cache_v3/{stem}/f{i:04d}.json`（非 `pose_cache/{key}.json`），并使用 emg2pose Mesh3d 顶点而非 skeleton 点线。
 
 ```
 浏览器 (webui/index.html + app.js ; plotly 由本地 vendored 或 CDN 兜底，未提交)
    │  fetch JSON / POST 标签
    ▼
 label_server.py   (http.server；import matplotlib + emg2pose，用 emg2pose 的 python 跑)
-   │  启动时 groupby 建录制级索引；读 clip_labels.csv（迁移旧 labels.csv）、recordings.csv
+   │  dbmod.connect(out) 开一个共享 sqlite 连接；启动时 groupby 建录制级索引
+   │  从 annotations 表载入既有标签/无效（断点续标），从 recordings 表取阈值/时长
    │
-   ├─ 读  out_pose/clips.csv            (打标单元 + QC 列)
-   ├─ 读  out_pose/recordings.csv       (每录制 duration_s / pose_thresh / lag_flag，用于 overview 上下文)
+   ├─ 读  OUT/index.db: clips ⨝ recordings   (打标单元 + QC 列 + source_path)
+   ├─ 读  OUT/index.db: recordings           (每录制 duration_s / pose_thresh / lag_flag，用于 overview 上下文)
+   ├─ 读  OUT/index.db: bursts               (burst 段几何，overview 现生成时用)
    ├─ 读  out_pose/shards/{stem}/overview.png   (三行 overview 图；缺失时由 plot_overview_dual 现生成)
    ├─ 算  整条录制手部网格顶点  ← emg2pose skin_vertices_np，缓存到 cache/mesh_cache_v3/{stem}/f{i:04d}.json
    │
-   └─ 写  out_pose/clip_labels.csv      ← POST /api/label（原子写，断点续标）
-          out_pose/clips_labeled.csv    ← GET /api/export（clips.csv ⨝ clip_labels.csv，按文件夹拆分 + 合并）
+   └─ 写  OUT/index.db: annotations          ← POST /api/label / /api/invalid_recording（事务，断点续标）
+          OUT/index.db: tombstones + 删 shard ← POST /api/drop_recording（永久删除）
+          out_pose/clips_labeled.csv          ← GET /api/export（clips ⨝ annotations，按文件夹拆分 + 合并）
 ```
 
 **数据流（一次打标，当前实现）：**
 
-1. 前端 `GET /api/recordings` 拿到**录制级**汇总（每条录制 n_clips/n_review/n_labeled/cached），渲染左侧录制树。
+1. 前端 `GET /api/recordings` 拿到**录制级**汇总（每条录制 n_clips/n_review/n_labeled/n_invalid/rec_invalid/cached），渲染左侧录制树。
 2. 选中一条录制 → `GET /api/recording?stem=...`（曲线 + frame_times + s1..sN 段落几何）+ `GET /api/overview?stem=...`（overview 图）+ `GET /api/handfaces`（三角面，一次）+ 逐帧 `GET /api/handmesh?stem=&i=`（每帧顶点 JSON）。
-3. 填标签、回车 → `POST /api/label {key, gesture_label, invalid, labeler, note}` → 服务端 upsert `clip_labels.csv` → 前端把该段 chip 染绿、自动跳下一个；整条录制可 `POST /api/invalid_recording` 标为无效。
+3. 填标签、回车 → `POST /api/label {key, gesture_label, invalid, labeler, note}` → 服务端把该 clip 写成 annotations 表里 scope='clip' 的一行（kind='label' 或 'invalid'，互斥）→ 前端把该段 chip 染绿、自动跳下一个；整条录制可 `POST /api/invalid_recording`（软无效，scope='recording'）或 `POST /api/drop_recording`（永久删除）。
 4. 全部标完 → `GET /api/export` 生成按文件夹拆分的 `clips_labeled/*.csv` + 合并的 `clips_labeled.csv`（= 真值集）。
 
 ---
@@ -80,12 +83,15 @@ label_server.py   (http.server；import matplotlib + emg2pose，用 emg2pose 的
 
 ### 3.1 读取（上游产物，只读，不改）
 
-| 文件 | 用途 |
+> 当前**全部从 `OUT/index.db` 读**（`dbmod.connect(out)` 一个共享连接 + `pd.read_sql_query`），不再把 `clips.csv` 整张读进内存。shard 目录里的 `overview.png` 仍是文件直读。`shards/{stem}/` 是切分**真值**；`OUT/index.db` 是从 shard 重建的派生索引（`store.build_index`），外加 annotations / cluster_runs 这两份本身就是真值、不在 shard 里的表。`segment.py` 之后也会落一份顶层便利 CSV（`recordings.csv`/`bursts.csv`/`clips.csv`，把 source_path JOIN 回去）供 `diag_seg`/`visualize_segment` 等扁平文件工具用，但**打标服务端读 db，不读这些便利 CSV**。
+
+| 数据源（db 表 / 文件） | 用途 |
 |------|------|
-| `out_pose/clips.csv` | 打标单元 + 子结构 sample 索引 + QC 列（含 `clip_start/end_sample`、`static_in/out_*_sample`、`motion_*_sample`、`apex_sample`、新增 `hold_start/end_sample`、`hold_duration_s`、`fusion_type`、`review_flag`；schema 见 METHOD §9.2。注意 `static_out_*` 现在就是真实 hold 的别名，无独立 `start_sample/end_sample` 列） |
-| `out_pose/recordings.csv` | 每录制 `duration_s` / `pose_thresh`/`enter_thresh`/`exit_thresh` / `lag_flag` / `n_clip_only`，给 overview 阈值线、上下文与排序优先级 |
+| `index.db: clips`（⨝ `recordings` 取 `source_path`） | 打标单元 + 子结构 sample 索引 + QC 列（含 `start_sample/end_sample`、`motion_*_sample`、`hold_start/end_sample`、`apex_sample`、`hold_duration_s`、`fusion_type`、`review_flag`、`matched_burst_idx`、`seg_version`；schema 见 store.py `CLIP_COLS`）。**已删除**旧的 `static_in_*`/`static_out_*` 列、以及空的 `gesture_label` 列（标签现住 annotations 表）。服务端内部把 `start_sample/end_sample→clip_start/end_sample`、`matched_burst_idx→matched_emg_seg_idx` 改名以复用既有几何/导出代码 |
+| `index.db: recordings` | 每录制 `duration_s` / `pose_thresh`/`pose_exit_thresh`/`enter_thresh`/`exit_thresh` / `lag_flag` / `n_clip_only`，给 overview 阈值线、上下文与排序优先级 |
+| `index.db: bursts` | EMG burst 段几何（`start_sample`/`end_sample`/`apex_sample`，主键 `burst_idx`；旧名 `segments.csv`/`seg_idx` 已弃），overview 现生成时画第三行 burst 行 |
 | `out_pose/shards/{stem}/overview.png` | 三行 overview 图（EMG 包络+burst / pose speed+clip / 全部 clip+burst）；**缺失时**由同一个 `plot_overview_dual` 从中间数据现生成 |
-| 源 npz（`clips.csv.source_path`） | 算 3D：`io_utils.load_npz` 取 joint_angles → emg2pose `skin_vertices_np` 蒙皮成手部网格（需 torch + emg2pose，环境已具备） |
+| 源 npz（`recordings.source_path`） | 算 3D：`io_utils.load_npz` 取 joint_angles → emg2pose `skin_vertices_np` 蒙皮成手部网格（需 torch + emg2pose，环境已具备） |
 
 > ~~`out_pose/clips_export/{key}.png`（6 帧关键帧）~~ — 原型设计里作快速参考，**当前服务端不再读取**（`/api/keyframes` 路由已移除）。`export_clips.py` 仍会产出这些 PNG，但打标 UI 不显示它们。
 
@@ -97,28 +103,30 @@ key = f"{io_utils.parse_file_info(source_path).stem}__c{int(clip_id):04d}"
 
 ### 3.2 写出（本工具产物）
 
-**`out_pose/clip_labels.csv`** — 打标结果，按 `(source_file, clip_id)` 唯一键 upsert。
-（**改名自 `labels.csv`**：避免与 flow-B 的**每聚类**命名表 `labels.csv`（被 `export.py` 读取）混淆；启动时若发现带 `clip_id` 列的旧 `labels.csv`，会自动迁移成 `clip_labels.csv`。）
-**刻意不直接写 `clips.csv`**（脚本会重写它），改用独立文件，对上游重跑稳健。表头为
-`source_file,clip_id,gesture_label,invalid,labeler,labeled_at,note`：
+**`OUT/index.db` 的 `annotations` 表** — 打标结果（标签 + 无效），是**标签真值**。一张表用 `(scope, kind)` 区分维度，主键 `(source_file, clip_id, scope, kind)`，每次 `POST` 走 `store.set_annotation`（事务）upsert。**不再写 `clip_labels.csv` / `invalid_recordings.csv`（已废弃）**，也刻意不直接写 `clips.csv`（重切会重写它，且它已不含 `gesture_label` 列）。annotations 的列（store.py `ANNOT_COLS`）：
 
 | 列 | 含义 |
 |----|------|
-| `source_file` | 溯源（联合主键之一） |
-| `clip_id` | 溯源（联合主键之一） |
-| `gesture_label` | 人填的手势名；空串 = 未标/丢弃 |
-| `invalid` | `1` = 人工标记为**无效切片**（过切产生的垃圾段），与 `gesture_label` 互斥；导出时排除 |
+| `source_file` | 溯源（主键之一） |
+| `clip_id` | 溯源（主键之一；`scope='recording'` 时为 `-1`） |
+| `scope` | `clip`（单切片标签/无效）或 `recording`（整条录制无效） |
+| `kind` | `label`（手势名，存 `value`）或 `invalid`（无效标记）；同一 clip 二者**互斥** |
+| `value` | `kind='label'` 时 = 人填的手势名；无效行为空串 |
+| `clip_start_sample` / `clip_end_sample` | clip 的样本区间，重切稳定锚点（`store.remap_annotations` 用它按重叠把标签搬到新 clip） |
+| `seg_version` | 标注时的切分版本；与当前版本不符则触发 remap（重叠不足时标 note='待复核'，**绝不静默丢**） |
 | `labeler` | 标注员（前端输入，便于多人协作/质检） |
 | `labeled_at` | ISO 时间戳 |
 | `note` | 备注（可选，比如"疑似翻手腕""信号噪声"） |
 
-另外整条录制可被标为无效（`POST /api/invalid_recording`），写到 `out_pose/invalid_recordings.csv`（列 `source_file,labeler,marked_at,note`），这些录制在打标、导出、聚类、评估里都会被排除。
+说明：单切片"无效"= `scope='clip', kind='invalid'`（过切产生的垃圾段，与手势名互斥，导出时排除）。整条录制可被**软标无效**（`POST /api/invalid_recording` → `scope='recording', kind='invalid'`），这些录制在打标、导出、聚类、评估里都会被排除（`store.excluded_recordings` = recording-scope invalid ∪ tombstones）。**永久删除**则走 `POST /api/drop_recording`（见下），与软无效不同。
 
-**导出（`GET /api/export`）** — 只导**已打标**的 clip（空标签按约定丢弃），分两层：
-- `out_pose/clips_labeled/{subject}__{session}.csv` — **每个源文件夹一份**（文件夹 = `os.path.dirname(source_path)`，即左侧树的 `{subject}/{date-hand}` 会话目录），含该文件夹内全部已标 clip + `gesture_label`/`label_note`。
+**永久删除（`POST /api/drop_recording {stem}`）** — 前端"删除录制"按钮。走 `store.drop_recording` → `dbmod.drop_recording`：删该 `source_file` 在 recordings/bursts/clips/annotations/cluster_assignments 里的所有行，写一条 `tombstones`（重切**不会**把它复活），并 `shutil.rmtree` 删掉磁盘上的 `shards/{stem}/`（顺带删 `features/{stem}.npz`），最后从内存状态里移除。与软"整条录制无效"不同（后者只打 `scope='recording'` 的 invalid 注解、可撤销）。
+
+**导出（`GET /api/export`）** — 只导**已打标**的 clip（空标签按约定丢弃），由内存中的标签与 clips 表 merge（= clips ⨝ annotations），分两层：
+- `out_pose/clips_labeled/{subject}__{session}.csv` — **每个源文件夹一份**（文件夹 = `_group_folder(source_path)`，即左侧树的 `{subject}/{date-hand}` 会话目录；pool 软链会 realpath 还原真实目录），含该文件夹内全部已标 clip + `gesture_label`/`label_note`。
 - `out_pose/clips_labeled.csv` — **最外层合并文件**（全部已标 clip）。
 
-这就是 RUNBOOK §A.5 那份"真值集"，但按文件夹拆开 + 一份合并，避免一个 22 万行的巨型完整 CSV。`/api/export` 返回 `{n_labeled, n_folders, dir, merged}`。
+软无效的整条录制会先被剔除。这就是 RUNBOOK §A.5 那份"真值集"，但按文件夹拆开 + 一份合并，避免一个 22 万行的巨型完整 CSV。`/api/export` 返回 `{n_labeled, n_folders, dir, merged}`。
 
 **`out_pose/cache/mesh_cache_v3/{stem}/f{i:04d}.json`** — 手部网格顶点缓存（每帧 emg2pose `skin_vertices_np` 顶点，int mm，~12KB/帧），首次请求时算好落盘，后续直接发。整条录制的几何（曲线 + frame_times + 段落）另缓存于 `out_pose/cache/recording_cache/{stem}.json`，现生成的 overview 缓存于 `out_pose/cache/overview_cache/{stem}.{png,json}`。
 
@@ -138,8 +146,9 @@ key = f"{io_utils.parse_file_info(source_path).stem}__c{int(clip_id):04d}"
 | GET | `/api/handmesh` | `stem, i` | 第 `i` 帧手部网格顶点 JSON `{"v": [[x,y,z]…788 顶点]}`（emg2pose `skin_vertices_np`，int mm；按需渲染+磁盘缓存） |
 | GET | `/api/handfaces` | — | 网格三角面 `{i,j,k}`（左右手相同，发一次；Plotly `Mesh3d`） |
 | GET | `/api/handstatus` | `stem` | `{...}` 手部帧渲染进度（数磁盘上的 JSON 帧） |
-| POST | `/api/label` | `{key, gesture_label, invalid, labeler, note}` | `{ok, total, total_labeled, total_invalid, stem, stem_labeled, stem_invalid}` |
-| POST | `/api/invalid_recording` | `{stem, invalid, labeler, note}` | `{ok, stem, rec_invalid, total_invalid_rec}` |
+| POST | `/api/label` | `{key, gesture_label, invalid, labeler, note}` | `{ok, total, total_labeled, total_invalid, stem, stem_labeled, stem_invalid}`（写 annotations: scope='clip'） |
+| POST | `/api/invalid_recording` | `{stem, invalid, labeler, note}` | `{ok, stem, rec_invalid, total_invalid_rec}`（软无效，写/删 annotations: scope='recording', kind='invalid'） |
+| POST | `/api/drop_recording` | `{stem}` | `{ok, stem, dropped, total_clips}`（**永久删除**：删 db 行 + annotations + cluster_assignments，写 tombstone，删 shard 目录） |
 | GET | `/api/export` | — | `{n_labeled, n_folders, dir, merged}`，并落盘 `clips_labeled/*.csv` + `clips_labeled.csv` |
 
 **`GET /api/recording?stem=` 段落（每个 clip 一段 s1..sN）**大致形如：
@@ -172,9 +181,9 @@ key = f"{io_utils.parse_file_info(source_path).stem}__c{int(clip_id):04d}"
 ## 5. 后端实现（`label_server.py`） — ⚠️ 原型，已被取代
 
 > **本节代码是最初原型，已不再与仓库里的 `label_server.py` 对应**，仅保留以记录设计思路。真实服务端的当前形态见 **§6.5**，关键差异：
-> - **不是 stdlib-only**：`import matplotlib`（Agg）+ emg2pose（`skin_vertices_np` 蒙皮手部网格），还 import `emg_label.io_utils/plotting`。
-> - 标签写 **`clip_labels.csv`**（非 `labels.csv`，启动迁移旧文件），3D 缓存为 **`cache/mesh_cache_v3/{stem}/f{i:04d}.json` 网格顶点**（非 `pose_cache/{key}.json` 的 skeleton 点线）。
-> - 索引按**录制 groupby 懒加载**（非一次性建 `by_key` 全量 dict），`main()` 多了 `--host`，并实现了整条录制无效化（`/api/invalid_recording`）、手部网格端点（`/api/handmesh`、`/api/handfaces`、`/api/handstatus`）、录制级 `/api/recording`、overview 现生成。
+> - **不是 stdlib-only**：`import matplotlib`（Agg）+ emg2pose（`skin_vertices_np` 蒙皮手部网格），还 import `emg_label.io_utils/plotting` + `emg_label.store as dbmod`。
+> - 数据从 **`OUT/index.db`** 读（`dbmod.connect` + `pd.read_sql_query`，clips/recordings/bursts），不再把 `clips.csv` 读进 pandas；标签/无效写 **annotations 表**（`store.set_annotation`，非 `clip_labels.csv`/`labels.csv`/`invalid_recordings.csv`），3D 缓存为 **`cache/mesh_cache_v3/{stem}/f{i:04d}.json` 网格顶点**（非 `pose_cache/{key}.json` 的 skeleton 点线）。
+> - 索引按**录制 groupby 懒加载**（非一次性建 `by_key` 全量 dict，而是 `by_stem` 录制级 + `_clip_meta` 锚点 dict），`main()` 多了 `--host`，并实现了整条录制软无效化（`/api/invalid_recording`）、永久删除（`/api/drop_recording`）、手部网格端点（`/api/handmesh`、`/api/handfaces`、`/api/handstatus`）、录制级 `/api/recording`、overview 现生成。
 > - `POSE_MAX_FRAMES=60` 常量已不存在；当前手部帧网格按 `POSE_FPS`（默认 15）采样、上限 `POSE_REC_MAX_FRAMES`（3000）。
 
 放在仓库根目录，用 `$PY`（emg2pose 的 python）跑。**以下为原型清单（已过时，勿照抄）：**
@@ -519,12 +528,12 @@ if __name__ == "__main__":
 
 **实现要点：**
 
-- **复用、不重写**：3D 走 `io_utils.load_skeleton`（无 torch）→ 失败回退 `hand3d` FK，和 `export_clips.py` 同一策略；连接表/配色直接 import。
-- **键一致**：`_clip_key` 与 `export_clips._clip_key` 同式，所以 `clips_export/{key}.png` 能直接拿来当 6 帧参考。
-- **写安全**：单进程 + `threading.Lock`，每次 upsert 后**原子写**（tmp→`os.replace`）整张 `labels.csv`；几千行重写成本可忽略，省掉行内改写的坑。
-- **断点续标**：启动读已存在的 `clip_labels.csv` 进内存（旧 `labels.csv` 自动迁移），刷新页面/重启进程都不丢。
+- **复用、不重写**：~~3D 走 `io_utils.load_skeleton`（无 torch）→ 失败回退 `hand3d` FK~~（原型）。当前 3D 走 emg2pose `skin_vertices_np` 手部网格（须 torch + emg2pose），见 §6.5。
+- **键一致**：`_clip_key` 与 `export_clips._clip_key` 同式（`{stem}__c{cid:04d}`），`_resolve_key` 反解回 `(stem, source_file, clip_id)`。
+- **写安全**：单进程 + `threading.Lock`，每次 upsert 走 `store.set_annotation` 的**事务**（WAL，`INSERT OR REPLACE`），省掉手写 CSV 行内改写的坑。
+- **断点续标**：启动 `_load_labels` 从 db annotations 表（scope='clip'）把既有标签/无效读进内存，刷新页面/重启进程都不丢；**无任何 CSV 文件读取或旧文件迁移**（标签真值就是 annotations 表）。
 - **缓存**：~~3D 帧 JSON 落 `pose_cache/{key}.json`，下采样到 ≤60 帧~~（原型）。当前为整条录制的网格顶点缓存 `cache/mesh_cache_v3/{stem}/f{i:04d}.json`，按 `POSE_FPS` 采样、上限 `POSE_REC_MAX_FRAMES`。
-- **只读上游**：绝不写 `clips.csv`；标签独立存 `clip_labels.csv`，导出时才 join。
+- **只读上游切分**：绝不写 `clips.csv`/shard；标签独立存 db annotations 表，导出时才 join。
 
 ---
 
@@ -827,7 +836,7 @@ boot();
   - 返回该录制全部 clip，按时间排序编号 `s1..sN`，带 `start_s/motion_*/apex_s/review` 几何；
   - 几何缓存到 `recording_cache/{stem}.json`；**标签每次请求实时叠加**（缓存与标签解耦）。
 - **上方 = 录制的 `overview.png`**（`segment.py` 的 `plot_overview_dual` 三行图：EMG 包络+burst / pose-speed+clip / matched s 段）：直接由 `/api/overview?stem=` 发图，前端 `<img>` 显示，上面叠一根 CSS playhead 竖线 + 点击跳转。
-- **overview 缺失时从中间数据重新生成**：默认优先用 `segment.py` 调好的静态 `overview.png`；**找不到时**（如 `--no-overview`、shard 命名对不上、新数据未切）后端用**同一个 `plot_overview_dual`** 从中间数据现生成——`env`/`pose_speed` 服务端算，burst 段取自 `segments.csv`，clip 段取自 `clips.csv`，阈值取自 `recordings.csv`，`clip_to_burst` 用 `matched_emg_seg_idx`——产物与切分时的图**逐像素同款**，缓存到 `overview_cache/{stem}.{png,json}`。现生成时**在渲染瞬间直接捕获坐标轴框** → playhead `ov_x0/ov_x1` 精确，无需检测。设 `OVERVIEW_REGEN=1`（如 `OVERVIEW_REGEN=1 ./pulse.sh label`）则**一律现生成**（忽略静态图，便于在服务端改样式而不必重切全量数据）。
+- **overview 缺失时从中间数据重新生成**：默认优先用 `segment.py` 调好的静态 `overview.png`；**找不到时**（如 `--no-overview`、shard 命名对不上、新数据未切）后端用**同一个 `plot_overview_dual`** 从中间数据现生成——`env`/`pose_speed` 服务端算，burst 段取自 db `bursts` 表（`_load_bursts`），clip 段取自 db `clips` 表，阈值取自 db `recordings` 表，`clip_to_burst` 用 `matched_burst_idx`——产物与切分时的图**逐像素同款**，缓存到 `overview_cache/{stem}.{png,json}`。现生成时**在渲染瞬间直接捕获坐标轴框** → playhead `ov_x0/ov_x1` 精确，无需检测。设 `OVERVIEW_REGEN=1`（如 `OVERVIEW_REGEN=1 ./pulse.sh label`）则**一律现生成**（忽略静态图，便于在服务端改样式而不必重切全量数据）。
 - **playhead 对位靠从 PNG 检测数据轴左右边（静态图时）**：`plot_overview_dual` 用 `tight_layout`，其左右边距既随 y 轴刻度宽度变，又会在标签拥挤时**失败回退到 matplotlib 默认 0.125/0.9**——所以固定常量必然偏（实测旧常量 0.049 在起点偏 ~11px）。后端 `_overview_xrange` 直接读 overview.png 里**海军蓝 pose-speed 曲线**横跨的列范围 = 数据轴 `x0..x1`（图像分数），~1px 精度、对 tight_layout 成功/失败都自洽（60/60 真实 overview 全检出），写进 `/api/recording` 的 `ov_x0/ov_x1`，缓存于 geometry v4。前端优先用它，检测失败才回退常量 `OVX0=0.054/OVX1=0.989`。
   > 早先做过浏览器内 Plotly 曲线版，但用户要看 overview.png 本身（信息更全：burst/clip/阈值/matched 行）。已**移除 Plotly 依赖**（手部与 overview 都是图片）。后端仍算 `curves`（pose_speed/EMG）但前端当前不用，保留以备回退。若要 playhead 像素级精确，可让 `plot_overview_dual` 落一个 `overview.bbox.json` 边距 sidecar，前端优先用它。
 - **3D 手 = emg2pose 手部网格(mesh)，前端 Plotly.js `Mesh3d` 渲染**：演进过——①最初 Plotly scatter3d 点线（Y 轴薄、看成侧面、看不清动作）→ ②服务端 matplotlib `draw_skeleton` 静态 PNG（清楚但点线、不能转）→ ③**现在用 `emg2pose.visualization` 的手部网格**（早先参照过 `seg_vis_all.ipynb`，该 notebook 已删除）：清晰的着色面 + **可旋转/缩放**(WebGL) + 与进度条同步。后端 `skin_vertices_np(profile, joint_angles[i])` 算 788 顶点(emg2pose 蒙皮，缓存 hand model 后 ~6ms/帧)；`/api/handmesh?stem=&i=` 发该帧顶点(int mm, ~12KB)落盘 `cache/mesh_cache_v3/{stem}/f{i:04d}.json`，`/api/handfaces` 发三角面(左右手相同，一次)。前端 `Plotly.newPlot` 一个 `Mesh3d`，scrub/播放时把**预载到 `STATE.handVerts` 的顶点**用 `Plotly.restyle` 换 x/y/z（不是逐帧改 `<img>.src`）；`scene.uirevision` 保留用户旋转视角。左手用镜像 profile(`mirror_profile`)。需 torch+emg2pose（环境已具备）。
@@ -884,7 +893,7 @@ PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
 curl -L https://cdn.plot.ly/plotly-2.35.2.min.js -o webui/plotly.min.js
 #    b. 或把 index.html 里的 <script src="/plotly.min.js"> 改成 CDN 链接
 
-# 2) 跑服务（先确保 out_pose/ 已由 segment.py 生成 clips.csv/recordings.csv/shards）
+# 2) 跑服务（先确保 out_pose/ 已由 segment.py 生成 index.db + shards/）
 $PY label_server.py --out out_pose --host 127.0.0.1 --port 8000
 
 # 3) 浏览器打开 http://127.0.0.1:8000，开始打标
@@ -905,7 +914,7 @@ $PY label_server.py --out out_pose --host 127.0.0.1 --port 8000
 **可选：提前批量渲染手部帧（首开即秒进）**
 
 ```bash
-WORKERS=8 ./pulse.sh label-prewarm            # 渲染 out_pose/clips.csv 里全部录制（默认 WORKERS=4）
+WORKERS=8 ./pulse.sh label-prewarm            # 渲染 out_pose/index.db 里全部录制（默认 WORKERS=4）
 # 或子集：
 python prewarm_hands.py --out out_pose --workers 8 --limit 50
 python prewarm_hands.py --out out_pose --workers 8 --subjects pgy-0226   # --subject 是已弃用的单值别名
@@ -920,16 +929,16 @@ python prewarm_hands.py --out out_pose --workers 8 --subjects pgy-0226   # --sub
 ## 9. 与现有流程衔接
 
 ```
-segment.py ──► clips.csv / recordings.csv / shards/*/overview.png
+segment.py ──► OUT/index.db (recordings/bursts/clips) + shards/*/overview.png + 便利 CSV
         │   (export_clips.py 仍可产出 clips_export/{key}.npz + .png，但打标 UI 不再读)
         ▼
 label_server.py（本工具）── 浏览器交互打标（3D = emg2pose 网格）
-        │  POST /api/label → clip_labels.csv（增量、可断点）
+        │  POST /api/label → index.db annotations 表（事务、可断点）
         ▼  GET /api/export
 clips_labeled/*.csv（按文件夹拆分）+ clips_labeled.csv（合并）＝ 真值集（替代 RUNBOOK §A.5 手填那份）
 ```
 
-`clips_labeled.csv` 列 = `clips.csv` 全列 + 填好的 `gesture_label` + `label_note`，下游用法与原约定一致（空标签丢弃、同名合并；标为无效的整条录制被剔除）。
+`clips_labeled.csv` 列 = `clips` 表全列 + 从 annotations join 来的 `gesture_label` + `label_note`，下游用法与原约定一致（空标签丢弃、同名合并；标为无效的整条录制被剔除）。注意：clip 是打标 / 聚类（cluster.py apex + cluster_traj.py 轨迹两路）/ 评估（evaluate.py 按 cluster_runs JOIN annotations 算 ARI/NMI/purity）共享的**同一单元** `(source_file, clip_id)`，所以标签能直接 JOIN 评估聚类。
 
 ---
 
@@ -937,20 +946,20 @@ clips_labeled/*.csv（按文件夹拆分）+ clips_labeled.csv（合并）＝ �
 
 | 项 | 处理 |
 |----|------|
-| clip 数很多（22 万+，5300 录制） | **按录制懒加载**（已实现）：`Store` 用 pandas groupby 建每条录制的汇总（无 22 万行 Python 循环，启动 ~2s）；`/api/recordings` 只发录制级汇总（~1.2MB）；某条录制的 clip 仅在 `/api/recording?stem=` 选中时从 df 切片构建。左侧列录制（带 `n_labeled/n_clips`、复核数、搜索/过滤），选中才载入其 clip（底部 s 段落条）。指向顶层 `out_pose2` 即可标全部，不卡。 |
+| clip 数很多（22 万+，5300 录制） | **按录制懒加载**（已实现）：`Store` 从 db 把 clips 读进一个 df（`clips ⨝ recordings`），用 pandas groupby(source_path) 建每条录制的汇总（无 22 万行 Python 循环，启动 ~2s）；`/api/recordings` 只发录制级汇总；某条录制的 clip 仅在 `/api/recording?stem=` 选中时从 df 切片构建。左侧列录制（带 `n_labeled/n_clips`、复核数、搜索/过滤），选中才载入其 clip（底部 s 段落条）。指向一个含全量 `index.db` 的输出目录即可标全部，不卡。 |
 | 手部网格缓存大小 | 每帧顶点 JSON ~12 KB；帧数 = `POSE_FPS`(默认 15)×时长、上限 `POSE_REC_MAX_FRAMES`(3000)。落盘 `cache/mesh_cache_v3/{stem}/f*.json`，**跨重启复用**，第二次打开秒进（磁盘通常够，瓶颈是蒙皮渲染时间）。 |
 | 首次打开慢（每条一次性） | 首帧需 load_npz + emg2pose 蒙皮（缓存 hand model 后 ~6ms/帧）+ 后台逐帧预载；要"首开即秒进"用 `prewarm_hands.py` 提前批量渲染（见 §8）。 |
 | 源 npz 在慢 NFS | 整条录制 load 一次（emg + joint_angles）算曲线 + 蒙皮；之后命中网格/几何缓存不再读源 |
 | 需要 torch + emg2pose | 手部网格走 emg2pose `skin_vertices_np`，**必须有 torch + emg2pose**（用其 python 跑即可，环境已具备）；不再有"无 torch 走 skeleton"的回退路径 |
-| 上游重跑改了 clips.csv | 标签按 `(source_file, clip_id)` 存，clip 数变了也能 re-join；重启服务重读 |
-| 并发写 | 单进程 + Lock + 原子替换；不建议多实例同写一个 `out_pose` |
-| 空标签语义 | 导出时空 `gesture_label` 原样保留（空=丢弃）；下游按约定过滤 |
+| 上游重切改了 clip 划分 | 标签按 `(source_file, clip_id)` 存于 annotations，并带 `clip_start_sample/clip_end_sample/seg_version` 锚点；重切后 `store.remap_annotations` 按样本区间重叠把标签搬到新 clip（重叠不足标 note='待复核'，绝不静默丢） |
+| 并发写 | 单进程 + Lock + sqlite WAL 事务；不建议多实例同写一个 `index.db` |
+| 空标签语义 | 导出时空 `gesture_label` 不进真值集（空=丢弃）；annotations 表里压根不为空标签建行 |
 
 ---
 
 ## 11. 测试
 
-> 注：`tests/test_label_server.py` **尚未实现**（仓库当前 98 个测试里没有它）。下面是建议的最小冒烟（aspirational，沿用 `tests/` 风格）：
+> 注：db 数据层本身已有 `tests/test_store.py`（仓库当前 106 个测试通过）；但 `tests/test_label_server.py` **仍未实现**。下面是建议的最小冒烟（aspirational，沿用 `tests/` 风格）：
 
 ```python
 # tests/test_label_server.py  （未实现）
@@ -959,17 +968,19 @@ def test_clip_key_matches_export():
     assert _clip_key("subj__sess__ts", 3) == "subj__sess__ts__c0003"
 
 def test_store_roundtrip(tmp_path):
-    # 造一个最小 clips.csv（含 source_path 指向一个小 npz），
-    # Store(tmp).set_label(key,'fist',...) 后断言 clip_labels.csv 写出且 export() join 正确。
+    # build a minimal index.db (store.connect + insert one recording/clip),
+    # Store(tmp).set_label(key,'fist',...) 后断言 annotations 表写出该行
+    # 且 export() 的 clips ⨝ annotations join 正确。
     ...
 ```
 
 手动验证清单（按当前路由）：
 
-- [ ] `GET /api/recordings` 录制数 == clips.csv 里不同 source_path 数；每条 `n_clips`/`n_review` 与切片一致
+- [ ] `GET /api/recordings` 录制数 == index.db 里不同 source_path 数；每条 `n_clips`/`n_review` 与切片一致
 - [ ] 选中录制 → overview 显示、playhead 对位正确、3D 网格可旋转、可播放、与进度条同步
-- [ ] 回车保存 → `clip_labels.csv` 立刻出现该行；刷新页面标签仍在（断点续标）
-- [ ] 标整条录制无效 → `invalid_recordings.csv` 出现该行；导出时被剔除
+- [ ] 回车保存 → annotations 表立刻出现该 clip 行（`sqlite3 out_pose/index.db "SELECT * FROM annotations WHERE scope='clip'"`）；刷新页面标签仍在（断点续标）
+- [ ] 软标整条录制无效 → annotations 出现 `scope='recording', kind='invalid'` 行；导出时被剔除
+- [ ] 点"删除录制" → db 行 + annotations 消失、`tombstones` 出现该 source_file、shard 目录被删；重切不复活
 - [ ] 导出 → `clips_labeled.csv` + `clips_labeled/*.csv` 出现，只含已标 clip，`gesture_label` 已填
 
 ---
@@ -979,12 +990,12 @@ def test_store_roundtrip(tmp_path):
 > 大部分已落地（见 §6.5/§8/§10）。当前实际形态：
 
 1. `webui/` 已有 `index.html` + `app.js`；`plotly.min.js` 未提交，本地放一份或靠 CDN 兜底（§6 头）。
-2. 仓库根的 `label_server.py`（import matplotlib + emg2pose；§6.5 为准，§5 是过时原型）。
-3. 确保 `out_pose/` 已有 `clips.csv` / `recordings.csv` / `shards/*/overview.png`（`./pulse.sh raw ...`）。
+2. 仓库根的 `label_server.py`（import matplotlib + emg2pose + `emg_label.store`；§6.5 为准，§5 是过时原型）。
+3. 确保 `out_pose/` 已有 `index.db`（recordings/bursts/clips 表）+ `shards/*/overview.png`（`./pulse.sh segment ...`；如只剩 shard 可 `./pulse.sh db` 重建 index.db）。
 4. `./pulse.sh label`（或 `$PY label_server.py --out out_pose`）起服务，浏览器自测（§11 清单）。
 5. `pulse.sh` 的 `label`/`label-prewarm` 子命令已实现（§8）。
 6. 标完 `GET /api/export` → `clips_labeled.csv` + `clips_labeled/*.csv`，接回真值集流程。
-7. （可选/待办）`prewarm_hands.py` 已有；`tests/test_label_server.py` 仍未实现。
+7. （可选/待办）`prewarm_hands.py` 已有；`tests/test_store.py` 已有；`tests/test_label_server.py` 仍未实现。
 
 ---
 
@@ -994,5 +1005,5 @@ def test_store_roundtrip(tmp_path):
 - **多人分工**：按 labeler 切片录制/clip；冲突检测（同 clip 多人标不一致时高亮）。
 - **键盘流**：完全脱离鼠标（↑↓选段、数字键贴标签、回车跳下一个）。
 - **EMG/角度曲线**：在 3D 下方加该 clip 的 16 通道 EMG + 20 关节角小图（复用 `visualize_segment.py` 思路），辅助判断。
-- **撤销/历史**：`clip_labels.csv` 已带时间戳，可加一个 `/api/undo` 回退上一次。
+- **撤销/历史**：annotations 表已带 `labeled_at` 时间戳，可加一个 `/api/undo` 回退上一次。
 ```

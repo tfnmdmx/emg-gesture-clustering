@@ -7,3 +7,4 @@ webui/plotly.min.js
 out
 plot_emg16.py
 render_emg_hand.py
+plot_emg_spectrum.py

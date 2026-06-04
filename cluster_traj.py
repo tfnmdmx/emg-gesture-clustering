@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-"""v1 dynamic-gesture TRAJECTORY clustering for peak-segmented clips.
+"""TRAJECTORY (time-series) clustering channel -- one of the two coexisting
+clustering channels (the other is cluster.py, the static-apex channel).
 
-Reads ``<out>/clips.csv`` (the peak-segment dynamic clips segment.py now writes)
+Reads the clips from ``<out>/index.db`` (store.labeled_view, invalid excluded)
 and builds ONE fixed-length joint-angle TRAJECTORY feature per clip over its
 motion interval -- the whole movement participates, which is what makes this a
-*dynamic*-gesture clusterer (unlike the old cluster.py, which clusters a single
-apex-pose frame). Then z-score -> PCA -> MiniBatchKMeans (scales to the 200k+
-clip range). Writes:
-
-  <out>/clips_clustered.csv     clips.csv + a cluster_id column
-  <out>/cluster_summary.csv     per cluster: size + medoid clip reference
-  <out>/clusters_traj/          per-cluster medoid 5-keyframe strip + index.html
-
-so the result can be eyeballed and hand-labelled (fill gesture_label on the
-medoid / a sample, then measure cluster purity).
+*dynamic*-gesture clusterer (vs cluster.py's single apex-pose frame). Then
+z-score -> PCA -> MiniBatchKMeans (scales to the 200k+ clip range). Registers
+the run like every channel: writes ``<out>/cluster_runs/{run_id}/`` (params.json
++ clusters.csv + gallery/) and the db (cluster_runs + cluster_assignments), keyed
+on (source_file, clip_id) so evaluate.py can score it against the labels.
 
 Feature representations (--repr):
   centered (default) joint-angle trajectory minus its per-clip mean pose --
@@ -27,7 +23,7 @@ Per-joint weighting hook: --joint-weights w0,..,w19 scales each joint's columns
 by sqrt(w) so the L2 distance respects which joints matter for the gestures.
 
 sklearn is in both the emg2pose env and base conda; run with either:
-  /home/chenglin/anaconda3/envs/emg2pose/bin/python cluster_traj.py --out out_peak
+  /home/chenglin/anaconda3/envs/emg2pose/bin/python cluster_traj.py --out out
 """
 
 import argparse
@@ -44,7 +40,7 @@ from sklearn.cluster import MiniBatchKMeans  # noqa: E402
 from sklearn.decomposition import PCA  # noqa: E402
 from sklearn.metrics import silhouette_score  # noqa: E402
 
-from emg_label import features, io_utils  # noqa: E402
+from emg_label import features, io_utils, store  # noqa: E402
 from emg_label.skeleton import (axis_limits, draw_skeleton,  # noqa: E402
                                 normalize_skeleton)
 
@@ -169,7 +165,7 @@ def render_medoid_strip(row, out_path, fs) -> bool:
                                   hand=(str(row.get("hand") or "") or None))
     if skel is None:
         return False
-    cs, ce = int(row["clip_start_sample"]), int(row["clip_end_sample"])
+    cs, ce = int(row["start_sample"]), int(row["end_sample"])
     ms, me = int(row["motion_start_sample"]), int(row["motion_end_sample"])
     ap = int(row["apex_sample"])
     md = max(1, me - ms)
@@ -196,9 +192,8 @@ def render_medoid_strip(row, out_path, fs) -> bool:
     return True
 
 
-def cluster_gallery(clips_df, rows, labels, Xp, out_dir, fs):
-    """One medoid strip per cluster + an index.html, sorted by size."""
-    gdir = os.path.join(out_dir, "clusters_traj")
+def cluster_gallery(clips_df, rows, labels, Xp, gdir, fs):
+    """One medoid strip per cluster + an index.html, sorted by size, into gdir."""
     os.makedirs(gdir, exist_ok=True)
     entries = []
     for cid in sorted(set(int(x) for x in labels)):
@@ -239,7 +234,7 @@ def cluster_gallery(clips_df, rows, labels, Xp, out_dir, fs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", default="out_peak", help="dir with clips.csv")
+    ap.add_argument("--out", default="out", help="output dir (reads index.db)")
     ap.add_argument("--fs", type=int, default=2000)
     ap.add_argument("--L", type=int, default=32, help="resampled trajectory length")
     ap.add_argument("--repr", default="centered",
@@ -256,11 +251,15 @@ def main():
     ap.add_argument("--no-gallery", action="store_true")
     args = ap.parse_args()
 
-    clips_path = os.path.join(args.out, "clips.csv")
-    clips_df = pd.read_csv(clips_path, dtype={"source_file": str})
+    conn = store.connect(args.out)
+    clips_df = store.labeled_view(conn)        # excludes invalid recordings/clips
+    srcp = {r["source_file"]: r["source_path"]
+            for r in conn.execute("SELECT source_file, source_path FROM recordings")}
+    conn.close()
     if clips_df.empty:
-        print(f"no clips in {clips_path}")
+        print(f"no clips in {store.db_path(args.out)}; run segment first")
         return
+    clips_df["source_path"] = clips_df["source_file"].map(srcp)
     print(f"{len(clips_df)} clips from {clips_df['source_file'].nunique()} recordings")
 
     X, rows = build_features(clips_df, args.out, args.L, args.repr)
@@ -287,35 +286,23 @@ def main():
     print(f"k={best_k}  silhouette={sil:.3f}  "
           f"(repr={args.repr}, L={args.L}, pca={n_comp})")
 
-    # clips_clustered.csv = clips.csv + cluster_id
-    clips_df["cluster_id"] = -1
-    clips_df.loc[rows, "cluster_id"] = labels.astype(int)
-    out_csv = os.path.join(args.out, "clips_clustered.csv")
-    clips_df.to_csv(out_csv, index=False)
-
-    # cluster_summary.csv
-    summ = []
-    for cid in sorted(set(int(x) for x in labels)):
-        mask = labels == cid
-        members = np.where(mask)[0]
-        centroid = Xp[members].mean(axis=0)
-        medoid = members[int(np.argmin(((Xp[members] - centroid) ** 2).sum(1)))]
-        mr = clips_df.loc[rows[medoid]]
-        summ.append({"cluster_id": cid, "size": int(mask.sum()),
-                     "medoid_source_file": mr["source_file"],
-                     "medoid_clip_id": int(mr["clip_id"]),
-                     "medoid_motion_s": round(float(mr["motion_duration_s"]), 3),
-                     "label": ""})
-    pd.DataFrame(summ).sort_values("size", ascending=False).to_csv(
-        os.path.join(args.out, "cluster_summary.csv"), index=False)
-
+    # Register the run: cluster_runs/{run_id}/ (params.json + clusters.csv) + db.
+    assign = clips_df.iloc[rows][["source_file", "clip_id"]].copy()
+    assign["cluster_id"] = labels.astype(int)
+    params = {"channel": "trajectory", "unit": "clip", "repr": args.repr,
+              "L": args.L, "pca": int(n_comp), "k": best_k,
+              "silhouette": round(float(sil), 4) if np.isfinite(sil) else None,
+              "n_clusters": int(len(set(int(x) for x in labels)))}
+    run_id, created_at = store.new_run_id("trajectory", params)
+    rundir = store.save_run(args.out, run_id, "trajectory", params, assign, created_at)
     print(f"cluster sizes: "
           f"{sorted((int((labels==c).sum()) for c in set(labels)), reverse=True)}")
-    print(f"wrote {out_csv} and cluster_summary.csv")
+    print(f"trajectory run {run_id}: {len(assign)} clips -> {rundir}")
 
     if not args.no_gallery:
-        cluster_gallery(clips_df, rows, labels, Xp, args.out, args.fs)
-        print(f"wrote {os.path.join(args.out, 'clusters_traj', 'index.html')}")
+        cluster_gallery(clips_df, rows, labels, Xp,
+                        os.path.join(rundir, "gallery"), args.fs)
+        print(f"wrote {os.path.join(rundir, 'gallery', 'index.html')}")
 
 
 if __name__ == "__main__":

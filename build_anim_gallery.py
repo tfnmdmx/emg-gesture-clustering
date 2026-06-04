@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-"""Batch-animate the first N segments of every label + build an index page.
+"""Batch-animate the first N clips of every gesture + build an index page.
 
-For each label directory under ``<out_root>/segments/<label>/`` this picks the
-first N segment npz files, renders each as an animated 3D-hand Plotly HTML via
+For each gesture directory under ``<out_root>/gestures/<label>/`` (the export.py
+output) this picks the first N clip npz files, renders each as an animated
+3D-hand Plotly HTML via
 animate_segment.animate, and writes them to
 ``<out_root>/<subdir>/<label>/<stem>.html``. Finally it writes an
 ``index.html`` under ``<out_root>/<subdir>/`` linking every animation, grouped
@@ -50,10 +51,10 @@ def _label_sort_key(label):
 
 
 def build(out_root, subdir, n, max_frames, fps, clean):
-    seg_root = os.path.join(out_root, "segments")
+    seg_root = os.path.join(out_root, "gestures")
     anim_root = os.path.join(out_root, subdir)
     if not os.path.isdir(seg_root):
-        raise SystemExit(f"not found: {seg_root}")
+        raise SystemExit(f"not found: {seg_root} (run ./pulse.sh export first)")
 
     try:
         from animate_segment import animate

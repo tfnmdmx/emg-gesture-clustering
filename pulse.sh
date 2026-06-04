@@ -16,26 +16,29 @@
 #   ./pulse.sh raw-segment <meta.csv | raw-dir> stage 1 only (raw input)
 #   ./pulse.sh raw-qc                            write recordings_keep.csv (informational subset)
 #   ./pulse.sh raw-export                        stage 3 only: per-clip npz/png + index.html
-#   ./pulse.sh raw-index                         rebuild top-level segments/clips/recordings.csv from existing shards
+#   ./pulse.sh raw-index                         rebuild index.db + convenience bursts/clips/recordings.csv from existing shards
 #   ./pulse.sh raw-status                        show raw-flow progress
-#   ./pulse.sh label                             interactive web UI to hand-label clips (writes labels.csv)
+#   ./pulse.sh label                             interactive web UI to hand-label clips (writes index.db annotations)
 #   ./pulse.sh label-prewarm                     pre-render hand-frame cache (WORKERS=N) so first open is instant
 #
-# B. PROCESSED data -> unsupervised cluster -> labeled npz (path B in RUNBOOK):
-#   ./pulse.sh segment [meta.csv|dir|processed]   stage 1: segment (no pool needed).
+# B. PROCESSED data -> index.db -> cluster (apex/trajectory) -> label-driven eval:
+#   ./pulse.sh segment [meta.csv|dir|processed]   stage 1: segment -> OUT/index.db
+#                                          (+ convenience recordings/bursts/clips.csv).
 #                                          Source = a meta CSV, a source dir, or
 #                                          'processed' ($DATA_ROOT); pick subjects
 #                                          with SUBJECTS=id1,id2. Omit -> work_pool.
-#   ./pulse.sh cluster [K]                 stage 2: cluster (K default 18; "auto" = silhouette)
-#   ./pulse.sh eval                        subject-invariance metrics (pooled runs)
-#   ./pulse.sh qc                          quality check: feature maps (+ gallery if exported)
-#   ./pulse.sh export                      stage 3: export labeled npz (+ build gallery)
-#   ./pulse.sh gallery                     build the per-label animation gallery (after export)
-#   ./pulse.sh run     [meta.csv|dir]      segment + cluster + eval + qc
+#   ./pulse.sh cluster [K]                 apex channel -> cluster_runs/{run_id}/ (K default 18; "auto")
+#   ./pulse.sh cluster-traj [K]            trajectory (time-series) channel -> cluster_runs/{run_id}/ (REPR=centered)
+#   ./pulse.sh eval                        label-driven metrics for a run (RUN= or latest) -> metrics.json
+#   ./pulse.sh qc                          feature maps for a run (+ gallery if exported)
+#   ./pulse.sh export                      export hand-labelled clips by gesture -> OUT/gestures/<label>/
+#   ./pulse.sh gallery                     per-gesture animation gallery (after export)
+#   ./pulse.sh db                          rebuild OUT/index.db from shards
+#   ./pulse.sh run     [meta.csv|dir]      segment + cluster + eval
 #   ./pulse.sh pool    <batch|path> [...]  (optional) gather processed_data batches into a
 #                                          work_pool -- only to select/merge specific batches;
-#                                          cluster/eval/export now find npz via source_path
-#   ./pulse.sh prep    <batch|path> [...]  pool + run (everything pre-labeling)
+#                                          downstream stages find npz via source_path
+#   ./pulse.sh prep    <batch|path> [...]  pool + run
 #
 # Shared:
 #   ./pulse.sh status                      show flow-B progress
@@ -157,84 +160,86 @@ cmd_segment() {
 }
 
 cmd_cluster() {
-  [ -f "$OUT/segments.csv" ] || die "no $OUT/segments.csv. run: ./pulse.sh segment"
+  [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment"
   local k="${1:-$K}"
-  if [ "$k" = "auto" ]; then
-    say "stage 2: cluster (auto k via silhouette, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM)"
-    "$PY" cluster.py --out "$OUT" --group-by "$GROUP_BY" \
-      --subject-norm "$SUBJECT_NORM"
-  else
-    say "stage 2: cluster (k=$k, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM)"
-    "$PY" cluster.py --out "$OUT" --k "$k" --group-by "$GROUP_BY" \
-      --subject-norm "$SUBJECT_NORM"
-  fi
+  local kflag=""; [ "$k" != "auto" ] && kflag="--k $k"
+  say "stage 2: apex clustering (k=$k, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM) -> cluster_runs/"
+  # shellcheck disable=SC2086
+  "$PY" cluster.py --out "$OUT" --group-by "$GROUP_BY" \
+    --subject-norm "$SUBJECT_NORM" $kflag
+}
+
+cmd_cluster_traj() {
+  [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment"
+  local k="${1:-$K}"
+  local kflag=""; [ "$k" != "auto" ] && kflag="--k $k"
+  say "stage 2: trajectory (time-series) clustering (k=$k, repr=${REPR:-centered}) -> cluster_runs/"
+  # shellcheck disable=SC2086
+  "$PY" cluster_traj.py --out "$OUT" --repr "${REPR:-centered}" $kflag
 }
 
 cmd_eval() {
-  [ -f "$OUT/segments_clustered.csv" ] || die "no clusters yet. run: ./pulse.sh cluster"
-  say "evaluation: subject-invariance metrics ($OUT/eval_metrics.csv, subject-norm=$SUBJECT_NORM)"
-  "$PY" evaluate.py --out "$OUT" --subject-norm "$SUBJECT_NORM"
+  [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh cluster first"
+  say "evaluation: label-driven + subject-invariance (--run ${RUN:-latest}, writes cluster_runs/<run>/metrics.json)"
+  local runflag=""; [ -n "${RUN:-}" ] && runflag="--run $RUN"
+  # shellcheck disable=SC2086
+  "$PY" evaluate.py --out "$OUT" --subject-norm "$SUBJECT_NORM" $runflag
+}
+
+cmd_db() {
+  # Rebuild OUT/index.db (+ convenience CSVs) from the shards on disk.
+  say "rebuild index.db from $OUT/shards/"
+  "$PY" segment.py --out "$OUT" --index-only
 }
 
 cmd_qc() {
-  [ -f "$OUT/segments_clustered.csv" ] || die "no clusters yet. run: ./pulse.sh cluster"
-  say "quality check: feature maps ($OUT/feature_maps/)"
-  "$PY" plot_cluster_features.py --out "$OUT"
-  # The animation gallery reads exported per-label dirs, which only exist after
-  # export. Build it now only if they're there; otherwise export builds it.
-  if [ -d "$OUT/segments" ]; then
+  [ -f "$OUT/index.db" ] || die "no clusters yet. run: ./pulse.sh cluster"
+  say "quality check: feature maps for run ${RUN:-latest} -> cluster_runs/<run>/feature_maps.png"
+  local runflag=""; [ -n "${RUN:-}" ] && runflag="--run $RUN"
+  # shellcheck disable=SC2086
+  "$PY" plot_cluster_features.py --out "$OUT" $runflag
+  # The animation gallery reads exported per-gesture dirs (export output).
+  if [ -d "$OUT/gestures" ]; then
     cmd_gallery
   else
-    warn "animation gallery skipped: needs exported segments (out/segments/)."
-    warn "It will be built automatically by './pulse.sh export'."
+    warn "animation gallery skipped: needs labelled clips exported to $OUT/gestures/"
+    warn "(label clips via './pulse.sh label', then './pulse.sh export')."
   fi
 }
 
 cmd_gallery() {
-  [ -d "$OUT/segments" ] || die "no $OUT/segments/. run ./pulse.sh export first"
+  [ -d "$OUT/gestures" ] || die "no $OUT/gestures/. run ./pulse.sh export first"
   say "animation gallery ($OUT/hand_anim/index.html)"
   "$PY" build_anim_gallery.py --out-root "$OUT" --n "$N_GALLERY" --clean
 }
 
 cmd_export() {
-  [ -f "$OUT/segments_clustered.csv" ] || die "no clusters yet. run: ./pulse.sh cluster"
-  if [ ! -f "$OUT/labels.csv" ]; then
-    warn "no $OUT/labels.csv -- generating placeholder labels (label = <group>-<cluster_id>)."
-    warn "That exports every cluster as its own gesture. Edit labels.csv for real"
-    warn "names / merging (same name = merge, blank = drop), then re-run export."
-    # The template's label column is empty; fill it so export is non-empty.
-    "$PY" - "$OUT" <<'PYEOF'
-import os, sys, pandas as pd
-out = sys.argv[1]
-df = pd.read_csv(os.path.join(out, "labels_template.csv"))
-df["label"] = df["group"].astype(str) + "-" + df["cluster_id"].astype(str)
-df.to_csv(os.path.join(out, "labels.csv"), index=False)
-print(f"wrote {out}/labels.csv with {len(df)} placeholder labels")
-PYEOF
-  fi
-  say "stage 3: export ($OUT/segments/<label>/)"
+  [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment"
+  # Label-driven: exports the hand-labelled clips (annotations) grouped by
+  # gesture. No cluster-naming step -- label clips in the web UI first.
+  say "stage 3: export labelled clips by gesture ($OUT/gestures/<label>/)"
   "$PY" export.py --out "$OUT"
-  cmd_gallery   # per-label animations now that segments/ exists
 }
 
 cmd_run() {
   # Optional <meta|dir>; without it, cmd_segment falls back to the work_pool.
+  # segment -> apex cluster -> evaluate (labels needed for a meaningful eval;
+  # with none it still writes a run + N/A label metrics). Label clips via
+  # './pulse.sh label', then re-run eval / export.
   cmd_segment "${1:-}"
   cmd_cluster "$K"
   cmd_eval
-  cmd_qc
 }
 
 cmd_prep() {
   cmd_pool "$@"
   cmd_run
   echo
-  say "PRE-LABELING DONE. Next:"
-  echo "  1. Look at  $OUT/clusters/*_hands.png  and  $OUT/feature_maps/*_features.png"
-  echo "  2. cp $OUT/labels_template.csv $OUT/labels.csv  then fill the 'label' column"
-  echo "     (same name on multiple rows = merge; blank = drop)"
-  echo "  3. ./pulse.sh export   (also builds the per-label animation gallery)"
-  echo "     -- or skip labeling and just run export for placeholder names."
+  say "DONE (segment + apex cluster + eval). Next:"
+  echo "  1. ./pulse.sh label              hand-label clips in the web UI (writes annotations to index.db)"
+  echo "  2. ./pulse.sh cluster-traj       (optional) also run the time-series channel"
+  echo "  3. ./pulse.sh eval               re-evaluate with labels (ARI/NMI/purity per run)"
+  echo "  4. ./pulse.sh export             export labelled clips -> $OUT/gestures/<gesture>/"
 }
 
 cmd_status() {
@@ -242,10 +247,11 @@ cmd_status() {
   echo "POOL    = $POOL    ($(ls "$POOL"/*.npz 2>/dev/null | wc -l) files)"
   echo "OUT     = $OUT"
   echo "K       = $K    GROUP_BY = $GROUP_BY    SUBJECT_NORM = $SUBJECT_NORM"
-  for f in segments.csv segments_clustered.csv eval_metrics.csv labels_template.csv labels.csv; do
+  for f in index.db clips.csv bursts.csv recordings.csv; do
     if [ -f "$OUT/$f" ]; then echo "  [x] $OUT/$f"; else echo "  [ ] $OUT/$f"; fi
   done
-  [ -d "$OUT/segments" ] && echo "  [x] $OUT/segments/ ($(ls "$OUT/segments" 2>/dev/null | wc -l) labels, $(find "$OUT/segments" -name '*.npz' 2>/dev/null | wc -l) npz)"
+  [ -d "$OUT/cluster_runs" ] && echo "  [x] $OUT/cluster_runs/ ($(ls "$OUT/cluster_runs" 2>/dev/null | wc -l) run(s))"
+  [ -d "$OUT/gestures" ] && echo "  [x] $OUT/gestures/ ($(ls "$OUT/gestures" 2>/dev/null | wc -l) gestures, $(find "$OUT/gestures" -name '*.npz' 2>/dev/null | wc -l) npz)"
 }
 
 # ---------- flow A (raw data -> ground-truth clip gallery) -----------------
@@ -325,7 +331,7 @@ cmd_raw_export() {
   "$PY" export_clips.py --out "$RAW_OUT" $extra
 }
 
-# Rebuild the three top-level index CSVs (segments/clips/recordings.csv) by
+# Rebuild OUT/index.db + the convenience bursts/clips/recordings.csv by
 # concatenating every completed shard under $RAW_OUT/shards/. Use this when a
 # `raw` run was interrupted before segment.py reached its end-of-run index step
 # (each shard is committed independently, so the per-recording data survives --
@@ -353,7 +359,7 @@ cmd_raw_status() {
   echo "RAW_OUT   = $RAW_OUT"
   echo "WORKERS   = $WORKERS    SUBJECTS=${SUBJECTS:-all}    ONLY_HAND=$ONLY_HAND"
   echo "QC keep   = lag_flag in ($RAW_LAG_FLAGS), pose_nan_frac<$RAW_NAN_MAX"
-  for f in segments.csv clips.csv recordings.csv recordings_keep.csv; do
+  for f in bursts.csv clips.csv recordings.csv recordings_keep.csv; do
     if [ -f "$RAW_OUT/$f" ]; then
       local n; n=$(($(wc -l < "$RAW_OUT/$f") - 1))
       echo "  [x] $RAW_OUT/$f  ($n rows)"
@@ -409,8 +415,10 @@ case "$sub" in
   # flow B: processed -> cluster -> labeled npz
   pool)    cmd_pool "$@";;
   segment) cmd_segment "$@";;
-  cluster) cmd_cluster "$@";;
+  cluster)      cmd_cluster "$@";;
+  cluster-traj) cmd_cluster_traj "$@";;
   eval)    cmd_eval "$@";;
+  db)      cmd_db "$@";;
   run)     cmd_run "$@";;
   qc)      cmd_qc "$@";;
   gallery) cmd_gallery "$@";;

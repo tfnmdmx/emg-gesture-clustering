@@ -67,6 +67,7 @@ async function boot() {
     on('save', 'onclick', () => saveLabel(true));
     on('invalid', 'onclick', () => markInvalid());
     on('recinvalid', 'onclick', () => toggleRecordingInvalid());
+    on('droprec', 'onclick', () => dropRecording());
     on('export', 'onclick', doExport);
     on('play', 'onclick', togglePlay);
     on('scrub', 'oninput', e => { stop(); setTime(e.target.value / 1000 * recDur()); });
@@ -498,6 +499,21 @@ async function markRecordingInvalid(toInvalid) {
   if (res.rec_invalid) nextRecording();   // marked bad -> move on
 }
 function toggleRecordingInvalid() { markRecordingInvalid(!recInvalidState()); }
+
+async function dropRecording() {
+  if (!STATE.rec) return;
+  const stem = STATE.rec.stem;
+  if (!confirm(`永久删除录制 ${stem}？\n会删除其 shard + 索引行并 tombstone（重切分不会复活）。不可撤销。`))
+    return;
+  const res = await (await fetch('/api/drop_recording', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stem })
+  })).json();
+  if (!res.ok) { document.getElementById('msg').textContent = '删除失败: ' + (res.error || ''); return; }
+  STATE.recordings = STATE.recordings.filter(r => r.stem !== stem);
+  document.getElementById('msg').textContent = `已永久删除 ${stem} `+ new Date().toLocaleTimeString();
+  renderRecList(); renderProgress(); nextRecording();
+}
 
 function nextRecording() {
   for (let k = STATE.recIdx + 1; k < STATE.recView.length; k++)

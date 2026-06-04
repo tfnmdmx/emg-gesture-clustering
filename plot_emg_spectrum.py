@@ -51,7 +51,7 @@ def plot_spectrum(raw_path: str, proc_path: str, out_path: str,
         order = np.argsort(raw[s:e].std(axis=0))[::-1]
         channels = sorted(int(c) for c in order[:3])
 
-    nper = min(4096, e - s)
+    nper = min(2048, e - s)
     nch = len(channels)
     fig, axs = plt.subplots(nch, 1, figsize=(10, 2.3 * nch + 1.0),
                             sharex=True, squeeze=False)
@@ -59,15 +59,19 @@ def plot_spectrum(raw_path: str, proc_path: str, out_path: str,
         ax = axs[i, 0]
         f, Pr = welch(raw[s:e, ch], fs=fs, nperseg=nper)
         _, Pp = welch(proc[s:e, ch], fs=fs, nperseg=nper)
-        ax.semilogy(f, Pr, color=RAW_C, lw=1.1, label="raw (before)")
-        ax.semilogy(f, Pp, color=PROC_C, lw=1.1, label="processed (after)")
+        ax.loglog(f[1:], Pr[1:], color=RAW_C, lw=1.2, label="raw (before)")
+        ax.loglog(f[1:], Pp[1:], color=PROC_C, lw=1.2, label="processed (after)")
+        # Clip to ~5 decades below the raw peak so the (real) attenuation is
+        # visible instead of being crushed by the Welch nulls near 1e-15.
+        peak = float(np.nanmax(Pr))
+        ax.set_ylim(peak * 1e-5, peak * 5)
         ax.set_ylabel(f"ch{ch}\nPSD")
         ax.grid(True, which="both", alpha=0.25)
         if i == 0:
-            ax.legend(loc="upper right", fontsize=9)
+            ax.legend(loc="lower center", fontsize=9)
 
     axs[-1, 0].set_xlabel("frequency (Hz)")
-    axs[-1, 0].set_xlim(0, fs / 2)
+    axs[-1, 0].set_xlim(10, fs / 2)   # 10^1 .. 10^3 Hz
     fig.suptitle(f"{os.path.basename(raw_path)}  |  EMG spectrum: raw vs processed "
                  f"(filtering)  |  segment {s/fs:.1f}–{e/fs:.1f}s", fontsize=11)
     fig.tight_layout()

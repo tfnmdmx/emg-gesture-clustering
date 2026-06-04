@@ -55,6 +55,65 @@ def apex_pose_feature(joint_angles, start, window_end, rest, fs,
     return np.nanmedian(seg[a0:a1], axis=0)
 
 
+def clip_apex_feature(joint_angles, apex_sample, fs, win_ms=50.0):
+    """Pose at a clip's pre-computed apex frame: nan-aware median over the
+    +/- ``win_ms`` window around ``apex_sample`` -> (D,).
+
+    The action segmenter already locates each clip's apex within its hold
+    (clips.apex_sample), so clustering reuses that frame directly rather than
+    re-deriving it from a burst window. This is the clip-keyed analogue of
+    ``apex_pose_feature`` and the feature both the apex clustering channel and
+    the stage-1 cache use.
+    """
+    X = np.asarray(joint_angles, dtype=float)
+    half = max(1, int(round(win_ms / 1000.0 * fs)))
+    a = int(apex_sample)
+    a0 = max(0, a - half)
+    a1 = min(len(X), a + half + 1)
+    if a1 <= a0:
+        return np.full(X.shape[1], np.nan)
+    return np.nanmedian(X[a0:a1], axis=0)
+
+
+def clip_features_for(source_file, clip_df, fs, features_dir=None,
+                      source_path=None, input_dir=None):
+    """``{clip_id: clip_apex_feature}`` for one recording's clips.
+
+    Prefers the per-recording cache segment.py writes to
+    ``<features_dir>/{stem}.npz`` (clip_id -> feature); else loads the npz from
+    ``source_path`` and recomputes from each clip's apex_sample. Returns
+    ``(feat_by_clip, cache_hit)``. The clip-keyed counterpart of
+    ``feature_by_seg`` (the clustering unit is the clip now).
+    """
+    feat_by_clip = _read_clip_feature_cache(features_dir, source_file, clip_df)
+    if feat_by_clip is not None:
+        return feat_by_clip, True
+    npz = source_path or (
+        io_utils.resolve_npz_path(source_file, None, input_dir))
+    _, ja = io_utils.load_npz(npz)
+    feat_by_clip = {int(r["clip_id"]): clip_apex_feature(ja, int(r["apex_sample"]), fs)
+                    for _, r in clip_df.iterrows()}
+    return feat_by_clip, False
+
+
+def _read_clip_feature_cache(features_dir, source_file, clip_df):
+    if not features_dir:
+        return None
+    stem = str(source_file)
+    if stem.endswith(".npz"):
+        stem = stem[:-4]
+    path = os.path.join(features_dir, stem + ".npz")
+    if not os.path.isfile(path):
+        return None
+    d = np.load(path)
+    if "clip_id" not in d.files:
+        return None      # an older burst-keyed cache; recompute
+    feat = {int(k): v for k, v in zip(d["clip_id"], d["feature"])}
+    if any(int(r["clip_id"]) not in feat for _, r in clip_df.iterrows()):
+        return None
+    return feat
+
+
 def per_subject_center(X, subjects):
     """Subtract each subject's mean feature vector (feature-space de-mean).
 
