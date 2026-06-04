@@ -219,12 +219,13 @@ def _valley_split(spd, ms, me, fs, move_enter):
 # ---------- threshold resolution --------------------------------------------
 
 def resolve_move_thresholds(spd, env, exit_e, cfg):
-    """(move_enter, move_exit) in deg/s.
+    """(move_enter, move_exit) in rad/s (joint angles are radians post-load).
 
-    Pose-speed scale varies ~4x across recordings (jm-0503 detect~161 vs hzy~597)
-    and EMG-rest is NOT a clean proxy for pose-hold here (during the 50% low-EMG
-    time pose-speed p95 is still ~1000 deg/s -- gentle gestures fire at rest-level
-    EMG), so neither a fixed absolute deg/s nor an EMG-rest-gated percentile works.
+    Pose-speed scale varies ~4x across recordings (jm-0503 detect~2.8 vs hzy~10.4
+    rad/s) and EMG-rest is NOT a clean proxy for pose-hold here (during the 50%
+    low-EMG time pose-speed p95 is still ~17 rad/s -- gentle gestures fire at
+    rest-level EMG), so neither a fixed absolute rad/s nor an EMG-rest-gated
+    percentile works.
     The motion onset must be the per-recording static/motion split, so we reuse the
     project's adaptive ``robust_threshold`` (bimodal-ish valley): move_enter at the
     valley, move_exit a fraction below it for hysteresis. Near-static recordings

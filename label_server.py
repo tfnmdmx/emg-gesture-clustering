@@ -46,8 +46,26 @@ from emg_label.skeleton import (  # noqa: E402
 )
 
 FS = 2000
-OVERVIEW_REGEN_V = 5          # bump to invalidate regenerated overview_cache
-                              # (v3: rad/s; v4: y-axis cap; v5: live rad pose_thr)
+OVERVIEW_REGEN_V = 9          # bump to invalidate regenerated overview_cache
+                              # (v3: rad/s; v4: y-axis cap; v5: live rad pose_thr;
+                              #  v6: NaN-interp curve + persisted move_exit line;
+                              #  v7: y-cap 4x->2x move_enter so holds are legible;
+                              #  v8: move_enter/exit recomputed live (units-robust
+                              #  vs stale deg pose_thresh in old recordings.csv);
+                              #  v9: xlim=[0,n/fs] -> no left/right margin, playhead
+                              #  flush)
+
+
+def _seg_pose_speed(ja):
+    """pose_speed exactly as segment.py computes it for the static overview:
+    NaN-interpolate short Manus gaps FIRST (otherwise occlusion drops smear into
+    ~250ms speed artifacts that the baked image doesn't have), then the shared
+    rad/s pose_speed (joint angles are radians post-load). Keeps the regen +
+    frontend curves identical to the static overview so threshold lines align."""
+    from emg_label.pose_segmentation import pose_speed
+    from emg_label.action_segmentation import interpolate_short_nan_gaps
+    return np.asarray(pose_speed(interpolate_short_nan_gaps(ja, FS), FS),
+                      dtype=float)
 # Whole-recording hand playback is sampled at POSE_FPS frames/sec (env-tunable),
 # bounded by POSE_REC_MAX_FRAMES so very long recordings stay cheap. Higher fps
 # = smoother motion but proportionally more emg2pose skinning + disk cache per
@@ -164,12 +182,14 @@ class Store:
 
         # recording durations / pose threshold for timeline context
         rec_dur, rec_pose_thr, rec_enter, rec_exit = {}, {}, {}, {}
+        rec_pose_exit = {}
         rec_path = os.path.join(out_dir, "recordings.csv")
         if os.path.isfile(rec_path):
             r = pd.read_csv(rec_path)
             sfk = r["source_file"].astype(str)
             rec_dur = dict(zip(sfk, r["duration_s"]))
             for col, dst in [("pose_thresh", rec_pose_thr),
+                             ("pose_exit_thresh", rec_pose_exit),
                              ("enter_thresh", rec_enter),
                              ("exit_thresh", rec_exit)]:
                 if col in r.columns:
@@ -200,6 +220,7 @@ class Store:
                 "subject": str(a["subject"]), "group": str(a["group"]),
                 "rec_duration_s": float(rec_dur.get(sf, 0.0)),
                 "pose_thresh": float(rec_pose_thr.get(sf, float("nan"))),
+                "pose_exit_thresh": float(rec_pose_exit.get(sf, float("nan"))),
                 "enter_thresh": float(rec_enter.get(sf, float("nan"))),
                 "exit_thresh": float(rec_exit.get(sf, float("nan"))),
                 "row_idx": gidx[source_path],
@@ -483,13 +504,23 @@ class Store:
                  for r in sub.itertuples()]
         c2b = [seg2pos.get(int(r.matched_emg_seg_idx), -1) for r in sub.itertuples()]
         thr = lambda v: (None if v is None or not np.isfinite(v) else float(v))
-        # Recompute the pose threshold LIVE (radians). recordings.csv's
-        # pose_thresh was written by segment.py and may be in stale units
-        # (degrees, pre deg->rad fix); mixing it with the rad/s curve misplaces
-        # the threshold line AND blows up the pose-speed panel's y-axis. EMG
-        # enter/exit thresholds are unaffected (EMG units never changed).
+        # Recompute move_enter/move_exit LIVE from THIS curve, exactly the way
+        # action_segmentation.resolve_move_thresholds does in auto mode:
+        # move_enter = robust_threshold(spd); move_exit = move_exit_frac (0.5) *
+        # move_enter. This MUST be live, not read from recordings.csv: load_npz
+        # normalizes joint angles to radians, so ps is rad/s, but recordings.csv's
+        # pose_thresh can be in stale deg units (written by an older run pre the
+        # deg->rad fix) -- ~57x larger, which would push the y-cap (pose_thr*2)
+        # off the top and squash the curve to ~0. A live threshold is always in
+        # the curve's own units, so curve + lines + y-cap can't drift apart.
+        # (EMG enter/exit are unaffected -- EMG units never changed -- so those
+        # still come from recordings.csv.)
         from emg_label.pose_segmentation import robust_threshold
-        pose_thr_live = float(robust_threshold(np.asarray(ps, dtype=float)))
+        MOVE_EXIT_FRAC = 0.5           # == config.Config.move_exit_frac default
+        move_enter = float(robust_threshold(np.asarray(ps, dtype=float)))
+        if not np.isfinite(move_enter) or move_enter <= 0:
+            move_enter = None          # near-static: let plotting percentile-cap
+        move_exit = MOVE_EXIT_FRAC * move_enter if move_enter else None
         import matplotlib.figure as _mf
         cap = {}
         with RENDER_LOCK:                          # plot_overview_dual uses pyplot
@@ -505,7 +536,8 @@ class Store:
                 plotting.plot_overview_dual(
                     env, ps, FS, tmp, burst_segments=bursts, clips=clips,
                     clip_to_burst=c2b, enter_thr=thr(st["enter_thresh"]),
-                    exit_thr=thr(st["exit_thresh"]), pose_thr=pose_thr_live,
+                    exit_thr=thr(st["exit_thresh"]),
+                    pose_thr=move_enter, pose_exit_thr=move_exit,
                     apex_samples=apex)
             finally:
                 _mf.Figure.savefig = orig
@@ -537,13 +569,12 @@ class Store:
         except Exception:
             pass
         # stale or missing -> recompute curves and regen (version-stamped)
-        from emg_label.pose_segmentation import pose_speed
         from emg_label.segmentation import emg_envelope
         st = self.by_stem[stem]
         side_hand = (st["hand"]
                      or io_utils.parse_file_info(st["source_path"]).hand or "left")
         emg, ja = io_utils.load_npz(st["source_path"], hand=side_hand)
-        ps = np.asarray(pose_speed(ja, FS), dtype=float)
+        ps = _seg_pose_speed(ja)
         env = np.asarray(emg_envelope(emg, FS), dtype=float)
         p, _, _ = self._regen_overview(stem, env, ps)
         return p
@@ -568,9 +599,8 @@ class Store:
         fidx = _frame_indices(n)
 
         # Overview curves: pose-speed + EMG envelope, downsampled for plotting.
-        from emg_label.pose_segmentation import pose_speed
         from emg_label.segmentation import emg_envelope
-        ps = np.asarray(pose_speed(ja, FS), dtype=float)
+        ps = _seg_pose_speed(ja)
         env = np.asarray(emg_envelope(emg, FS), dtype=float)
         cstep = max(1, n // CURVE_MAX_POINTS)
         cidx = list(range(0, n, cstep))

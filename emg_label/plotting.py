@@ -77,7 +77,7 @@ def plot_overview_dual(env, pose_speed, fs, out_path,
 
     ps_arr = np.asarray(pose_speed)
     axes[1].plot(t, ps_arr, lw=0.8, color="navy")
-    axes[1].set_ylabel("pose speed (deg/s)\n(‖dθ/dt‖ over 20 joints; peaks clipped)")
+    axes[1].set_ylabel("pose speed (rad/s)\n(‖dθ/dt‖ over 20 joints; peaks clipped)")
     axes[1].set_xlabel("time (s)")
     # move_enter (onset) and move_exit (settle) thresholds -- the band between
     # them is the hysteresis dead-zone; holds sit below move_exit.
@@ -87,15 +87,16 @@ def plot_overview_dual(env, pose_speed, fs, out_path,
     if pose_exit_thr is not None:
         axes[1].axhline(pose_exit_thr, color="seagreen", ls=":", lw=1.0,
                         label="move_exit")
-    # Transition peaks reach ~thousands of deg/s and would squash the threshold
-    # band + the low-speed holds into an unreadable sliver. Cap the y-axis at a
-    # few x the onset threshold so the segmentation-relevant band (holds, the two
-    # thresholds, the rising flank) stays legible; tall peaks clip off-screen --
+    # Transition peaks reach tens of rad/s and would squash the threshold
+    # band + the low-speed holds into an unreadable sliver. Cap the y-axis just
+    # above the onset threshold (2x move_enter -> move_enter at mid-height,
+    # move_exit + the holds get the lower half at full resolution) so the
+    # segmentation-relevant band stays legible; tall peaks clip off-screen --
     # we only need to see WHERE speed crosses the thresholds, not how tall it got.
     finite = ps_arr[np.isfinite(ps_arr)]
     cap = 0.0
     if pose_thr:
-        cap = float(pose_thr) * 4.0
+        cap = float(pose_thr) * 2.0
     elif finite.size:
         cap = float(np.percentile(finite, 90))
     if cap > 0:
@@ -126,6 +127,11 @@ def plot_overview_dual(env, pose_speed, fs, out_path,
         for a in apex_samples:
             axes[1].axvline(a / fs, color="purple", ls="--", lw=0.6, alpha=0.55)
 
+    # Pin the time axis to exactly [0, n/fs] (== the web UI's recDur) so t=0 sits
+    # flush at the left spine and t=end at the right. matplotlib's default 5%
+    # x-margin otherwise insets the curve, leaving blank gaps front+back AND
+    # offsetting the web playhead, which maps t/recDur onto the captured axes box.
+    axes[1].set_xlim(0, n / fs)        # sharex=True -> applies to both rows
     fig.tight_layout()
     fig.savefig(out_path, dpi=100)
     plt.close(fig)

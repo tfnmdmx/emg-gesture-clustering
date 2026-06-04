@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -44,16 +45,20 @@ class Config:
     # Absolute motion gate -- robust_threshold is per-recording relative, so on a
     # static recording it descends to the noise floor and manufactures phantom
     # segments. A real dynamic gesture must move the joints an absolute distance.
-    pose_min_range: float = 15.0      # min joint excursion (pose_range) per segment
+    # RADIANS: joint angles are normalized to radians at load (io_utils.load_npz),
+    # so pose_range = ‖max-min‖ is a rad-space norm. ~15 deg-equivalent.
+    pose_min_range: float = math.radians(15.0)   # min joint excursion per segment
     pose_long_seg_s: float = 2.5      # segments longer than this -> review flag
     # --- Unified pose-hysteresis + EMG-split detector (action_segmentation.py).
     # Designed for the regular 静止-动作-静止 protocol with NO neutral return: a
     # hold is the formed pose itself, so rest = low pose-speed AND low EMG (never
     # 'near neutral'). pose-speed is the spine; EMG splits back-to-back holds.
     # See docs/检测切分统一设计.md.
-    move_enter: float = 60.0          # deg/s: STATIC->MOVING (pose motion onset);
-                                      # only used when auto_move_thresh=False
-    move_exit: float = 25.0           # deg/s: MOVING->STATIC settle (must be < move_enter)
+    # rad/s (joint angles are radians post-load). Only used when
+    # auto_move_thresh=False (ablation) or as the near-static fallback; the
+    # math.radians() keeps the original deg-tuned provenance visible.
+    move_enter: float = math.radians(60.0)   # rad/s (≈60 deg/s): STATIC->MOVING onset
+    move_exit: float = math.radians(25.0)    # rad/s (≈25 deg/s): MOVING->STATIC settle
     settle_frac: float = 0.25         # relative-settle: spd <= max(move_exit, frac*peak_run)
     auto_move_thresh: bool = True     # derive move_enter/exit per-rec from robust_threshold
     move_exit_frac: float = 0.5       # move_exit = frac * move_enter when auto

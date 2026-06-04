@@ -41,7 +41,7 @@ REC_FIELDS = ["source_file", "source_path", "group", "subject", "hand",
               "n_burst_only", "n_clip_only",
               "emg_pose_lag_s", "emg_pose_corr", "lag_flag",
               "pose_nan_frac", "emg_nan_frac",
-              "enter_thresh", "exit_thresh", "pose_thresh",
+              "enter_thresh", "exit_thresh", "pose_thresh", "pose_exit_thresh",
               "rec_pose_range", "pose_static"]
 
 
@@ -146,7 +146,7 @@ def process_one(path: str, info, cfg: Config,
     # stable hold, right boundary at the next onset (segments tile seamlessly,
     # no artificial pad). move_enter/move_exit are adaptive per-recording
     # (robust_threshold valley) -- pose-speed scale varies ~4x across recordings
-    # so a fixed deg/s does not work. Diagnostic-verified on jm-0503/ax-0819:
+    # so a fixed rad/s does not work. Diagnostic-verified on jm-0503/ax-0819:
     # ~1 segment per natural gesture, real hold median 0.6-1.0s, apex in hold
     # >90%. See docs/检测切分统一设计.md + emg_label/action_segmentation.py.
     actions, dbg = action_segmentation.segment_recording(emg, ja, cfg)
@@ -269,6 +269,7 @@ def process_one(path: str, info, cfg: Config,
         "enter_thresh": round(float(enter), 6),
         "exit_thresh": round(float(exit_thr), 6),
         "pose_thresh": round(float(pose_thr), 6),
+        "pose_exit_thresh": round(float(pose_exit_thr), 6),
         "rec_pose_range": round(rec_pose_range, 4),
         "pose_static": int(pose_static),
     }
@@ -393,9 +394,10 @@ def main():
     ap.add_argument("--pose-bound-frac", type=float, default=0.5,
                     help="segment-bound level = frac * detect threshold")
     ap.add_argument("--pose-peak-merge-gap-s", type=float, default=0.12)
-    ap.add_argument("--pose-min-range", type=float, default=15.0,
-                    help="absolute joint-excursion floor; segments/recordings "
-                         "below it are dropped as static (no real gesture)")
+    ap.add_argument("--pose-min-range", type=float, default=np.deg2rad(15.0),
+                    help="absolute joint-excursion floor in RADIANS (default "
+                         "~15 deg-equiv); segments/recordings below it are "
+                         "dropped as static (no real gesture)")
     ap.add_argument("--pose-long-seg-s", type=float, default=2.5,
                     help="segments longer than this get review_flag=long")
     # --- incremental-mode flags ---
