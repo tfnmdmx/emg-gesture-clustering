@@ -18,7 +18,7 @@
 ### A.1 一条龙（推荐）
 
 ```bash
-cd /data/cl_data/action-clustering
+cd /data/cl_data/action-clustering-compact
 
 # 最常见：meta CSV 喂入 + 并行 8
 WORKERS=8 ./pulse.sh raw reference/sample_meta.csv
@@ -32,7 +32,7 @@ WORKERS=8 ./pulse.sh raw /mnt/pose_data/emg2pose/data
 | 子步骤 | 产物 |
 |--------|------|
 | `raw-segment` | `out_pose/shards/{stem}/*` + 顶层 `segments.csv / clips.csv / recordings.csv` + `features/{stem}.npz` |
-| `raw-qc` | `out_pose/recordings_keep.csv`（lag_flag=ok & pose_nan_frac<0.01 的子集） |
+| `raw-qc` | `out_pose/recordings_keep.csv`（`lag_flag in RAW_LAG_FLAGS(ok)` & `pose_nan_frac<RAW_NAN_MAX(0.01)` 的**参考**子集，非门控；默认阈值下常近乎空，详见 §QC） |
 | `raw-export` | `out_pose/clips_export/{stem}/c{cid:04d}.{npz,png}`（每条录制一个子目录）+ `index.html`（增量刷新） |
 
 跑完打开 `out_pose/clips_export/index.html` 浏览关键帧，往 `out_pose/clips.csv` 的 `gesture_label` 列填手势名即可。
@@ -52,7 +52,8 @@ WORKERS=8 ./pulse.sh raw-segment reference/sample_meta.csv   # 仅 stage 1
 |------|------|------|
 | `RAW_OUT` | `out_pose` | 输出目录 |
 | `WORKERS` | `1` | segment 并行 worker 数（每条录制独立进程） |
-| `SUBJECT` | 空 | 只处理指定 subject（透传 `--only-subject`） |
+| `SUBJECTS` | 空 | 只处理这些 subject（逗号分隔，透传 `--subjects`）；按**归一化 id** 匹配，`fgw-0917 == fgw0917`，meta CSV 与 processed_data 用法一致 |
+| `SUBJECT` | 空 | `SUBJECTS` 的单值遗留别名（pulse.sh 把 `SUBJECT` 灌进 `SUBJECTS`，最终也是 `--subjects`，**不是** `--only-subject`） |
 | `ONLY_HAND` | 空 | 只处理 `left` 或 `right`（透传 `--only-hand`） |
 | `NO_OVERVIEW` | `0` | 设 `1` 跳过 `overview.png` 渲染（提速） |
 | `RAW_LAG_FLAGS` | `ok` | QC 保留的 lag_flag（逗号分隔，可加 `early`/`late`） |
@@ -115,11 +116,13 @@ python segment.py --meta sample_meta.csv --out out --allow-force
 
 | 列                                              | 怎么用                                                       |
 |-------------------------------------------------|--------------------------------------------------------------|
-| `lag_flag`                                      | `ok` 进真值集；`early`/`late` 复核；`nan` 直接弃             |
-| `emg_pose_lag_s, emg_pose_corr`                 | 异常 lag 的具体值与置信度                                    |
-| `pose_nan_frac, emg_nan_frac`                   | > 0.1 弃用（大量插值假帧）                                   |
+| `lag_flag`                                      | 全局 EMG↔pose 互相关的诊断标签（`ok`/`early`/`late`/`nan`）。**已知在本类准周期数据上有偏**（持姿期 EMG 才达峰，互相关易把绝大多数判成 `ok`），**非硬门控**——见 §QC 说明 |
+| `emg_pose_lag_s, emg_pose_corr`                 | 上面 lag 的具体秒数与互相关置信度                            |
+| `pose_nan_frac, emg_nan_frac`                   | NaN/插值占比；`raw-qc` 默认 `pose_nan_frac < 0.01` 才保留（见 `RAW_NAN_MAX`），手动复核可放宽 |
 | `n_burst_only, n_clip_only`                     | 双信号分歧；clip_only 数高 = 大量 EMG 漏切的真手势           |
-| `enter_thresh, exit_thresh, pose_thresh`        | 阈值快照，复盘阈值是否合理                                   |
+| `enter_thresh, exit_thresh, pose_thresh, pose_exit_thresh` | 阈值快照，复盘阈值是否合理                          |
+
+> **§QC `lag_flag` 注意**：`raw-qc`（`./pulse.sh raw-qc`）默认只保留 `RAW_LAG_FLAGS=ok` 且 `pose_nan_frac < RAW_NAN_MAX(0.01)` 的录制写入 `recordings_keep.csv`。但 `lag_flag` 是基于**全局互相关**（`qc.estimate_emg_pose_lag` / `lag_status`）的诊断量，在本项目这种准周期、持姿期 EMG 才达峰的数据上**已知有偏**，常把几乎所有录制判成 `ok`；叠加 0.01 的 NaN 上限后 `recordings_keep.csv` 往往近乎空集。它**不是硬门控**——`export_clips.py` 仍读完整 `clips.csv`，`recordings_keep.csv` 只是参考子集。要让它有用，建议放宽：`RAW_LAG_FLAGS=ok,early,late RAW_NAN_MAX=0.1 ./pulse.sh raw-qc`。
 
 `clips.csv`（打标单元）的关键过滤列：
 
@@ -167,7 +170,7 @@ python visualize_segment.py out_pose/clips_export/<stem>/c0000.npz -o /tmp/x.png
 ### B.1 TL;DR
 
 ```bash
-cd /data/cl_data/action-clustering
+cd /data/cl_data/action-clustering-compact
 
 # 1) 一条命令：建池 + 切分 + 聚类(k=18) + 评估 + 质检图
 ./pulse.sh prep fgw0917_0502_left fgw0917_0504_right
@@ -264,7 +267,7 @@ POOL=old_data/work_pool_4users OUT=out_4users_zscore  GROUP_BY=all SUBJECT_NORM=
 
 | 阶段    | 产物                                                                                          |
 |---------|-----------------------------------------------------------------------------------------------|
-| segment | `segments.csv`、`clips.csv`、`recordings.csv`、`overview/*.png`                               |
+| segment | 顶层 `segments.csv`、`clips.csv`、`recordings.csv` + 每条录制一个 shard `shards/{stem}/`（`segments.csv`/`clips.csv`/`recording.csv`/`overview.png`）+ `features/{stem}.npz` |
 | cluster | `segments_clustered.csv`、`labels_template.csv`、`clusters/<group>{,_hands}.png`              |
 | eval    | `eval_metrics.csv`（被试无关性指标），`eval_cache/`                                            |
 | qc      | `feature_maps/<group>_features.png`、`hand_anim/index.html`                                   |
@@ -280,7 +283,7 @@ POOL=old_data/work_pool_4users OUT=out_4users_zscore  GROUP_BY=all SUBJECT_NORM=
 | `lag=n/a (corr=0.00, nan)`                          | 该录制 EMG 或 pose 信号近常值/全 NaN；`recordings.csv.lag_flag=nan`，弃用                      |
 | `lag=+0.500s (corr=0.20, late)`                     | EMG 领先 pose 超 400ms；可能是任务特性（持姿期 EMG 才达峰），看 `corr` 决定是否进真值集        |
 | `lag=-0.21s (corr=0.30, early)`                     | EMG 滞后 pose；通常是预处理对齐 bug，需要去查源头 npz                                          |
-| `pose_nan_frac > 0.10`                              | Manus 大量丢帧，姿态基本靠插值，弃用                                                           |
+| `pose_nan_frac >= RAW_NAN_MAX`（默认 0.01）         | Manus 丢帧多，姿态靠插值；`raw-qc` 默认把它挡在 `recordings_keep.csv` 外（阈值可调）          |
 | HTML 画廊"no PNG"                                   | 该 clip 渲染失败；首选 skeleton 路径需 raw npz 含 `manus_*_skeleton`，否则走 FK 需要 torch     |
 | 第一条 clip 报 `keyframe FK unavailable`            | 处理后数据无 skeleton 且无 torch；用 raw 数据，或装 torch                                      |
 | `ModuleNotFoundError: sklearn`                      | 没走 pulse.sh（它锁定了 emg2pose conda python）；或用 `$PY` 显式指                              |
@@ -296,7 +299,7 @@ POOL=old_data/work_pool_4users OUT=out_4users_zscore  GROUP_BY=all SUBJECT_NORM=
 
 ```bash
 PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
-cd /data/cl_data/action-clustering
+cd /data/cl_data/action-clustering-compact
 
 # 真值集路径
 $PY segment.py --meta reference/sample_meta.csv --out out_pose

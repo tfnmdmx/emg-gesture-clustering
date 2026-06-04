@@ -1,5 +1,14 @@
 # EMG 手势数据 动作切分与标注 实现计划
 
+> ⚠️ **历史归档 — 已被取代,勿照此实现。** 这是项目最初的 TDD 实现计划,与当前代码已严重不符,仅作历史记录保留。具体偏差:
+> - **切分**:本计划的 `segmentation.estimate_rest_baseline / activity_signal / auto_thresholds / segment_file`(关节角度偏离静息基线的迟滞分割)**已不是 live 路径**。当前 `segment.py`(`segment_recording` @ `emg_label/action_segmentation.py:280`)以 EMG 包络(`segmentation.emg_envelope` + `segment_emg`)为骨架做切分,关节角速度(pose-speed)迟滞 + EMG 分割并段。`segmentation.py` 现仅含 `emg_envelope / auto_thresholds / hysteresis_segments / filter_segments / hold_windows / segment_emg`,不含 `estimate_rest_baseline / activity_signal / segment_file`。
+> - **Config**:本计划的 `plateau_frac / baseline_iters / baseline_keep_frac` 字段已从 `emg_label/config.py` 删除。
+> - **特征**:本计划的 `features.plateau_feature`(段中部 50% 中位数)已被 `features.apex_pose_feature`(保持窗口顶点附近中位数)取代;`features.py` 还新增了共享提取器 `feature_by_seg`、`apex_index`、`per_subject_center/zscore`。
+> - **聚类落地**:live 聚类是 `cluster.py`(聚 apex 静态姿态特征,经 `pulse.sh cluster` 调用);`cluster_traj.py`(轨迹特征)是独立实验脚本,未接入 `pulse.sh`。
+> - **CSV / 产物**:本计划的 `segments.csv` 列(`start_sample/end_sample`)与 `labels.csv` 命名与当前不符,详见已实现的设计文档 `../specs/2026-05-26-emg-gesture-segmentation-labeling-design.md` 第 0 节及 `docs/METHOD.md`。
+>
+> 下文 Task 中的具体函数签名、Config 字段、CLI 代码块均为**当时**的设计草稿,不代表当前实现。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 从一批 npz(动作-静息交替)中自动切分动作段、按 (被试,手) 分组聚类、人工批量命名后,把每个动作段导出为带标签的单独 npz 并出可视化图。

@@ -3,7 +3,7 @@ import os
 import warnings
 
 from emg_label.io_utils import (group_files, parse_file_info,
-                                resolve_npz_path)
+                                resolve_npz_path, side_from_meta)
 
 
 def test_resolve_npz_path_prefers_existing_source_path(tmp_path):
@@ -22,6 +22,32 @@ def test_resolve_npz_path_falls_back_to_input_dir():
 
 def test_resolve_npz_path_bare_filename_when_nothing_given():
     assert resolve_npz_path("a.npz", None, None) == "a.npz"
+
+
+def test_parse_file_info_rejects_nonhand_mid_token():
+    # 'b-xyz' is not a real hand -> must NOT be accepted with hand='xyz';
+    # the stem doesn't match any layout, so it falls through to own-group.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        info = parse_file_info("/tmp/sub__date-xyz__ts.npz")
+    assert info.parsed is False
+    assert info.hand is None
+
+
+def test_parse_file_info_accepts_real_processed_hand():
+    info = parse_file_info("/tmp/fgw-0917__20260502-left__132054.npz")
+    assert info.parsed is True
+    assert info.subject == "fgw-0917"
+    assert info.hand == "left"
+    assert info.group == "fgw-0917-left"
+
+
+def test_side_from_meta_prefers_explicit_hand():
+    # explicit hand wins even when group has no side (GROUP_BY=all -> 'all').
+    assert side_from_meta({"hand": "right", "group": "all"}) == "right"
+    assert side_from_meta({"group": "all"}, fallback="left") == "left"
+    assert side_from_meta({"source_file": "fgw__d-right__t.npz"}) == "right"
+    assert side_from_meta({"label": "left-3"}) == "left"
 
 
 def test_normalize_subject_strips_hyphen_and_case():

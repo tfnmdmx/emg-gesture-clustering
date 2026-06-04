@@ -23,24 +23,26 @@ class Config:
     # absolute overrides still come from enter_thresh / exit_thresh.
     emg_enter_k: float = 0.8
     emg_exit_k: float = 0.4
-    # Pose-speed (joint-angle velocity) segmentation -- independent of EMG.
-    # Used to carve static_hold / transition_motion intervals and compose them
-    # into static-motion-static gesture clips for manual labelling.
+    # Pose-speed (joint-angle velocity) smoothing/threshold knobs. The live
+    # detector (action_segmentation.segment_recording) uses pose_smooth_ms for the
+    # speed signal and, when auto_move_thresh=True, derives move_enter/move_exit
+    # from robust_threshold(speed, pose_pct, pose_mad). min_static_s/min_motion_s
+    # gate the pose-hysteresis dwell tests.
     pose_smooth_ms: float = 250.0
     pose_pct: float = 35.0
     pose_mad: float = 1.5
     min_static_s: float = 0.35
     min_motion_s: float = 0.20
-    merge_gap_s: float = 0.20
-    pre_static_s: float = 0.5
-    post_static_s: float = 0.5
-    pad_s: float = 0.05
-    # Velocity-peak segmentation (the dynamic-gesture segmenter that replaces
-    # static->motion->static clips: one segment per pose-speed peak). See
-    # pose_segmentation.velocity_peak_segments.
-    pose_prom_k: float = 2.0          # peak prominence = k * MAD(speed)
-    pose_min_gesture_s: float = 0.25  # min peak spacing AND min segment length
-    pose_bound_frac: float = 0.5      # segment-bound level = frac * detect_thr
+    # --- legacy / diagnostic-only knobs ---------------------------------------
+    # The live pipeline (segment.py -> segment_recording) does NOT read these.
+    # They parameterize the superseded segmenters in pose_segmentation.py
+    # (static_motion_intervals, velocity_peak_segments) which now run only inside
+    # diag_seg.py for the before/after over-cut comparison. Kept so that
+    # diagnostic stays runnable; not exposed as segment.py CLI flags.
+    merge_gap_s: float = 0.20         # static_motion_intervals merge gap
+    pose_prom_k: float = 2.0          # velocity-peak prominence = k * MAD(speed)
+    pose_min_gesture_s: float = 0.25  # velocity-peak min spacing AND min length
+    pose_bound_frac: float = 0.5      # velocity-peak segment-bound = frac*detect_thr
     pose_peak_merge_gap_s: float = 0.12
     # Absolute motion gate -- robust_threshold is per-recording relative, so on a
     # static recording it descends to the noise floor and manufactures phantom
@@ -67,7 +69,6 @@ class Config:
                                       # data the ~125ms pose-smoothing group delay drops EMG
                                       # bursts into the preceding hold, making R7 over-split.
                                       # Only enable if a recording genuinely under-cuts.
-    hold_confirm_s: float = 0.30      # min pose-quiet ∩ EMG-rest overlap to confirm a hold (R3)
     max_hold_s: float = 4.0           # hold longer than this -> review_flag='long_static'
     snap_window_s: float = 0.15       # half-window for onset/cut snapping to speed foot/min
     nan_max_gap_s: float = 0.20       # Manus dropouts shorter than this are linearly filled

@@ -12,8 +12,8 @@ Usage:
     python visualize_segment.py <segment.npz> [-o out.png] [--side left|right]
 
 The apex frame is the moment of maximum joint deviation from the segment's
-mean pose -- the most "settled" gesture pose, the same idea used for the
-clustering feature.
+mean pose -- the most "settled" gesture pose. It is computed with the exact
+shared helper used for the clustering feature (features.apex_index).
 """
 
 import argparse
@@ -24,31 +24,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from scipy.ndimage import uniform_filter1d  # noqa: E402
 
+from emg_label import features  # noqa: E402
 from emg_label.hand3d import angles_to_landmarks, draw_hand  # noqa: E402
+from emg_label.io_utils import side_from_meta  # noqa: E402
 from emg_label.segmentation import emg_envelope  # noqa: E402
-
-
-def _side_from_meta(d, fallback="left") -> str:
-    """Infer hand side from the group/source metadata stored in the npz."""
-    for key in ("group", "source_file", "label"):
-        if key in d.files:
-            s = str(d[key]).lower()
-            if "right" in s:
-                return "right"
-            if "left" in s:
-                return "left"
-    return fallback
-
-
-def _apex_frame(ja, fs, smooth_ms=50.0):
-    """Frame of max joint deviation from the segment mean (settled pose)."""
-    rest = np.median(ja, axis=0)
-    sm = max(1, int(round(smooth_ms / 1000.0 * fs)))
-    dev = uniform_filter1d(np.linalg.norm(ja - rest, axis=1), size=sm,
-                           mode="nearest")
-    return int(np.argmax(dev))
+from emg_label.skeleton import axis_limits  # noqa: E402
 
 
 def visualize(npz_path: str, out_path: str, side: str | None = None):
@@ -61,11 +42,11 @@ def visualize(npz_path: str, out_path: str, side: str | None = None):
     src = str(d["source_file"]) if "source_file" in d.files else ""
     seg_idx = str(d["seg_idx"]) if "seg_idx" in d.files else "?"
     if side is None:
-        side = _side_from_meta(d)
+        side = side_from_meta(d)
 
     T = emg.shape[0]
     t = np.arange(T) / fs
-    apex = _apex_frame(ja, fs)
+    apex = features.apex_index(ja, 0, T, np.nanmedian(ja, axis=0), fs)
 
     # Envelope = baseline-centered RMS across channels (matches segmentation).
     env = emg_envelope(emg, fs=fs, smooth_ms=50.0)
@@ -111,16 +92,12 @@ def visualize(npz_path: str, out_path: str, side: str | None = None):
     # --- (4) 3D hand poses at start / apex / end -----------------------------
     frames = [("start", 0), ("apex", apex), ("end", T - 1)]
     lms = [angles_to_landmarks(ja[f], side=side) for _, f in frames]
-    pts = np.concatenate(lms, axis=0)
-    mn, mx = pts.min(axis=0), pts.max(axis=0)
-    mid = (mn + mx) / 2.0
-    half = (mx - mn).max() / 2.0 * 1.05
-    lo, hi = mid - half, mid + half
+    lims = axis_limits(np.concatenate(lms, axis=0), margin_ratio=0.025)
     for i, (name, f) in enumerate(frames):
         ax = fig.add_subplot(gs[i, 2], projection="3d")
         draw_hand(ax, lms[i])
         ax.set_title(f"hand @ {name} (t={f / fs:.2f}s)", fontsize=9)
-        ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1]); ax.set_zlim(lo[2], hi[2])
+        ax.set_xlim(*lims[0]); ax.set_ylim(*lims[1]); ax.set_zlim(*lims[2])
         ax.view_init(elev=25, azim=-60)
         try:
             ax.set_box_aspect((1, 1, 1))

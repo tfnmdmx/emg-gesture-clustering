@@ -1,5 +1,11 @@
 # 3D 手部姿态预览 Implementation Plan
 
+> ⚠️ **历史归档 — 核心决策已被推翻,勿照此实现。** 本计划的"自包含 numpy 近似 FK、不依赖 emg2pose/torch"方案**已被取代**。当前 `emg_label/hand3d.py` 改用 **emg2pose 的 torch 正向运动学**(`HandPositionErrorCalculator.angles_to_positions`,从 `$EMG2POSE_VIS_DIR` 下的 `calculate_hand_error.py` 懒加载;默认 `/home/chenglin/anuo_emg2pose/emg2pose/scripts/visualize_3d`)。因此下文 Task 1 写的 `FLEX_SIGN / ABD_SIGN / _FINGERS / _finger_chain / _thumb_chain / _rot_x / _rot_z` 以及 `angles_to_landmarks` 的纯 numpy 实现**均不存在于当前代码**。
+> - 当前 `hand3d.py` 实际导出:常量 `LANDMARK_NAMES / BONE_CONNECTIONS / PALM_CONNECTIONS`(仍如下文 §文件结构);函数 `angles_to_landmarks(angles20, side="left") -> (21,3)`(单位 mm)、`angles_batch_to_landmarks`(批量,(N,20)->(N,21,3))、`draw_hand(ax, landmarks, finger_color="steelblue", thumb_color="crimson")`、`_get_calculator / _to_radians` 等内部辅助。
+> - 输入若是 Manus ergonomics 角度(度),`_to_radians` 会按数值范围自动转弧度;右手通过对左手 FK 结果镜像 X 实现(规避 emg2pose 右手 init 的 22-vs-21 形状 bug)。
+> - 因依赖 emg2pose/torch,`tests/test_hand3d.py` 在未装 emg2pose 的环境下整模块 skip。
+> - 下文 Task 4 的"调 `FLEX_SIGN`/`ABD_SIGN` 标定符号"流程已不适用(无此常量)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 为聚类阶段额外渲染“每个 cluster 质心姿态的 3D 手骨架”拼图 PNG,替代不直观的条形图,便于看图给手势命名。

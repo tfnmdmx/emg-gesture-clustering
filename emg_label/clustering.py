@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
@@ -12,6 +14,12 @@ def select_k_and_cluster(X, k_min: int, k_max: int, random_state: int = 0):
         return np.zeros(n, dtype=int), 1
     hi = min(k_max, n - 1)
     lo = max(2, min(k_min, hi))
+    # A fixed-k request (k_min == k_max) is silently clamped to n-1 for small
+    # groups; surface it so 'k=18' that became k=7 is not mistaken for the ask.
+    if k_min == k_max and lo != k_min:
+        warnings.warn(
+            f"requested k={k_min} infeasible for n={n} sample(s); using k={lo}",
+            stacklevel=2)
     best_k = lo
     best_score = -np.inf
     best_labels = None

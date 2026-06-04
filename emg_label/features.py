@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from scipy.ndimage import uniform_filter1d
+
+from . import io_utils
 
 
 def apex_index(joint_angles, start, window_end, rest, fs, smooth_ms=50.0):
@@ -21,7 +25,8 @@ def apex_index(joint_angles, start, window_end, rest, fs, smooth_ms=50.0):
     sm = max(1, int(round(smooth_ms / 1000.0 * fs)))
     dev = uniform_filter1d(np.linalg.norm(seg - rest, axis=1), size=sm,
                            mode="nearest")
-    return int(start) + int(np.argmax(dev))
+    # NaN frames (long/edge Manus dropouts left unfilled) must never win argmax.
+    return int(start) + int(np.argmax(np.nan_to_num(dev, nan=-np.inf)))
 
 
 def apex_pose_feature(joint_angles, start, window_end, rest, fs,
@@ -45,7 +50,9 @@ def apex_pose_feature(joint_angles, start, window_end, rest, fs,
     half = max(1, int(round(win_ms / 1000.0 * fs)))
     a0 = max(0, apex - half)
     a1 = min(len(seg), apex + half + 1)
-    return np.median(seg[a0:a1], axis=0)
+    # nan-aware: a few dropped frames in the +/-win_ms window must not poison the
+    # whole feature vector (would propagate NaN into zscore/KMeans).
+    return np.nanmedian(seg[a0:a1], axis=0)
 
 
 def per_subject_center(X, subjects):
@@ -101,3 +108,51 @@ def zscore(X):
     std = X.std(axis=0)
     std_safe = np.where(std < 1e-12, 1.0, std)
     return (X - mean) / std_safe, mean, std
+
+
+def _read_feature_cache(features_dir, source_file, fdf):
+    """{seg_idx: feature} from <features_dir>/{stem}.npz, or None if the cache is
+    absent or missing any seg_idx in `fdf` (stale -> recompute)."""
+    if not features_dir:
+        return None
+    stem = str(source_file)
+    if stem.endswith(".npz"):
+        stem = stem[:-4]
+    cache_path = os.path.join(features_dir, stem + ".npz")
+    if not os.path.isfile(cache_path):
+        return None
+    d = np.load(cache_path)
+    feat_by_seg = {int(k): v for k, v in zip(d["seg_idx"], d["feature"])}
+    missing = [int(r["seg_idx"]) for _, r in fdf.iterrows()
+               if int(r["seg_idx"]) not in feat_by_seg]
+    if missing:
+        print(f"features stale for {source_file} "
+              f"({len(missing)} seg_idx missing); recomputing")
+        return None
+    return feat_by_seg
+
+
+def feature_by_seg(source_file, fdf, fs, features_dir=None, input_dir=None):
+    """``{seg_idx: apex_pose_feature}`` for one recording's segment rows.
+
+    The single shared apex-feature extractor for cluster.py,
+    plot_cluster_features.py and evaluate.py. Prefers the per-recording cache
+    segment.py writes to ``<features_dir>/{stem}.npz`` (a deterministic function
+    of the inputs, so cached and recomputed values are bit-identical); otherwise
+    loads the npz and recomputes with the SAME nan-aware
+    ``rest = nanmedian(joint_angles)`` the cache writer uses. Routing every
+    consumer through here keeps rest/cache identical so each scores exactly the
+    features that were clustered. `fdf` needs columns seg_idx / start_sample /
+    hold_end_sample (+ optional source_path). Returns ``(feat_by_seg, cache_hit)``.
+    """
+    feat_by_seg = _read_feature_cache(features_dir, source_file, fdf)
+    if feat_by_seg is not None:
+        return feat_by_seg, True
+    sp = fdf["source_path"].iloc[0] if "source_path" in fdf.columns else None
+    _, ja = io_utils.load_npz(io_utils.resolve_npz_path(source_file, sp, input_dir))
+    rest = np.nanmedian(ja, axis=0)
+    feat_by_seg = {}
+    for _, row in fdf.iterrows():
+        feat_by_seg[int(row["seg_idx"])] = apex_pose_feature(
+            ja, int(row["start_sample"]), int(row["hold_end_sample"]), rest, fs)
+    return feat_by_seg, False

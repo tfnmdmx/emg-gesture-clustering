@@ -12,7 +12,7 @@ then for each group produces a multi-panel figure:
 Features are cached to <out>/feature_cache/<group>.npz so reruns are fast.
 
 Usage:
-    python plot_cluster_features.py <input_dir> [--out out_fgw] [--fs 2000]
+    python plot_cluster_features.py <input_dir> [--out out] [--fs 2000]
         [--no-tsne] [--force]
 """
 
@@ -29,47 +29,17 @@ from sklearn.decomposition import PCA  # noqa: E402
 from sklearn.manifold import TSNE  # noqa: E402
 from sklearn.metrics import silhouette_samples  # noqa: E402
 
-from emg_label import features, io_utils  # noqa: E402
+from emg_label import features  # noqa: E402
 
 
 def _group_features(input_dir, gdf, fs, features_dir=None):
-    """Recompute (X, cluster_ids) for one group -- identical to cluster.py.
-
-    Prefers the per-recording cache that segment.py writes to
-    ``<out>/features/{stem}.npz`` (deterministic, bit-identical). Falls back
-    to reloading the npz and recomputing apex features when the cache is
-    absent or stale.
-    """
+    """(X, cluster_ids) for one group via the shared features.feature_by_seg
+    extractor (same cache + nan-aware rest as cluster.py / evaluate.py)."""
     feats, cids = [], []
     for fname, fdf in gdf.groupby("source_file"):
         fdf = fdf.sort_values("start_sample")
-        stem = str(fname)
-        if stem.endswith(".npz"):
-            stem = stem[:-4]
-        cache_path = (os.path.join(features_dir, stem + ".npz")
-                      if features_dir else None)
-        feat_by_seg = None
-        if cache_path and os.path.isfile(cache_path):
-            d = np.load(cache_path)
-            feat_by_seg = {int(k): v
-                           for k, v in zip(d["seg_idx"], d["feature"])}
-            missing = [int(r["seg_idx"]) for _, r in fdf.iterrows()
-                       if int(r["seg_idx"]) not in feat_by_seg]
-            if missing:
-                feat_by_seg = None
-        if feat_by_seg is None:
-            sp = (fdf["source_path"].iloc[0]
-                  if "source_path" in fdf.columns else None)
-            _, ja = io_utils.load_npz(
-                io_utils.resolve_npz_path(fname, sp, input_dir))
-            rest = np.median(ja, axis=0)
-            feat_by_seg = {}
-            for _, row in fdf.iterrows():
-                s = int(row["start_sample"])
-                he = int(row["hold_end_sample"])
-                feat_by_seg[int(row["seg_idx"])] = (
-                    features.apex_pose_feature(ja, s, he, rest, fs))
-            del ja
+        feat_by_seg, _ = features.feature_by_seg(
+            fname, fdf, fs, features_dir, input_dir)
         for _, row in fdf.iterrows():
             feats.append(feat_by_seg[int(row["seg_idx"])])
             cids.append(int(row["cluster_id"]))
@@ -178,7 +148,7 @@ def main():
     ap.add_argument("input_dir", nargs="?", default=None,
                     help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
                          "located via each row's source_path (no work_pool needed).")
-    ap.add_argument("--out", default="out_fgw")
+    ap.add_argument("--out", default="out")
     ap.add_argument("--fs", type=int, default=2000)
     ap.add_argument("--no-tsne", action="store_true")
     ap.add_argument("--force", action="store_true",

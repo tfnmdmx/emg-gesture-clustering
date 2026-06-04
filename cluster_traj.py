@@ -44,7 +44,7 @@ from sklearn.cluster import MiniBatchKMeans  # noqa: E402
 from sklearn.decomposition import PCA  # noqa: E402
 from sklearn.metrics import silhouette_score  # noqa: E402
 
-from emg_label import io_utils  # noqa: E402
+from emg_label import features, io_utils  # noqa: E402
 from emg_label.skeleton import (axis_limits, draw_skeleton,  # noqa: E402
                                 normalize_skeleton)
 
@@ -131,12 +131,6 @@ def build_features(clips_df: pd.DataFrame, out_dir: str, L: int, repr_: str):
 
 
 # ---------- clustering ------------------------------------------------------
-
-def zscore(X):
-    mean = X.mean(axis=0)
-    std = X.std(axis=0)
-    return (X - mean) / np.where(std < 1e-12, 1.0, std)
-
 
 def cluster(Xp, k, k_min, k_max, sil_sample, seed=0):
     """MiniBatchKMeans; if k is None, pick k by silhouette on a subsample."""
@@ -280,7 +274,7 @@ def main():
         else:
             print(f"WARN joint-weights size {njoint} doesn't divide feature dim {D}; ignored")
 
-    Xz = zscore(X)
+    Xz, _mean, _std = features.zscore(X)
     n_comp = min(args.pca, Xz.shape[1], Xz.shape[0] - 1)
     Xp = PCA(n_components=n_comp, random_state=0).fit_transform(Xz)
 

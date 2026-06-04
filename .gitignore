@@ -5,3 +5,5 @@ __pycache__
 old_data
 webui/plotly.min.js
 out
+plot_emg16.py
+render_emg_hand.py

@@ -30,6 +30,8 @@ from emg_label.hand3d import (
     LANDMARK_NAMES,
     angles_batch_to_landmarks,
 )
+from emg_label.io_utils import side_from_meta
+from emg_label.skeleton import axis_limits
 
 FINGER_COLORS = {
     "thumb": "#e41a1c", "index": "#ff7f00", "middle": "#4daf4a",
@@ -45,17 +47,6 @@ LANDMARK_FINGER = {
     4: "pinky", 17: "pinky", 18: "pinky", 19: "pinky",
     5: "palm", 20: "palm",
 }
-
-
-def _side_from_meta(d, fallback="left") -> str:
-    for key in ("group", "source_file", "label"):
-        if key in d.files:
-            s = str(d[key]).lower()
-            if "right" in s:
-                return "right"
-            if "left" in s:
-                return "left"
-    return fallback
 
 
 def _skeleton_traces(pos, show_legend=False):
@@ -93,7 +84,7 @@ def animate(npz_path, out_path, side=None, max_frames=80, fps=30):
     cid = str(d["cluster_id"]) if "cluster_id" in d.files else "?"
     src = str(d["source_file"]) if "source_file" in d.files else ""
     if side is None:
-        side = _side_from_meta(d)
+        side = side_from_meta(d)
 
     T = ja.shape[0]
     # Downsample to <= max_frames evenly spaced frames.
@@ -102,11 +93,7 @@ def animate(npz_path, out_path, side=None, max_frames=80, fps=30):
     pos_all = angles_batch_to_landmarks(ja[idxs], side=side)  # (F, 21, 3) mm
 
     # Fixed axis ranges across all frames (cube, true aspect).
-    pts = pos_all.reshape(-1, 3)
-    mn, mx = pts.min(axis=0), pts.max(axis=0)
-    mid = (mn + mx) / 2.0
-    half = (mx - mn).max() / 2.0 * 1.1
-    lo, hi = mid - half, mid + half
+    lims = axis_limits(pos_all, margin_ratio=0.05)
 
     # Initial frame + animation frames.
     init = _skeleton_traces(pos_all[0])
@@ -124,9 +111,9 @@ def animate(npz_path, out_path, side=None, max_frames=80, fps=30):
         title=f"{label}  |  t=0.000s (frame 0/{T})",
         height=720, width=820,
         scene=dict(
-            xaxis=dict(range=[lo[0], hi[0]], title="X (mm)"),
-            yaxis=dict(range=[lo[1], hi[1]], title="Y (mm)"),
-            zaxis=dict(range=[lo[2], hi[2]], title="Z (mm)"),
+            xaxis=dict(range=list(lims[0]), title="X (mm)"),
+            yaxis=dict(range=list(lims[1]), title="Y (mm)"),
+            zaxis=dict(range=list(lims[2]), title="Z (mm)"),
             aspectmode="cube",
             camera=dict(eye=dict(x=-0.25, y=-1.6, z=0.6)),
         ),

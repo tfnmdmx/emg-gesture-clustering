@@ -10,7 +10,7 @@ animate_segment.animate, and writes them to
 by group/side, so you can browse all classes from one page.
 
 Usage:
-    python build_anim_gallery.py [--out-root out_fgw] [--subdir hand_anim]
+    python build_anim_gallery.py [--out-root out] [--subdir hand_anim]
         [--n 3] [--max-frames 80] [--fps 30] [--clean]
 """
 
@@ -21,7 +21,9 @@ import os
 
 import numpy as np
 
-from animate_segment import animate
+# animate_segment (plotly + emg2pose/torch FK) is imported lazily inside build()
+# so a missing optional dep degrades to "index cached HTMLs" instead of crashing
+# the whole pulse.sh qc/run/export step that chains into the gallery.
 
 
 def _meta(npz_path):
@@ -53,6 +55,13 @@ def build(out_root, subdir, n, max_frames, fps, clean):
     if not os.path.isdir(seg_root):
         raise SystemExit(f"not found: {seg_root}")
 
+    try:
+        from animate_segment import animate
+    except ImportError as exc:
+        animate = None
+        print(f"!! animate_segment unavailable ({exc}); skipping new renders, "
+              f"indexing only already-cached HTMLs.")
+
     labels = sorted(
         [d for d in os.listdir(seg_root)
          if os.path.isdir(os.path.join(seg_root, d))],
@@ -79,15 +88,19 @@ def build(out_root, subdir, n, max_frames, fps, clean):
             # existing file is the same artifact a fresh run would produce.
             if os.path.isfile(out_path) and not clean:
                 n_cached += 1
-            else:
+            elif animate is not None:
                 animate(npz, out_path, max_frames=max_frames, fps=fps)
                 total_html += 1
+            else:
+                continue  # renderer unavailable and no cached HTML -> skip
             m = _meta(npz)
             samples.append({
                 "stem": stem,
                 "rel": os.path.relpath(out_path, anim_root),
                 "meta": m,
             })
+        if not samples:
+            continue
         grp = samples[0]["meta"]["group"]
         entries.setdefault(grp, []).append({"label": label, "samples": samples})
         # Refresh index after each label so a long run is browsable mid-way.
@@ -149,7 +162,7 @@ def _write_index(index_path, entries, n):
 def main():
     ap = argparse.ArgumentParser(
         description="Batch-animate first N segments per label + index page")
-    ap.add_argument("--out-root", default="out_fgw")
+    ap.add_argument("--out-root", default="out")
     ap.add_argument("--subdir", default="hand_anim")
     ap.add_argument("--n", type=int, default=3,
                     help="samples per label (default 3)")

@@ -27,7 +27,7 @@ mean dominant-subject fraction, both toward the random baseline, while keeping
 silhouette up and the LOSO transfer ratio near 1.0.
 
 Usage:
-    python evaluate.py <input_dir> [--out out_4users] [--fs 2000] [--force]
+    python evaluate.py <input_dir> [--out out] [--fs 2000] [--force]
 """
 
 import argparse
@@ -48,27 +48,23 @@ def _subject(source_file: str) -> str:
     return str(source_file).split("__")[0]
 
 
-def _group_features(input_dir, gdf, fs):
-    """Recompute (X, cluster_ids, subjects) for one group, aligned row-for-row.
+def _group_features(input_dir, gdf, fs, features_dir=None):
+    """(X, cluster_ids, subjects) for one group, aligned row-for-row.
 
-    Mirrors cluster.py / plot_cluster_features.py exactly: reads each segment's
-    precomputed hold-window end and takes the apex pose within it.
+    Uses the shared features.feature_by_seg extractor so it scores EXACTLY the
+    apex features cluster.py clustered (same out/features cache, same nan-aware
+    rest) rather than an independently recomputed variant.
     """
     feats, cids, subs = [], [], []
     for fname, fdf in gdf.groupby("source_file"):
-        sp = fdf["source_path"].iloc[0] if "source_path" in fdf.columns else None
-        _, ja = io_utils.load_npz(
-            io_utils.resolve_npz_path(fname, sp, input_dir))
-        rest = np.median(ja, axis=0)
         fdf = fdf.sort_values("start_sample")
         subj = _subject(fname)
+        feat_by_seg, _ = features.feature_by_seg(
+            fname, fdf, fs, features_dir, input_dir)
         for _, row in fdf.iterrows():
-            s = int(row["start_sample"])
-            he = int(row["hold_end_sample"])
-            feats.append(features.apex_pose_feature(ja, s, he, rest, fs))
+            feats.append(feat_by_seg[int(row["seg_idx"])])
             cids.append(int(row["cluster_id"]))
             subs.append(subj)
-        del ja
     return np.asarray(feats), np.asarray(cids), np.asarray(subs)
 
 
@@ -103,8 +99,13 @@ def _subject_leakage(Xz, subs):
     vc = pd.Series(subs).value_counts()
     majority = float(vc.iloc[0] / vc.sum())
     random_base = 1.0 / n_subj
+    # StratifiedKFold needs every class populated >= n_splits; cap to the
+    # smallest subject count and skip entirely when that is < 2.
+    n_splits = min(5, int(vc.min()))
+    if n_splits < 2:
+        return None
     clf = LogisticRegression(max_iter=2000)
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
     acc = cross_val_score(clf, Xz, subs, cv=skf, scoring="accuracy").mean()
     return float(acc), random_base, majority
 
@@ -199,7 +200,7 @@ def main():
     ap.add_argument("input_dir", nargs="?", default=None,
                     help="OPTIONAL legacy fallback dir of .npz. Omit it: npz are "
                          "located via each row's source_path (no work_pool needed).")
-    ap.add_argument("--out", default="out_4users")
+    ap.add_argument("--out", default="out")
     ap.add_argument("--fs", type=int, default=2000)
     ap.add_argument("--force", action="store_true",
                     help="recompute features even if eval cache exists")
@@ -226,7 +227,9 @@ def main():
             print(f"[{group}] loaded cached features {X.shape}")
         else:
             print(f"[{group}] computing features ...")
-            X, cids, subs = _group_features(args.input_dir, gdf, args.fs)
+            X, cids, subs = _group_features(
+                args.input_dir, gdf, args.fs,
+                features_dir=os.path.join(args.out, "features"))
             np.savez(cache, X=X, cids=cids, subs=subs)
         summary.append(evaluate_group(group, X, cids, subs,
                                        subject_norm=args.subject_norm))

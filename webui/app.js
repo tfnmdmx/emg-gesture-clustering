@@ -34,10 +34,20 @@ function on(id, ev, fn) {
 
 // Plotly loads deferred (4.5MB, non-blocking) so the tree paints immediately;
 // the 3D hand mesh awaits it here rather than blocking the whole page.
-function whenPlotly() {
+function whenPlotly(timeoutMs = 20000) {
   if (window.Plotly) return Promise.resolve();
-  return new Promise(res => {
-    const t = setInterval(() => { if (window.Plotly) { clearInterval(t); res(); } }, 50);
+  // Resolve once Plotly is ready; reject after a timeout so a missing/blocked
+  // plotly.min.js (no local vendor AND no CDN reachable) surfaces an error in
+  // the 3D panel instead of spinning forever.
+  return new Promise((res, rej) => {
+    const t0 = Date.now();
+    const t = setInterval(() => {
+      if (window.Plotly) { clearInterval(t); res(); }
+      else if (Date.now() - t0 > timeoutMs) {
+        clearInterval(t);
+        rej(new Error('Plotly failed to load (no local webui/plotly.min.js and CDN unreachable)'));
+      }
+    }, 50);
   });
 }
 
@@ -264,7 +274,15 @@ async function buildHand(d) {
       camera: { eye: { x: 1.5, y: -1.5, z: 0.9 } },
     },
   };
-  await whenPlotly();                              // deferred 4.5MB lib may still be loading
+  try {
+    await whenPlotly();                            // deferred 4.5MB lib may still be loading
+  } catch (e) {
+    const el = document.getElementById('hand');
+    if (el) el.innerHTML = "<div style='padding:12px;color:#a00;font-size:12px'>" +
+      "3D 手部渲染不可用：未找到 webui/plotly.min.js 且 CDN 不可达。" +
+      "请下载 plotly-2.35.2.min.js 放到 webui/ 或联网后重试。</div>";
+    return;
+  }
   if (epoch !== STATE.handEpoch) return;
   Plotly.newPlot('hand', [trace], layout, { displaylogo: false, responsive: true });
   STATE.meshReady = true; STATE.curHandFrame = 0;

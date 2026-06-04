@@ -5,8 +5,10 @@ Run:  $PY label_server.py --out out_pose --port 8000
 Then open http://127.0.0.1:8000
 
 Reads out/clips.csv (+ recordings.csv, shard overviews, source npz for 3D),
-writes out/labels.csv on each label, out/clips_labeled.csv on export.
-Stdlib only -- no flask/fastapi. Reuses emg_label for 3D, same as export_clips.
+writes out/clip_labels.csv on each label, out/clips_labeled.csv on export.
+(clip_labels.csv is per-clip gesture labels; distinct from flow-B's labels.csv
+which is per-cluster names read by export.py. A legacy labels.csv is migrated
+on first load.) Uses matplotlib + emg2pose for server-side 3D, like export_clips.
 """
 from __future__ import annotations
 
@@ -26,7 +28,6 @@ import pandas as pd
 
 import matplotlib
 matplotlib.use("Agg")
-from matplotlib.figure import Figure  # noqa: E402
 from mpl_toolkits.mplot3d import Axes3D  # noqa: E402,F401  (registers 3d proj)
 
 # Some npz paths don't follow the {subject}/{date-hand}/{stamp} layout, so
@@ -36,14 +37,10 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: E402,F401  (registers 3d proj)
 warnings.filterwarnings("ignore", message="Cannot parse filename")
 
 from emg_label import io_utils, plotting  # noqa: E402
-from emg_label.skeleton import (  # noqa: E402
-    SKELETON_CONNECTIONS,
-    SKELETON_FINGER_COLORS,
-    SKELETON_PALM_CONNECTIONS,
-    axis_limits,
-    draw_skeleton,
-    normalize_skeleton,
-)
+
+# NOTE: hand rendering is the emg2pose Plotly Mesh3d path (skin_vertices_np ->
+# per-frame vertex JSON, drawn client-side). The old matplotlib skeleton path
+# (emg_label.skeleton.draw_skeleton) is no longer used here.
 
 FS = 2000
 OVERVIEW_REGEN_V = 10         # bump to invalidate regenerated overview_cache
@@ -154,7 +151,11 @@ class Store:
         self.out = out_dir
         self.lock = threading.Lock()
         self.clips_path = os.path.join(out_dir, "clips.csv")
-        self.labels_path = os.path.join(out_dir, "labels.csv")
+        # Per-clip labels. Named clip_labels.csv so it can never be confused with
+        # flow-B's per-cluster labels.csv (read by export.py). A pre-rename
+        # labels.csv with the per-clip schema is migrated on load (see below).
+        self.labels_path = os.path.join(out_dir, "clip_labels.csv")
+        self._legacy_labels_path = os.path.join(out_dir, "labels.csv")
         # All render caches live under one umbrella dir (out/cache/) so the
         # output root stays tidy; makedirs creates the parent on first run.
         cache_root = os.path.join(out_dir, "cache")
@@ -169,7 +170,9 @@ class Store:
         self.segments_path = os.path.join(out_dir, "segments.csv")
         self.regen_always = os.environ.get("OVERVIEW_REGEN") == "1"
         self._segs_by_source = None      # lazy burst spans from segments.csv
+        self._segs_lock = threading.Lock()
         self._overview_scan = None       # lazy source_file -> overview.png map
+        self._overview_scan_lock = threading.Lock()
         self._stem_cache: dict[str, str] = {}
 
         if not os.path.isfile(self.clips_path):
@@ -259,9 +262,21 @@ class Store:
         return stem, sf, int(cids)
 
     def _load_labels(self):
-        if not os.path.isfile(self.labels_path):
-            return
-        ldf = pd.read_csv(self.labels_path, dtype=str).fillna("")
+        path = self.labels_path
+        if not os.path.isfile(path):
+            # Migrate a pre-rename per-clip labels.csv if present (the next flush
+            # writes clip_labels.csv). A flow-B per-cluster labels.csv lacks the
+            # clip_id column, so guard on it to avoid mis-reading that schema.
+            if os.path.isfile(self._legacy_labels_path):
+                head = pd.read_csv(self._legacy_labels_path, dtype=str, nrows=0)
+                if "clip_id" in head.columns:
+                    path = self._legacy_labels_path
+                    print(f"migrating legacy {path} -> {self.labels_path}")
+                else:
+                    return
+            else:
+                return
+        ldf = pd.read_csv(path, dtype=str).fillna("")
         for _, r in ldf.iterrows():
             sf = str(r["source_file"]); cid = int(float(r["clip_id"]))
             inv = str(r.get("invalid", "")).strip() in ("1", "true", "True")
@@ -467,17 +482,21 @@ class Store:
     def _load_bursts(self, stem: str):
         """Lazy burst spans from segments.csv -> (spans, apexes, segidx->pos)."""
         if self._segs_by_source is None:
-            self._segs_by_source = {}
-            if os.path.isfile(self.segments_path):
-                sdf = pd.read_csv(self.segments_path)
-                sdf["source_file"] = sdf["source_file"].astype(str)
-                for sf, g in sdf.groupby("source_file", sort=False):
-                    g = g.sort_values("seg_idx")
-                    self._segs_by_source[sf] = (
-                        list(zip(g["start_sample"].astype(int),
-                                 g["end_sample"].astype(int))),
-                        list(g["apex_sample"].astype(int)),
-                        {int(s): i for i, s in enumerate(g["seg_idx"].astype(int))})
+            with self._segs_lock:                  # double-checked; build then publish
+                if self._segs_by_source is None:
+                    segs: dict = {}
+                    if os.path.isfile(self.segments_path):
+                        sdf = pd.read_csv(self.segments_path)
+                        sdf["source_file"] = sdf["source_file"].astype(str)
+                        for sf, g in sdf.groupby("source_file", sort=False):
+                            g = g.sort_values("seg_idx")
+                            segs[sf] = (
+                                list(zip(g["start_sample"].astype(int),
+                                         g["end_sample"].astype(int))),
+                                list(g["apex_sample"].astype(int)),
+                                {int(s): i for i, s
+                                 in enumerate(g["seg_idx"].astype(int))})
+                    self._segs_by_source = segs    # publish fully-built map
         sf = self.by_stem[stem]["source_file"]
         return self._segs_by_source.get(sf, ([], [], {}))
 
@@ -601,16 +620,16 @@ class Store:
         if os.path.isfile(cache):
             with open(cache) as f:
                 d = json.load(f)
-            if d.get("v") == 9:        # ignore older-schema caches
-                return d
+            if d.get("v") == OVERVIEW_REGEN_V:   # tied to overview version so an
+                return d                         # overview bump invalidates ov_x0/x1
         st = self.by_stem[stem]
         side = (st["hand"]
                 or io_utils.parse_file_info(st["source_path"]).hand or "left")
 
         emg, ja = io_utils.load_npz(st["source_path"], hand=side)
         n = len(ja)
-        # Hand frames are rendered server-side as PNGs (matplotlib draw_skeleton,
-        # ipynb-identical) and indexed by this same downsampled grid -- the
+        # Hand frames are rendered server-side as emg2pose mesh vertices (JSON,
+        # via /api/handmesh) and indexed by this same downsampled grid -- the
         # payload only carries frame_times so the scrubber maps time -> frame i.
         fidx = _frame_indices(n)
 
@@ -663,8 +682,11 @@ class Store:
                 print(f"overview regen failed for {stem}: {ex}")
                 ov_x0 = ov_x1 = None
         out = {
-            "v": 9, "stem": stem, "fps": POSE_FPS,   # bump when overview render
-                                                     # / curves / ov_x0,x1 change
+            "v": OVERVIEW_REGEN_V, "stem": stem, "fps": POSE_FPS,  # share the
+                                                     # overview version: ov_x0/x1
+                                                     # come from the overview, so
+                                                     # an overview bump invalidates
+                                                     # this geometry cache too
             "duration_s": round(n / FS, 3),
             "n_frames": len(fidx),
             "ov_x0": ov_x0, "ov_x1": ov_x1,   # overview data-axis edges (img frac)
@@ -743,7 +765,10 @@ class Store:
             i = max(0, min(nfr - 1, i))
             path = self._hand_path(stem, i)
             if not os.path.isfile(path):
-                verts = np.asarray(ev.skin_vertices_np(profile, ja_sub[i]))
+                # emg2pose skinning isn't verified re-entrant; serialize the
+                # compute behind RENDER_LOCK (same lock the overview render uses).
+                with RENDER_LOCK:
+                    verts = np.asarray(ev.skin_vertices_np(profile, ja_sub[i]))
                 body = json.dumps({"v": np.rint(verts).astype(int).tolist()})
                 tmp = path + ".tmp"
                 with open(tmp, "w") as f:
@@ -782,21 +807,23 @@ class Store:
             if os.path.isfile(p):
                 return p
         if self._overview_scan is None:        # one-time scan, source_file -> png
-            self._overview_scan = {}
-            if os.path.isdir(root):
-                for name in os.listdir(root):
-                    ov = os.path.join(root, name, "overview.png")
-                    if not os.path.isfile(ov):
-                        continue
-                    rc = os.path.join(root, name, "recording.csv")
-                    if os.path.isfile(rc):
-                        try:
-                            rr = pd.read_csv(rc, nrows=1)
-                            if "source_file" in rr.columns:
-                                self._overview_scan[
-                                    str(rr["source_file"].iloc[0])] = ov
-                        except Exception:
-                            pass
+            with self._overview_scan_lock:     # double-checked; build then publish
+                if self._overview_scan is None:
+                    scan: dict = {}
+                    if os.path.isdir(root):
+                        for name in os.listdir(root):
+                            ov = os.path.join(root, name, "overview.png")
+                            if not os.path.isfile(ov):
+                                continue
+                            rc = os.path.join(root, name, "recording.csv")
+                            if os.path.isfile(rc):
+                                try:
+                                    rr = pd.read_csv(rc, nrows=1)
+                                    if "source_file" in rr.columns:
+                                        scan[str(rr["source_file"].iloc[0])] = ov
+                                except Exception:
+                                    pass
+                    self._overview_scan = scan  # publish fully-built map
         return self._overview_scan.get(r["source_file"]) if r else None
 
     def hand_status(self, stem: str) -> dict:
@@ -866,11 +893,6 @@ def make_handler(store: Store):
                 print(f"WARN /api/overview: no overview for stem={stem}")
                 return self._send(404, {"error": "overview not found",
                                         "stem": stem})
-            if p == "/api/keyframes":
-                key = q.get("key", [""])[0]
-                return self._file(
-                    os.path.join(store.out, "clips_export", key + ".png"),
-                    "image/png")
             if p == "/api/recording":
                 stem = q.get("stem", [""])[0]
                 try:

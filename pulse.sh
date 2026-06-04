@@ -270,13 +270,13 @@ _raw_seg_extra() {
   [ -n "$SUBJECTS" ] && extra="$extra --subjects $SUBJECTS"
   [ -n "$ONLY_HAND" ] && extra="$extra --only-hand $ONLY_HAND"
   [ "$NO_OVERVIEW" = "1" ] && extra="$extra --no-overview"
-  # pose-segmentation thresholds: lower these to over-segment (more clips),
-  # then prune by labelling. Only passed when set, else segment.py defaults.
+  # pose-speed motion thresholds (feed the auto move-enter/exit derivation):
+  # lower POSE_PCT/POSE_MAD to over-segment (more clips), then prune by labelling.
+  # Only passed when set, else segment.py defaults.
   [ -n "${POSE_PCT:-}" ]     && extra="$extra --pose-pct $POSE_PCT"          # default 35 -> lower = more motion
   [ -n "${POSE_MAD:-}" ]     && extra="$extra --pose-mad $POSE_MAD"          # default 1.5
   [ -n "${MIN_STATIC_S:-}" ] && extra="$extra --min-static-s $MIN_STATIC_S"  # default 0.35
   [ -n "${MIN_MOTION_S:-}" ] && extra="$extra --min-motion-s $MIN_MOTION_S"  # default 0.20
-  [ -n "${MERGE_GAP_S:-}" ]  && extra="$extra --merge-gap-s $MERGE_GAP_S"    # default 0.20
   echo "$extra"
 }
 

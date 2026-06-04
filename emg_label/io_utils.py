@@ -65,21 +65,24 @@ def parse_file_info(path: str) -> FileInfo:
     stem = p.stem
 
     # --- Processed: filename has __subject__date-hand__ ---
+    # Only accept this layout when subject is non-empty AND the hand token is a
+    # recognized left/right/both. Otherwise a stem like 'a__b-xyz__t' would be
+    # silently accepted with hand='xyz'; instead fall through to the other
+    # layouts (or the warn/own-group path).
     parts = stem.split("__")
     mid = parts[1].split("-") if len(parts) >= 3 else []
-    if len(mid) >= 2:
+    if len(mid) >= 2 and parts[0]:
         subject = parts[0]
-        hand_raw = mid[1]
-        hand_lower = hand_raw.lower()
+        hand_lower = mid[1].lower()
+        hand = None
         if hand_lower.startswith("left"):
             hand = "left"
         elif hand_lower.startswith("right"):
             hand = "right"
         elif hand_lower.startswith("both"):
             hand = "both"
-        else:
-            hand = hand_raw
-        return FileInfo(path, stem, subject, hand, f"{subject}-{hand}", True)
+        if hand is not None:
+            return FileInfo(path, stem, subject, hand, f"{subject}-{hand}", True)
 
     # --- Raw: hand lives in parent dir like 20260423-left[-batch] ---
     session_dir = p.parent.name
@@ -112,6 +115,36 @@ def group_files(paths: list[str]) -> dict[str, list[FileInfo]]:
         info = parse_file_info(p)
         groups.setdefault(info.group, []).append(info)
     return groups
+
+
+def side_from_meta(d, fallback: str = "left") -> str:
+    """Hand side ('left'/'right') from an exported-segment npz (or any dict-like).
+
+    Prefers an explicit ``hand`` field (export.py writes it); else scans
+    ``group`` / ``source_file`` / ``label`` for a left/right substring; else the
+    ``fallback``. Single source of truth for visualize_segment / animate_segment /
+    build_anim_gallery / label_server so a fix propagates to every renderer.
+    Note: with GROUP_BY=all the group is just 'all' (no side), which is exactly
+    why the explicit ``hand`` field is checked first.
+    """
+    keys = getattr(d, "files", None)
+    if keys is None:
+        keys = list(d.keys()) if hasattr(d, "keys") else []
+
+    def _val(k):
+        try:
+            return str(d[k]).lower()
+        except Exception:
+            return ""
+
+    for key in ("hand", "group", "source_file", "label"):
+        if key in keys:
+            s = _val(key)
+            if "right" in s:
+                return "right"
+            if "left" in s:
+                return "left"
+    return fallback
 
 
 def _find_pose_key(files: Iterable[str], hand: str | None) -> str | None:

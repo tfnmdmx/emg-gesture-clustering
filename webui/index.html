@@ -1,7 +1,11 @@
 <!doctype html><meta charset=utf-8><title>Clip 打标</title>
 <!-- defer: 4.5MB plotly must NOT block first paint (over a slow VSCode tunnel a
-     render-blocking <head> script leaves the page blank until it finishes). -->
-<script defer src="/plotly.min.js"></script>
+     render-blocking <head> script leaves the page blank until it finishes).
+     Prefer a locally-vendored webui/plotly.min.js (works offline, not committed
+     -- see .gitignore); if it is absent the server 404s and we fall back to the
+     CDN so a fresh checkout still renders the 3D hand. -->
+<script defer src="/plotly.min.js"
+        onerror="this.onerror=null;this.src='https://cdn.plot.ly/plotly-2.35.2.min.js'"></script>
 <style>
   body{font-family:-apple-system,Segoe UI,sans-serif;margin:0;color:#222;height:100vh;display:flex;flex-direction:column}
   #top{display:flex;gap:14px;align-items:center;padding:8px 14px;background:#f4f4f4;border-bottom:1px solid #ddd;font-size:13px;flex-wrap:wrap}

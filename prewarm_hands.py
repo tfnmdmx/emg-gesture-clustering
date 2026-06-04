@@ -22,6 +22,7 @@ import os
 from multiprocessing import Pool
 
 import label_server as L
+from emg_label import io_utils
 
 _STORE = None
 
@@ -50,14 +51,22 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=None,
                     help="only the first N recordings (sampling)")
+    ap.add_argument("--subjects", default=None,
+                    help="comma-separated subject ids to keep, matched on the "
+                         "NORMALIZED id (fgw-0917 == fgw0917) -- the same "
+                         "selector as segment.py / pulse.sh SUBJECTS.")
     ap.add_argument("--subject", default=None,
-                    help="only recordings whose stem contains this string")
+                    help="(deprecated alias for a single --subjects id)")
     args = ap.parse_args()
 
     store = L.Store(args.out)
     stems = list(store.by_stem)
-    if args.subject:
-        stems = [s for s in stems if args.subject in s]
+    subjects = args.subjects or args.subject
+    if subjects:
+        want = {io_utils.normalize_subject(s)
+                for s in subjects.split(",") if s.strip()}
+        stems = [s for s in stems
+                 if io_utils.normalize_subject(s.split("__")[0]) in want]
     if args.limit:
         stems = stems[:args.limit]
     if not stems:

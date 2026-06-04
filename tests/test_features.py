@@ -87,3 +87,28 @@ def test_zscore_constant_column_safe():
     Xz, mean, std = zscore(X)
     assert np.all(np.isfinite(Xz))
     assert np.allclose(Xz[:, 0], 0.0)
+
+
+def test_apex_index_never_returns_nan_frame():
+    # A leftover NaN frame (long/edge gap that survived interpolation) must never
+    # be selected as the apex (nan_to_num(-inf) guard). The high-deviation hold
+    # sits early, clear of the NaN's forward smoothing smear; plain np.argmax
+    # would instead return the first NaN-deviation frame (~851).
+    rest = np.zeros(3)
+    X = np.zeros((1000, 3))
+    X[100:140] = 5.0          # the real, finite apex region (early)
+    X[900] = np.nan           # dropped frame late -> smear poisons only the tail
+    a = apex_index(X, 0, len(X), rest, fs=2000)
+    assert np.all(np.isfinite(X[a]))
+    assert 60 <= a <= 160     # the finite hold, not the NaN-smear tail
+
+
+def test_apex_pose_feature_finite_despite_nan():
+    # nanmedian over the +/-win_ms window must skip a NaN frame so the feature
+    # stays finite (plain np.median would yield NaN and poison zscore/KMeans).
+    rest = np.zeros(3)
+    X = np.tile([1.0, 2.0, 3.0], (40, 1))
+    X[2] = np.nan
+    feat = apex_pose_feature(X, 0, len(X), rest, fs=2000)
+    assert np.all(np.isfinite(feat))
+    assert np.allclose(feat, [1.0, 2.0, 3.0])

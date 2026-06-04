@@ -382,18 +382,40 @@ def main():
     ap.add_argument("--pose-mad", type=float, default=1.5)
     ap.add_argument("--min-static-s", type=float, default=0.35)
     ap.add_argument("--min-motion-s", type=float, default=0.20)
-    ap.add_argument("--merge-gap-s", type=float, default=0.20)
-    ap.add_argument("--pre-static-s", type=float, default=0.5)
-    ap.add_argument("--post-static-s", type=float, default=0.5)
-    ap.add_argument("--pad-s", type=float, default=0.05)
-    # --- velocity-peak segmentation (dynamic-gesture clips) ---
-    ap.add_argument("--pose-prom-k", type=float, default=2.0,
-                    help="peak prominence = k * MAD(pose-speed)")
-    ap.add_argument("--pose-min-gesture-s", type=float, default=0.25,
-                    help="min peak spacing AND min segment length")
-    ap.add_argument("--pose-bound-frac", type=float, default=0.5,
-                    help="segment-bound level = frac * detect threshold")
-    ap.add_argument("--pose-peak-merge-gap-s", type=float, default=0.12)
+    # --- unified pose-hysteresis + EMG-split detector (action_segmentation) ---
+    # These are the knobs segment_recording actually consumes. pose-speed is the
+    # spine; move-enter/move-exit are auto-derived per recording by default.
+    ap.add_argument("--auto-move-thresh", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="derive move-enter/exit per recording from "
+                         "robust_threshold(pose-speed) using --pose-pct/--pose-mad "
+                         "(default). --no-auto-move-thresh uses fixed "
+                         "--move-enter/--move-exit instead.")
+    ap.add_argument("--move-enter", type=float, default=np.deg2rad(60.0),
+                    help="STATIC->MOVING onset, rad/s (~60 deg/s). Only used with "
+                         "--no-auto-move-thresh.")
+    ap.add_argument("--move-exit", type=float, default=np.deg2rad(25.0),
+                    help="MOVING->STATIC settle, rad/s (~25 deg/s). Only used with "
+                         "--no-auto-move-thresh.")
+    ap.add_argument("--move-exit-frac", type=float, default=0.5,
+                    help="move_exit = frac * move_enter when --auto-move-thresh.")
+    ap.add_argument("--settle-frac", type=float, default=0.25,
+                    help="relative-settle: spd <= max(move_exit, frac*peak_run).")
+    ap.add_argument("--enable-r2", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="split over-long never-settling runs at clean EMG-rest gaps.")
+    ap.add_argument("--enable-r7", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="back-to-back hold veto. OFF by default (over-splits on "
+                         "regular data); opt-in for genuinely under-cut recordings.")
+    ap.add_argument("--max-hold-s", type=float, default=4.0,
+                    help="hold longer than this gets review_flag=long_static.")
+    ap.add_argument("--snap-window-s", type=float, default=0.15,
+                    help="half-window for snapping onset/cut to the speed foot/min.")
+    ap.add_argument("--nan-max-gap-s", type=float, default=0.20,
+                    help="Manus pose dropouts shorter than this are linearly filled.")
+    ap.add_argument("--min-finite-frac", type=float, default=0.5,
+                    help="window with fewer finite rows than this fails the gate.")
     ap.add_argument("--pose-min-range", type=float, default=np.deg2rad(15.0),
                     help="absolute joint-excursion floor in RADIANS (default "
                          "~15 deg-equiv); segments/recordings below it are "
@@ -434,13 +456,14 @@ def main():
         emg_enter_k=args.emg_enter_k, emg_exit_k=args.emg_exit_k,
         pose_smooth_ms=args.pose_smooth_ms, pose_pct=args.pose_pct,
         pose_mad=args.pose_mad, min_static_s=args.min_static_s,
-        min_motion_s=args.min_motion_s, merge_gap_s=args.merge_gap_s,
-        pre_static_s=args.pre_static_s, post_static_s=args.post_static_s,
-        pad_s=args.pad_s,
-        pose_prom_k=args.pose_prom_k, pose_min_gesture_s=args.pose_min_gesture_s,
-        pose_bound_frac=args.pose_bound_frac,
-        pose_peak_merge_gap_s=args.pose_peak_merge_gap_s,
+        min_motion_s=args.min_motion_s,
         pose_min_range=args.pose_min_range, pose_long_seg_s=args.pose_long_seg_s,
+        auto_move_thresh=args.auto_move_thresh, move_enter=args.move_enter,
+        move_exit=args.move_exit, move_exit_frac=args.move_exit_frac,
+        settle_frac=args.settle_frac, enable_r2=args.enable_r2,
+        enable_r7=args.enable_r7, max_hold_s=args.max_hold_s,
+        snap_window_s=args.snap_window_s, nan_max_gap_s=args.nan_max_gap_s,
+        min_finite_frac=args.min_finite_frac,
     )
     os.makedirs(os.path.join(cfg.out_dir, "shards"), exist_ok=True)
     os.makedirs(os.path.join(cfg.out_dir, "features"), exist_ok=True)

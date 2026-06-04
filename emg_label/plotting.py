@@ -157,17 +157,13 @@ def plot_cluster_preview(centroids, counts, ids, out_path):
 
 def plot_cluster_hands(centroids, counts, ids, out_path, side="left"):
     from emg_label.hand3d import angles_batch_to_landmarks, draw_hand
+    from emg_label.skeleton import axis_limits
 
     # Batched FK is one torch call instead of k.
     all_lm = angles_batch_to_landmarks(np.asarray(centroids), side=side)
-    pts = all_lm.reshape(-1, 3)
-    mn, mx = pts.min(axis=0), pts.max(axis=0)
-    # Center each axis around midpoint with the same half-range so the
-    # aspect stays true and small clusters don't get visually inflated.
-    mid = (mn + mx) / 2.0
-    half = (mx - mn).max() / 2.0 * 1.05
-    lo = mid - half
-    hi = mid + half
+    # Shared cubic limits so the aspect stays true and small clusters don't get
+    # visually inflated.
+    lims = axis_limits(all_lm, margin_ratio=0.025)
     k = len(centroids)
     ncol = 4
     nrow = max(1, int(np.ceil(k / ncol)))
@@ -176,9 +172,9 @@ def plot_cluster_hands(centroids, counts, ids, out_path, side="left"):
         ax = fig.add_subplot(nrow, ncol, i + 1, projection="3d")
         draw_hand(ax, all_lm[i])
         ax.set_title(f"cluster {ids[i]} (n={counts[i]})", fontsize=9)
-        ax.set_xlim(lo[0], hi[0])
-        ax.set_ylim(lo[1], hi[1])
-        ax.set_zlim(lo[2], hi[2])
+        ax.set_xlim(*lims[0])
+        ax.set_ylim(*lims[1])
+        ax.set_zlim(*lims[2])
         # emg2pose coords: +X = wrist->fingertips, Y = palm normal, Z = finger spread.
         # 3/4 view from above the back of the hand makes fingers and thumb readable.
         ax.view_init(elev=25, azim=-60)

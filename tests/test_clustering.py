@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 
 from emg_label.clustering import select_k_and_cluster
@@ -32,3 +34,22 @@ def test_clamps_k_to_sample_count():
     labels, best_k = select_k_and_cluster(X, k_min=12, k_max=30)
     assert best_k <= 5
     assert len(labels) == 6
+
+
+def test_fixed_k_clamp_warns():
+    # A fixed k (k_min == k_max) that can't fit the sample count is clamped;
+    # that must surface as a warning, not silently produce a different k.
+    X = _three_blobs(per=2)  # 6 samples -> max feasible k is 5
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _labels, best_k = select_k_and_cluster(X, k_min=18, k_max=18)
+    assert best_k < 18
+    assert any("infeasible" in str(w.message) for w in caught)
+
+
+def test_fixed_k_no_warn_when_feasible():
+    X = _three_blobs(per=15)  # 45 samples, k=3 is feasible
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        select_k_and_cluster(X, k_min=3, k_max=3)
+    assert not any("infeasible" in str(w.message) for w in caught)

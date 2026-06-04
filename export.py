@@ -92,7 +92,7 @@ def main():
                 emg=emg[s:e], joint_angles=ja[s:e],
                 label=label, source_file=fname, group=group,
                 seg_idx=int(row["seg_idx"]), start_sample=s, end_sample=e,
-                fs=cfg.fs, cluster_id=cid,
+                fs=cfg.fs, cluster_id=cid, hand=hand,
             )
             os.replace(tmp, out_path)
             spans.append((s, e))

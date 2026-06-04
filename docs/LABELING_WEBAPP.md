@@ -35,43 +35,44 @@
 |------|--------|-------------|---------|--------|------|
 | **A. 纯静态 HTML** | 在现有 `index.html` 上加 JS，标签存 `localStorage`，最后导出下载一个 csv | ✗ 只能"下载"到浏览器下载目录，无法原地写 `out_pose/`，多人/断点续标乱 | 可（Plotly.js）但 3D 坐标得预先烘进 HTML，体积爆炸 | 低 | 不推荐 |
 | **B. 静态 + File System Access API** | 用浏览器新 API 让用户授权写本地文件 | △ 仅 Chrome/Edge，需每次授权，路径不可控，非 https 受限 | 同 A | 中 | 不推荐 |
-| **C. 本地轻服务端**（推荐） | 一个本地 Python 进程读 `out_pose/`、按需算 3D、`POST` 写回 CSV，浏览器只当前端 | ✓ 服务端直接原子写 `labels.csv`，断点续标天然支持 | ✓ 3D 坐标**按需**算 + 缓存，前端 Plotly.js 渲染 | 中 | **推荐** |
+| **C. 本地轻服务端**（推荐） | 一个本地 Python 进程读 `out_pose/`、按需算 3D、`POST` 写回 CSV，浏览器只当前端 | ✓ 服务端直接原子写 `clip_labels.csv`，断点续标天然支持 | ✓ 3D 顶点**按需**算 + 缓存，前端 Plotly.js `Mesh3d` 渲染 | 中 | **推荐（已落地）** |
 
-**为什么是 C：**
+**为什么是 C：**（结论 C 已落地，但下面的实现细节已演进——以 §6.5 为准）
 
-- 写 CSV 是核心诉求，只有服务端能稳妥地原地写 `out_pose/labels.csv`（原子写、可加 labeler/时间戳、断点续标）。
-- 3D 渲染可**复用现有模块**：优先 `io_utils.load_skeleton`（raw Manus 骨架，**无需 torch**），回退 `hand3d.angles_batch_to_landmarks`（FK，需 torch）——和 `export_clips.py` / `animate_segment.py` 完全同一套逻辑。
-- 零额外重依赖：用 **Python 标准库 `http.server`** 就能写（项目里目前没装 flask/fastapi，标准库方案免安装、用 emg2pose 的 python 直接跑）。前端 3D 用 Plotly.js（一个 CDN/vendored js 文件）。
+- 写 CSV 是核心诉求，只有服务端能稳妥地原地写 `out_pose/clip_labels.csv`（原子写、可加 labeler/时间戳、断点续标）。
+- ~~3D 优先 `io_utils.load_skeleton`（无需 torch）、回退 FK~~ —— **已改**：当前服务端统一走 emg2pose `skin_vertices_np` 手部**网格**（更清晰、可旋转），**需要 torch + emg2pose**，没有"无 torch skeleton 路径"。
+- HTTP 用 **`http.server`**（仍是标准库 server），但**不是 stdlib-only**：进程 import `matplotlib`（Agg，画/检测 overview）+ emg2pose（蒙皮）。用 emg2pose 的 python 直接跑。前端 3D 用 Plotly.js `Mesh3d`（`plotly.min.js` 本地 vendored 或 CDN 兜底，未提交）。
 
-> 如果团队已惯用 Flask/FastAPI，可平替（路由一一对应），但标准库版的好处是**零 pip 安装**、和 `pulse.sh` 用同一个解释器即可跑。
+> 如果团队已惯用 Flask/FastAPI，可平替（路由一一对应）；这里用 `http.server` 是为了和 `pulse.sh` 用同一个 emg2pose 解释器即可跑、免再装 web 框架。
 
 ---
 
 ## 2. 架构总览
 
+> 注：下图与 §3–§5、§9 描述的是**最初原型**的数据流；实现已演进为**录制级懒加载 + emg2pose 手部网格 + 实时同步播放**（见 §6.5、§10）。当前真实路由/产物：标签写 `out_pose/clip_labels.csv`（非 `labels.csv`，见 §3.2），3D 缓存为 `out_pose/cache/mesh_cache_v3/{stem}/f{i:04d}.json`（非 `pose_cache/{key}.json`），并使用 emg2pose Mesh3d 顶点而非 skeleton 点线。
+
 ```
-浏览器 (webui/index.html + app.js + plotly.min.js)
+浏览器 (webui/index.html + app.js ; plotly 由本地 vendored 或 CDN 兜底，未提交)
    │  fetch JSON / POST 标签
    ▼
-label_server.py   (stdlib http.server，用 emg2pose 的 python 跑)
-   │  启动时建索引：clips.csv → {key: row}；读 labels.csv、recordings.csv
+label_server.py   (http.server；import matplotlib + emg2pose，用 emg2pose 的 python 跑)
+   │  启动时 groupby 建录制级索引；读 clip_labels.csv（迁移旧 labels.csv）、recordings.csv
    │
    ├─ 读  out_pose/clips.csv            (打标单元 + QC 列)
-   ├─ 读  out_pose/recordings.csv       (每录制 duration / lag_flag，用于 overview 上下文)
-   ├─ 读  out_pose/shards/{stem}/overview.png   (三行 overview 图，直接当图片发)
-   ├─ 读  out_pose/clips_export/{key}.png       (6 帧关键帧，快速参考；可选)
-   ├─ 算  3D 帧 JSON  ← load_skeleton(源npz) 优先 / FK 回退，缓存到 pose_cache/{key}.json
+   ├─ 读  out_pose/recordings.csv       (每录制 duration_s / pose_thresh / lag_flag，用于 overview 上下文)
+   ├─ 读  out_pose/shards/{stem}/overview.png   (三行 overview 图；缺失时由 plot_overview_dual 现生成)
+   ├─ 算  整条录制手部网格顶点  ← emg2pose skin_vertices_np，缓存到 cache/mesh_cache_v3/{stem}/f{i:04d}.json
    │
-   └─ 写  out_pose/labels.csv           ← POST /api/label（原子写，断点续标）
-          out_pose/clips_labeled.csv    ← GET /api/export（clips.csv ⨝ labels.csv）
+   └─ 写  out_pose/clip_labels.csv      ← POST /api/label（原子写，断点续标）
+          out_pose/clips_labeled.csv    ← GET /api/export（clips.csv ⨝ clip_labels.csv，按文件夹拆分 + 合并）
 ```
 
-**数据流（一次打标）：**
+**数据流（一次打标，当前实现）：**
 
-1. 前端 `GET /api/clips` 拿到全部 clip 的轻量元信息（QC + 当前标签 + key），渲染左侧队列。
-2. 选中一个 clip → `GET /api/overview?stem=...`（图片）+ `GET /api/pose?key=...`（3D 帧 JSON）+ `GET /api/keyframes?key=...`（6 帧 png）。
-3. 填标签、回车 → `POST /api/label {key, gesture_label}` → 服务端 upsert `labels.csv` → 前端把该行染绿、自动跳下一个。
-4. 全部标完 → `GET /api/export` 生成 `clips_labeled.csv`（= 真值集）。
+1. 前端 `GET /api/recordings` 拿到**录制级**汇总（每条录制 n_clips/n_review/n_labeled/cached），渲染左侧录制树。
+2. 选中一条录制 → `GET /api/recording?stem=...`（曲线 + frame_times + s1..sN 段落几何）+ `GET /api/overview?stem=...`（overview 图）+ `GET /api/handfaces`（三角面，一次）+ 逐帧 `GET /api/handmesh?stem=&i=`（每帧顶点 JSON）。
+3. 填标签、回车 → `POST /api/label {key, gesture_label, invalid, labeler, note}` → 服务端 upsert `clip_labels.csv` → 前端把该段 chip 染绿、自动跳下一个；整条录制可 `POST /api/invalid_recording` 标为无效。
+4. 全部标完 → `GET /api/export` 生成按文件夹拆分的 `clips_labeled/*.csv` + 合并的 `clips_labeled.csv`（= 真值集）。
 
 ---
 
@@ -81,11 +82,12 @@ label_server.py   (stdlib http.server，用 emg2pose 的 python 跑)
 
 | 文件 | 用途 |
 |------|------|
-| `out_pose/clips.csv` | 打标单元 + 子结构 sample 索引 + QC 列（schema 见 METHOD §9.2） |
-| `out_pose/recordings.csv` | 每录制 `duration_s` / `lag_flag` / `n_clip_only`，给 overview 提供上下文与排序优先级 |
-| `out_pose/shards/{stem}/overview.png` | 三行 overview 图（EMG 包络+burst / pose speed+clip / matched 段） |
-| `out_pose/clips_export/{key}.png` | 6 帧关键帧（可选，作快速参考；没有就不显示） |
-| 源 npz（`clips.csv.source_path`） | 算 3D：`load_skeleton` 取 `manus_*_skeleton`（无 torch）；缺则 FK |
+| `out_pose/clips.csv` | 打标单元 + 子结构 sample 索引 + QC 列（含 `clip_start/end_sample`、`static_in/out_*_sample`、`motion_*_sample`、`apex_sample`、新增 `hold_start/end_sample`、`hold_duration_s`、`fusion_type`、`review_flag`；schema 见 METHOD §9.2。注意 `static_out_*` 现在就是真实 hold 的别名，无独立 `start_sample/end_sample` 列） |
+| `out_pose/recordings.csv` | 每录制 `duration_s` / `pose_thresh`/`enter_thresh`/`exit_thresh` / `lag_flag` / `n_clip_only`，给 overview 阈值线、上下文与排序优先级 |
+| `out_pose/shards/{stem}/overview.png` | 三行 overview 图（EMG 包络+burst / pose speed+clip / 全部 clip+burst）；**缺失时**由同一个 `plot_overview_dual` 从中间数据现生成 |
+| 源 npz（`clips.csv.source_path`） | 算 3D：`io_utils.load_npz` 取 joint_angles → emg2pose `skin_vertices_np` 蒙皮成手部网格（需 torch + emg2pose，环境已具备） |
+
+> ~~`out_pose/clips_export/{key}.png`（6 帧关键帧）~~ — 原型设计里作快速参考，**当前服务端不再读取**（`/api/keyframes` 路由已移除）。`export_clips.py` 仍会产出这些 PNG，但打标 UI 不显示它们。
 
 **clip key**（前端唯一 id，与 `export_clips.py` 一致）：
 
@@ -95,8 +97,10 @@ key = f"{io_utils.parse_file_info(source_path).stem}__c{int(clip_id):04d}"
 
 ### 3.2 写出（本工具产物）
 
-**`out_pose/labels.csv`** — 打标结果，按 `(source_file, clip_id)` 唯一键 upsert。
-**刻意不直接写 `clips.csv`**（脚本会重写它），改用独立文件，对上游重跑稳健：
+**`out_pose/clip_labels.csv`** — 打标结果，按 `(source_file, clip_id)` 唯一键 upsert。
+（**改名自 `labels.csv`**：避免与 flow-B 的**每聚类**命名表 `labels.csv`（被 `export.py` 读取）混淆；启动时若发现带 `clip_id` 列的旧 `labels.csv`，会自动迁移成 `clip_labels.csv`。）
+**刻意不直接写 `clips.csv`**（脚本会重写它），改用独立文件，对上游重跑稳健。表头为
+`source_file,clip_id,gesture_label,invalid,labeler,labeled_at,note`：
 
 | 列 | 含义 |
 |----|------|
@@ -108,83 +112,72 @@ key = f"{io_utils.parse_file_info(source_path).stem}__c{int(clip_id):04d}"
 | `labeled_at` | ISO 时间戳 |
 | `note` | 备注（可选，比如"疑似翻手腕""信号噪声"） |
 
+另外整条录制可被标为无效（`POST /api/invalid_recording`），写到 `out_pose/invalid_recordings.csv`（列 `source_file,labeler,marked_at,note`），这些录制在打标、导出、聚类、评估里都会被排除。
+
 **导出（`GET /api/export`）** — 只导**已打标**的 clip（空标签按约定丢弃），分两层：
 - `out_pose/clips_labeled/{subject}__{session}.csv` — **每个源文件夹一份**（文件夹 = `os.path.dirname(source_path)`，即左侧树的 `{subject}/{date-hand}` 会话目录），含该文件夹内全部已标 clip + `gesture_label`/`label_note`。
 - `out_pose/clips_labeled.csv` — **最外层合并文件**（全部已标 clip）。
 
 这就是 RUNBOOK §A.5 那份"真值集"，但按文件夹拆开 + 一份合并，避免一个 22 万行的巨型完整 CSV。`/api/export` 返回 `{n_labeled, n_folders, dir, merged}`。
 
-**`out_pose/pose_cache/{key}.json`** — 3D 帧缓存，首次请求时算好落盘，后续直接发。
+**`out_pose/cache/mesh_cache_v3/{stem}/f{i:04d}.json`** — 手部网格顶点缓存（每帧 emg2pose `skin_vertices_np` 顶点，int mm，~12KB/帧），首次请求时算好落盘，后续直接发。整条录制的几何（曲线 + frame_times + 段落）另缓存于 `out_pose/cache/recording_cache/{stem}.json`，现生成的 overview 缓存于 `out_pose/cache/overview_cache/{stem}.{png,json}`。
 
 ---
 
 ## 4. 后端 API 规格
 
+> 以下为**当前实现**的路由（与 §6.5 一致）。`/api/clips`、`/api/pose` 从未存在；`/api/keyframes`、`/api/handframe`（PNG 版）已**移除**——3D 改走 emg2pose 网格的 `/api/handmesh`+`/api/handfaces`。
+
 | 方法 | 路径 | 入参 | 返回 |
 |------|------|------|------|
-| GET | `/` | — | `index.html` |
-| GET | `/app.js` `/plotly.min.js` | — | 静态资源 |
-| GET | `/api/recordings` | — | **录制列表**（每条录制一行 + n_clips/n_review/n_labeled，懒加载用） |
-| GET | `/api/overview` | `stem` | `image/png`（overview.png） |
-| GET | `/api/keyframes` | `key` | `image/png`（6 帧；无则 404） |
-| GET | `/api/pose` | `key` | 单 clip 3D 帧 JSON（遗留，当前未用） |
-| GET | `/api/recording` | `stem` | **整条录制**的 overview 曲线 + `frame_times` + s1..sN 段落（同步播放用，带缓存） |
-| GET | `/api/handframe` | `stem, i` | 第 `i` 帧手部 PNG（matplotlib `draw_skeleton`，ipynb 同款；按需渲染+磁盘缓存） |
-| GET | `/api/handstatus` | `stem` | `{done, total}` 后台预渲染进度 |
-| POST | `/api/label` | `{key, gesture_label, labeler, note}` | `{ok, labeled, total}` |
-| GET | `/api/export` | — | `{written, path, n_labeled}`，并落盘 `clips_labeled.csv` |
+| GET | `/` | — | `index.html`（no-cache） |
+| GET | `/app.js` `/plotly.min.js` | — | 静态资源（`plotly.min.js` 未提交，命中则发本地 vendored 副本，否则 404 由前端回退 CDN） |
+| GET | `/api/recordings` | — | **录制列表**（每条录制 stem/folder/subject/hand/n_clips/n_review/n_labeled/n_invalid/rec_invalid/cached + `labels_used`/`total_*` 汇总，懒加载用） |
+| GET | `/api/overview` | `stem` | `image/png`（静态 overview.png 或现生成版；no-cache；缺则 404） |
+| GET | `/api/recording` | `stem` | **整条录制**的曲线（pose_speed/emg_env/pose_thr）+ `frame_times` + `ov_x0/ov_x1` + s1..sN 段落（标签实时叠加；几何带缓存） |
+| GET | `/api/handmesh` | `stem, i` | 第 `i` 帧手部网格顶点 JSON `{"v": [[x,y,z]…788 顶点]}`（emg2pose `skin_vertices_np`，int mm；按需渲染+磁盘缓存） |
+| GET | `/api/handfaces` | — | 网格三角面 `{i,j,k}`（左右手相同，发一次；Plotly `Mesh3d`） |
+| GET | `/api/handstatus` | `stem` | `{...}` 手部帧渲染进度（数磁盘上的 JSON 帧） |
+| POST | `/api/label` | `{key, gesture_label, invalid, labeler, note}` | `{ok, total, total_labeled, total_invalid, stem, stem_labeled, stem_invalid}` |
+| POST | `/api/invalid_recording` | `{stem, invalid, labeler, note}` | `{ok, stem, rec_invalid, total_invalid_rec}` |
+| GET | `/api/export` | — | `{n_labeled, n_folders, dir, merged}`，并落盘 `clips_labeled/*.csv` + `clips_labeled.csv` |
 
-**`GET /api/clips` 返回**（一次性发全部，几千行小 JSON 没问题；>5k 再考虑虚拟列表）：
+**`GET /api/recording?stem=` 段落（每个 clip 一段 s1..sN）**大致形如：
 
 ```json
 {
-  "fs": 2000,
-  "labels_used": ["fist", "pinch_index", "one"],
-  "clips": [
+  "v": 10, "stem": "subj__sess__ts", "fps": 15,
+  "duration_s": 64.0, "n_frames": 960,
+  "ov_x0": 0.054, "ov_x1": 0.989,
+  "frame_times": [0.0, 0.067, …],
+  "curves": { "t": [...], "pose_speed": [...], "emg_env": [...], "pose_thr": 1.05 },
+  "segments": [
     {
-      "key": "subj__sess__ts__c0003",
-      "source_file": "….npz", "clip_id": 3,
-      "stem": "subj__sess__ts",
-      "group": "subj-left", "subject": "subj", "hand": "left",
-      "duration_s": 1.42, "motion_duration_s": 0.46,
-      "emg_rms": 31.2, "envelope_peak": 18.7,
-      "pose_range": 1.83, "max_pose_speed": 9.1,
-      "matched_emg_seg_idx": -1,
-      "clip_start_s": 12.30, "clip_end_s": 13.72,
-      "rec_duration_s": 64.0,
-      "review": true,
-      "gesture_label": "", "labeler": "", "note": ""
+      "key": "subj__sess__ts__c0003", "clip_id": 3, "s": 1,
+      "start_s": 12.30, "end_s": 13.72,
+      "motion_start_s": 12.46, "motion_end_s": 12.92, "apex_s": 12.80,
+      "envelope_peak": 18.7, "pose_range": 1.83,
+      "motion_duration_s": 0.46, "duration_s": 1.42,
+      "matched_emg_seg_idx": -1, "review": true,
+      "gesture_label": "", "note": "", "invalid": false
     }
   ]
 }
 ```
 
-`review = (matched_emg_seg_idx < 0)` → 前端标红、排到队列最前（EMG 漏切，优先复核）。
-
-**`GET /api/pose?key=` 返回**（前端 Plotly.js 直接吃）：
-
-```json
-{
-  "mode": "skeleton",          // 或 "fk"
-  "fps": 30, "n_total": 2840, "step": 36,
-  "frames": [[[x,y,z], …J个关节], … F帧],
-  "bones": [[0,1,2,3,4], …],   // 连线（chain 索引）
-  "palm":  [[0,5,10,15,20]],
-  "colors": ["#CC6677", …],    // 每条 finger chain 一色
-  "apex_frame": 14,            // 下采样后最接近 apex 的帧
-  "structure": {               // 下采样后的帧区间，用于时间轴上色
-    "static_in": [0, 5], "motion": [5, 11], "static_out": [11, 19]
-  }
-}
-```
-
-skeleton 模式 J=25（连接表来自 `emg_label/skeleton.py`），FK 模式 J=21（来自 `emg_label/hand3d.py`）。前端只按 `bones`/`palm`/`colors` 画线，对两种模式通用。
+`review = (matched_emg_seg_idx < 0)` → 前端把该段 chip 标红、优先复核（EMG 漏切）。手部网格则由 `/api/handfaces`（三角面 i/j/k）+ 逐帧 `/api/handmesh?stem=&i=`（788 顶点，约 21 关节角经 emg2pose 蒙皮）拼成 Plotly `Mesh3d`，左手用镜像 profile（`mirror_profile`）；与 frame_times 对位、随进度条 scrub/播放。
 
 ---
 
-## 5. 后端实现（`label_server.py`，标准库）
+## 5. 后端实现（`label_server.py`） — ⚠️ 原型，已被取代
 
-放在仓库根目录，用 `$PY`（emg2pose 的 python）跑。完整可运行：
+> **本节代码是最初原型，已不再与仓库里的 `label_server.py` 对应**，仅保留以记录设计思路。真实服务端的当前形态见 **§6.5**，关键差异：
+> - **不是 stdlib-only**：`import matplotlib`（Agg）+ emg2pose（`skin_vertices_np` 蒙皮手部网格），还 import `emg_label.io_utils/plotting`。
+> - 标签写 **`clip_labels.csv`**（非 `labels.csv`，启动迁移旧文件），3D 缓存为 **`cache/mesh_cache_v3/{stem}/f{i:04d}.json` 网格顶点**（非 `pose_cache/{key}.json` 的 skeleton 点线）。
+> - 索引按**录制 groupby 懒加载**（非一次性建 `by_key` 全量 dict），`main()` 多了 `--host`，并实现了整条录制无效化（`/api/invalid_recording`）、手部网格端点（`/api/handmesh`、`/api/handfaces`、`/api/handstatus`）、录制级 `/api/recording`、overview 现生成。
+> - `POSE_MAX_FRAMES=60` 常量已不存在；当前手部帧网格按 `POSE_FPS`（默认 15）采样、上限 `POSE_REC_MAX_FRAMES`（3000）。
+
+放在仓库根目录，用 `$PY`（emg2pose 的 python）跑。**以下为原型清单（已过时，勿照抄）：**
 
 ```python
 #!/usr/bin/env python
@@ -529,15 +522,17 @@ if __name__ == "__main__":
 - **复用、不重写**：3D 走 `io_utils.load_skeleton`（无 torch）→ 失败回退 `hand3d` FK，和 `export_clips.py` 同一策略；连接表/配色直接 import。
 - **键一致**：`_clip_key` 与 `export_clips._clip_key` 同式，所以 `clips_export/{key}.png` 能直接拿来当 6 帧参考。
 - **写安全**：单进程 + `threading.Lock`，每次 upsert 后**原子写**（tmp→`os.replace`）整张 `labels.csv`；几千行重写成本可忽略，省掉行内改写的坑。
-- **断点续标**：启动读已存在的 `labels.csv` 进内存，刷新页面/重启进程都不丢。
-- **缓存**：3D 帧 JSON 落 `pose_cache/{key}.json`，第二次秒开；下采样到 ≤60 帧控制体积。
-- **只读上游**：绝不写 `clips.csv`；标签独立存 `labels.csv`，导出时才 join。
+- **断点续标**：启动读已存在的 `clip_labels.csv` 进内存（旧 `labels.csv` 自动迁移），刷新页面/重启进程都不丢。
+- **缓存**：~~3D 帧 JSON 落 `pose_cache/{key}.json`，下采样到 ≤60 帧~~（原型）。当前为整条录制的网格顶点缓存 `cache/mesh_cache_v3/{stem}/f{i:04d}.json`，按 `POSE_FPS` 采样、上限 `POSE_REC_MAX_FRAMES`。
+- **只读上游**：绝不写 `clips.csv`；标签独立存 `clip_labels.csv`，导出时才 join。
 
 ---
 
-## 6. 前端实现（`webui/`）
+## 6. 前端实现（`webui/`） — ⚠️ §6.2/§6.3 清单为原型，已被取代
 
-三个文件：`webui/index.html`、`webui/app.js`、`webui/plotly.min.js`（从 https://cdn.plot.ly/plotly-2.35.2.min.js 下载放进来，或 `index.html` 里直接引 CDN）。
+`webui/` 实际只提交**两个文件**：`webui/index.html` + `webui/app.js`。`plotly.min.js` **未提交**——`index.html` 用 `defer` 引 `/plotly.min.js`，服务端命中本地 vendored 副本就发它，否则 `onerror` 自动回退 CDN（`https://cdn.plot.ly/plotly-2.35.2.min.js`）。
+
+> 下面 §6.2/§6.3 内嵌的 `index.html`/`app.js` 是**最初原型**（用 `/api/clips`、`/api/pose`、`/api/keyframes` 等已不存在的路由，3D 走 Plotly scatter3d 点线）。**当前真实前端见 §6.5**：录制树懒加载、emg2pose 网格 `Mesh3d`、单一 `STATE.t` 同步引擎。保留原型仅作设计参照。
 
 ### 6.1 布局
 
@@ -546,7 +541,7 @@ if __name__ == "__main__":
 │ 顶栏：进度 [■■■□□ 123/512]  过滤[未标▾]  排序[复核优先▾]         │
 │        labeler:[___]  [导出 clips_labeled.csv]                    │
 ├────────────────┬───────────────────────────────────────────────┤
-│ 左：录制树      │ overview.png（整条录制）      │  3D 手（ipynb 同款）│
+│ 左：录制树      │ overview.png（整条录制）      │  3D 手（emg2pose 网格）│
 │ ▾ ax-0819/      │  EMG/pose-speed/matched      │   [手部图]          │
 │   20260428-left │  橙=clip，蓝竖线=playhead      │   与 playhead 同步   │
 │   ● ..114049 3/8│ transport:[▶][═══●══进度条══] 1.23/4.00s 1×        │
@@ -835,30 +830,29 @@ boot();
 - **overview 缺失时从中间数据重新生成**：默认优先用 `segment.py` 调好的静态 `overview.png`；**找不到时**（如 `--no-overview`、shard 命名对不上、新数据未切）后端用**同一个 `plot_overview_dual`** 从中间数据现生成——`env`/`pose_speed` 服务端算，burst 段取自 `segments.csv`，clip 段取自 `clips.csv`，阈值取自 `recordings.csv`，`clip_to_burst` 用 `matched_emg_seg_idx`——产物与切分时的图**逐像素同款**，缓存到 `overview_cache/{stem}.{png,json}`。现生成时**在渲染瞬间直接捕获坐标轴框** → playhead `ov_x0/ov_x1` 精确，无需检测。设 `OVERVIEW_REGEN=1`（如 `OVERVIEW_REGEN=1 ./pulse.sh label`）则**一律现生成**（忽略静态图，便于在服务端改样式而不必重切全量数据）。
 - **playhead 对位靠从 PNG 检测数据轴左右边（静态图时）**：`plot_overview_dual` 用 `tight_layout`，其左右边距既随 y 轴刻度宽度变，又会在标签拥挤时**失败回退到 matplotlib 默认 0.125/0.9**——所以固定常量必然偏（实测旧常量 0.049 在起点偏 ~11px）。后端 `_overview_xrange` 直接读 overview.png 里**海军蓝 pose-speed 曲线**横跨的列范围 = 数据轴 `x0..x1`（图像分数），~1px 精度、对 tight_layout 成功/失败都自洽（60/60 真实 overview 全检出），写进 `/api/recording` 的 `ov_x0/ov_x1`，缓存于 geometry v4。前端优先用它，检测失败才回退常量 `OVX0=0.054/OVX1=0.989`。
   > 早先做过浏览器内 Plotly 曲线版，但用户要看 overview.png 本身（信息更全：burst/clip/阈值/matched 行）。已**移除 Plotly 依赖**（手部与 overview 都是图片）。后端仍算 `curves`（pose_speed/EMG）但前端当前不用，保留以备回退。若要 playhead 像素级精确，可让 `plot_overview_dual` 落一个 `overview.bbox.json` 边距 sidecar，前端优先用它。
-- **3D 手 = emg2pose 手部网格(mesh)，前端 Plotly.js `Mesh3d` 渲染**：演进过——①最初 Plotly scatter3d 点线（Y 轴薄、看成侧面、看不清动作）→ ②服务端 matplotlib `draw_skeleton` 静态 PNG（清楚但点线、不能转）→ ③**现在用 `seg_vis_all.ipynb` 同款 `emg2pose.visualization` 的手部网格**：清晰的着色面 + **可旋转/缩放**(WebGL) + 与进度条同步。后端 `skin_vertices_np(profile, joint_angles[i])` 算 788 顶点(emg2pose 蒙皮，缓存 hand model 后 ~6ms/帧)；`/api/handmesh?stem=&i=` 发该帧顶点(int mm, ~12KB)落盘 `mesh_cache/{stem}/f{i}.json`，`/api/handfaces` 发三角面(1544，左右手相同，一次)。前端 `Plotly.newPlot` 一个 `Mesh3d`，scrub/播放时 `Plotly.restyle` 换顶点 x/y/z；`scene.uirevision` 保留用户旋转视角。左手用镜像 profile(`mirror_profile`，对应 ipynb 的 `flip`)。需 torch+emg2pose（环境已具备）。
-- **关键单位坑(deg→rad)**：Manus `*_ergonomics` 是**度**(range ~±60)，emg2pose 蒙皮/FK 要**弧度**。直接喂度会把五指拧成一团。`_mesh_prep` 里当 `max|ja|>2π` 判定为度并 `×π/180`（弧度数据如 emg2pose 自带 joint_angles 不受影响）。缓存目录加版本 `mesh_cache_v2` 让旧的(扭曲)缓存失效。⚠️ 同一坑也存在于聚类路径的 `hand3d` FK（`plot_cluster_hands` 等也喂了度）——本次未改，如要正确的聚类 3D 手图需同样转弧度。
+- **3D 手 = emg2pose 手部网格(mesh)，前端 Plotly.js `Mesh3d` 渲染**：演进过——①最初 Plotly scatter3d 点线（Y 轴薄、看成侧面、看不清动作）→ ②服务端 matplotlib `draw_skeleton` 静态 PNG（清楚但点线、不能转）→ ③**现在用 `emg2pose.visualization` 的手部网格**（早先参照过 `seg_vis_all.ipynb`，该 notebook 已删除）：清晰的着色面 + **可旋转/缩放**(WebGL) + 与进度条同步。后端 `skin_vertices_np(profile, joint_angles[i])` 算 788 顶点(emg2pose 蒙皮，缓存 hand model 后 ~6ms/帧)；`/api/handmesh?stem=&i=` 发该帧顶点(int mm, ~12KB)落盘 `cache/mesh_cache_v3/{stem}/f{i:04d}.json`，`/api/handfaces` 发三角面(左右手相同，一次)。前端 `Plotly.newPlot` 一个 `Mesh3d`，scrub/播放时把**预载到 `STATE.handVerts` 的顶点**用 `Plotly.restyle` 换 x/y/z（不是逐帧改 `<img>.src`）；`scene.uirevision` 保留用户旋转视角。左手用镜像 profile(`mirror_profile`)。需 torch+emg2pose（环境已具备）。
+- **关键单位坑(deg→rad)**：Manus `*_ergonomics` 是**度**(range ~±60)，emg2pose 蒙皮/FK 要**弧度**。直接喂度会把五指拧成一团。`_mesh_prep` 里当 `max|ja|>2π` 判定为度并 `×π/180`（弧度数据如 emg2pose 自带 joint_angles 不受影响）。缓存目录加版本号（`mesh_cache_v2` deg→rad 修复，`mesh_cache_v3` 改为按 `POSE_FPS` 变帧率采样）让旧的(扭曲/旧网格)缓存失效。⚠️ 同一坑也存在于聚类路径的 `hand3d` FK（`plot_cluster_hands` 等也喂了度）——本次未改，如要正确的聚类 3D 手图需同样转弧度。
 - **播放为什么之前"只在暂停时刷新"**：三个原因叠加，已全部修掉——
-  1. **没有浏览器预载**：播放时每帧改 `<img>.src` 触发网络加载，下一帧的 src 在上一张加载完前就把它**取消**了，于是只有停下来（暂停）最后一张才加载完。→ 现在前端 `preloadHands` 把全部帧用 `Image()` 预载进**浏览器缓存**，播放时换 src 命中缓存、瞬时上屏、不取消。
-  2. **后台预渲染线程抢 GIL**：原来 `/api/recording` 起一个线程连续 matplotlib 渲染，CPU 占满 GIL，把"当前帧"的按需请求饿死。→ 去掉后台线程，渲染改由前端预载请求驱动（受 `onload` 节流），`/api/handstatus` 改成数磁盘 PNG 数报进度。
-  3. **60fps 重排**：`setTime` 每个 rAF 调一次 `Plotly.relayout` 把主线程占满、图片解码上不了屏。→ 播放循环按真实时间推进但**节流到 ~25fps 才重绘**。
-- **同步引擎**（`app.js`）：单一时间 `STATE.t` 驱动 playhead（`#ovhead` CSS `left%`）+ 手部（`<img>.src` 按 `frame_times` 最近邻取帧，`curHandFrame` 去重）。拖动进度条/▶播放/点击 overview 都只改 `STATE.t` 后调 `setTime()`，天然同步。
-- **首次加载**：首帧 ~2.6s（load_skeleton），随后 600 帧在后台预载渲染（~50–120ms/帧）。手部图顶部一条**进度条**（`#handprog`，蓝色填充 + 「渲染手部 N/600」），渲完变绿显示「**渲染完成 ✓**」约 1.5s 后淡出；已渲染帧可立即 scrub/播放，未渲染帧按需即时补。整条录制全部缓存后再开秒进。
-- **左侧 3D 缓存标识**：每条录制名前一个小圆点——灰=无缓存 / 橙=部分 / 绿=已全部渲染；文件夹头显示 `🎬{已缓存录制数}`。后端按 `hand_frames/{stem}/` 的 PNG 数 vs 由时长推出的 `n_frames`（不读 npz）判定 `cached∈{0,1,2}`；前端随渲染进度（`markCached`）实时更新。
+  1. **没有浏览器预载**（PNG 时代）：播放时每帧改 `<img>.src` 触发网络加载，下一帧的 src 在上一张加载完前就把它**取消**了，只有暂停最后一张才加载完。→ 现在 3D 是 Plotly `Mesh3d`，前端 `preloadHands` 把**全部帧顶点**拉进 `STATE.handVerts`，播放时 `Plotly.restyle` 直接换 x/y/z，无网络往返。
+  2. **后台预渲染线程抢 GIL**：原来 `/api/recording` 起一个线程连续渲染，CPU 占满 GIL，把"当前帧"的按需请求饿死。→ 去掉后台线程，渲染改由前端预载请求驱动，`/api/handstatus` 改成数磁盘上的帧 JSON 报进度。
+  3. **60fps 重排**：`setTime` 每个 rAF 都重绘把主线程占满。→ 播放循环按真实时间推进但**节流到 ~25fps 才重绘**（`now - lastDraw >= 40`）。
+- **同步引擎**（`app.js`）：单一时间 `STATE.t` 驱动 playhead（`#ovhead` CSS `left%`）+ 手部（按 `frame_times` 最近邻取帧 `fi`，`curHandFrame` 去重后 `Plotly.restyle` 换顶点）。拖动进度条/▶播放/点击 overview 都只改 `STATE.t` 后调 `setTime()`，天然同步。
+- **首次加载**：首帧需 load_npz + 蒙皮，随后整条录制的帧在后台预载顶点。手部图顶部一条**进度条**（`#handprog`），渲完变绿显示「**渲染完成 ✓**」约 1.5s 后淡出；已渲染帧可立即 scrub/播放，未渲染帧按需即时补。整条录制全部缓存后再开秒进。
+- **左侧 3D 缓存标识**：每条录制名前一个小圆点——灰=无缓存 / 橙=部分 / 绿=已全部渲染；文件夹头显示 `🎬{已缓存录制数}`。后端按 `cache/mesh_cache_v3/{stem}/` 的帧 JSON 数 vs 由时长推出的 `n_frames`（不读 npz）判定 `cached∈{0,1,2}`；前端随渲染进度实时更新。
 - **底部段落条 `s1..sN`**：绿=已标 / 灰=未标 / 红框=`burst=-1` 复核；蓝色外框=当前打标目标。点 chip → 选中该段并把 playhead 跳到它的 **clip 起点**（`start_s`，对齐 overview 里该段左边缘；早先跳 apex 落在末尾的持姿期，易误以为"跳到结尾"）。保存后该 chip 立即变绿。
 - **overview 第三行（row3）显示全部 clip + burst**：上半=所有 clip（橙色，按时间 `s1..sN` 编号，与底部 chip **数量/编号一致**；matched 的更深更实，clip-only 的浅），下半=所有 burst（绿色 `b0..`）；段数 >40 时省略文字标号仅留色块。修了之前 row3 只画 matched 段导致与 chip 数量对不上的问题。改的是 `plot_overview_dual`（切分时也会用到），**要 `OVERVIEW_REGEN=1` 现生成或重跑 segment.py 才能在旧的静态图上看到新 row3**。
 
-> 单 clip 的 `/api/pose`（apex 起、clip 内更细的 60 帧）保留作备用，当前主视图走 `/api/recording`。
+> 原型里设想过单 clip 的 `/api/pose`（apex 起、clip 内更细的 60 帧），但**该路由从未实现**；当前主视图走 `/api/recording` + `/api/handmesh`（整条录制）。
 
-### 6.5.1 手渲染对齐 ipynb 的要点（务必保留）
+### 6.5.1 ⚠️ 中间版（matplotlib skeleton PNG）渲染要点 — 已被 emg2pose 网格取代
 
-后端 `_hand_prep` / `_render_hand` 必须复刻 notebook（`render_segmentation_60s.ipynb`）的变换，否则手"看不出动作"：
+> 下面描述的是**演进步骤 ②（服务端 matplotlib `draw_skeleton` 静态 PNG）**的对齐要点，**已不在当前代码路径里**：现在 3D 是 emg2pose 网格 `Mesh3d`（步骤 ③，见上文 §6.5）。`label_server.py` 已无 `_hand_prep`/`_render_hand`/`_frames_json`/`normalize_skeleton`/`axis_limits` 调用，也不再用 `draw_skeleton`。`render_segmentation_60s.ipynb` 已删除（仓库现仅存 `render_segmentation_30s.ipynb`）。保留本节仅记录历史上踩过的渲染坑：
 
-1. **米 → 毫米**：raw Manus `manus_*_skeleton` 的 XYZ 是**米**（±0.14 m）。渲染前 `normalize_skeleton(skel) * 1000.0`（与 notebook 一致）。FK 回退路径（`angles_batch_to_landmarks`）已是 mm，**不要再 ×1000**。
-2. **算 cube 前把 inf 变 nan**：raw 骨架含约 0.006% 的 `inf/nan`（遮挡丢帧）。整条录制做 `axis_limits` 时，`inf` 会让 `nanmin/nanmax` 返回 inf → cube span 退化成兜底的 1.0 → 手被缩成一点/裁掉。所以 `_hand_prep` 先 `arr[~isfinite]=nan` 再 `axis_limits(arr)`（`axis_limits` 忽略 nan、且对全坏有 span=1 兜底）。
-3. **视角**：`ax.view_init(elev=30, azim=-60)`（matplotlib 3D 默认 = notebook）。WebGL 时代用 Plotly 相机看成手的薄边（Y 轴仅 ±~40mm）→ 动作投影几乎为零，这正是之前"看不出动作"的根因；matplotlib 这个 3/4 俯视角把五指铺开，动作清晰。
+1. **米 → 毫米**：raw Manus `manus_*_skeleton` 的 XYZ 是**米**（±0.14 m），渲染前 ×1000。FK 回退路径（`angles_batch_to_landmarks`）已是 mm，**不要再 ×1000**。
+2. **算 cube 前把 inf 变 nan**：raw 骨架含约 0.006% 的 `inf/nan`（遮挡丢帧），`inf` 会让 `nanmin/nanmax` 返回 inf → cube span 退化成兜底的 1.0 → 手被缩成一点/裁掉。先 `arr[~isfinite]=nan` 再算范围。
+3. **视角**：matplotlib `ax.view_init(elev=30, azim=-60)` 3/4 俯视角把五指铺开、动作清晰；早先 Plotly 相机看成手的薄边（Y 轴仅 ±~40mm）→ 动作投影几乎为零，是"看不出动作"的根因（mesh 版用 `scene.uirevision`+合适默认相机解决）。
 
-> EMG / pose-speed 曲线**保持本项目 overview 的实现**（Plotly 双轴曲线 + clip 色块 + playhead），不回退成 notebook 的 matplotlib 三联面板——notebook 只作 3D 手渲染的参照。
-> 遗留的 `_frames_json()`（非有限坐标→`None`，JSON 合法化）仅服务于未用的 `/api/pose`，可保留备用。
+> EMG / pose-speed 曲线**保持本项目 overview 的实现**（overview.png 三行图 + playhead），不回退成 notebook 的 matplotlib 三联面板。
 
 ## 7. 打标交互设计要点
 
@@ -870,13 +864,13 @@ boot();
 | **过切 + 人工剔除** | 切分降低门槛多切（`POSE_PCT`/`MIN_STATIC_S`/`MIN_MOTION_S` 调低，见下），打标时把垃圾段按 `x`/「标记无效」剔除 |
 | **三态：未标/已标/无效** | 空标签=未看；填手势名=有效；`invalid=1`=看过且判为垃圾。三者在 chip/录制树/进度里区分（绿/✗灰/灰），"已看完"= 已标+无效 覆盖全部 clip |
 | **空标签 = 丢弃** | 未标与无效都不进真值集；区别是"无效"代表你已审阅过、不必再看 |
-| **3D 默认停在 apex 帧** | apex 是最到位的定型姿态（METHOD §6.2），一眼可辨；空格键播放看全过程 |
-| **overview + 时间轴条** | 给出该 clip 在整条录制里的位置和邻段关系，判断是否切碎/粘连 |
-| **6 帧 png 作快速参考** | 已有产物零成本复用；3D 没渲染成功时仍有图可看 |
+| **3D 默认停在 apex 帧** | apex 是最到位的定型姿态（METHOD §6.2），一眼可辨；播放看全过程 |
+| **overview + playhead + 段落条** | 给出该 clip 在整条录制里的位置和邻段关系，判断是否切碎/粘连；底部 `s1..sN` chip 与 overview 第三行编号一致 |
 | **自动保存 + 时间戳 + labeler** | 每次回车即落盘；多人协作可追溯谁标的 |
 
-**overview 高亮**：overview.png 由 matplotlib `tight_layout` 生成，数据区像素框不固定，**不在图上做像素级覆盖**；改用图下方一条 JS 时间轴条（按 `clip_start_s / rec_duration_s` 精确定位），既准又与 matplotlib 解耦。图里本来就画了 `c{clip_id}` 文字标号可对照。
-> 可选增强：让 `plot_overview_dual` 额外吐一个 `overview.bbox.json`（数据轴的 figure 分数坐标），前端就能在图上画精确高亮带。非必需。
+> ~~6 帧 png 作快速参考~~：原型设计，**当前 UI 不显示**（`/api/keyframes` 已移除），靠 emg2pose 网格的可旋转/逐帧播放替代。
+
+**overview 高亮（当前实现）**：3D 改为直接在 overview.png 上叠一根 CSS playhead 竖线（`#ovhead`）。playhead 的左右对位靠从 PNG 检测**海军蓝 pose-speed 曲线**横跨的列范围作数据轴边界 `ov_x0/ov_x1`（写进 `/api/recording`，~1px 精度，对 `tight_layout` 成功/失败都自洽），检测失败才回退常量 `OVX0=0.054/OVX1=0.989`。（原型曾设想图下方独立的 JS 时间轴条 + 可选 `overview.bbox.json` sidecar，均未采用。）
 
 ---
 
@@ -890,34 +884,34 @@ PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
 curl -L https://cdn.plot.ly/plotly-2.35.2.min.js -o webui/plotly.min.js
 #    b. 或把 index.html 里的 <script src="/plotly.min.js"> 改成 CDN 链接
 
-# 2) 跑服务（先确保 out_pose/ 已由 segment.py + export_clips.py 生成）
-$PY label_server.py --out out_pose --port 8000
+# 2) 跑服务（先确保 out_pose/ 已由 segment.py 生成 clips.csv/recordings.csv/shards）
+$PY label_server.py --out out_pose --host 127.0.0.1 --port 8000
 
 # 3) 浏览器打开 http://127.0.0.1:8000，开始打标
 # 4) 标完点"导出" → out_pose/clips_labeled.csv（即真值集）
 ```
 
-**接入 `pulse.sh`**（加一个子命令，和现有风格一致）：
+**接入 `pulse.sh`**：`label`/`label-prewarm` 子命令**已实现**（`cmd_label`/`cmd_label_prewarm`）。`cmd_label` 默认 `OVERVIEW_REGEN=1`（现生成 overview，因为 shard 里 baked 的静态图在 pose/plot 修复后会过时；设 `OVERVIEW_REGEN=0` 用静态图、首开更快），并传 `--host`/`--port`：
 
 ```bash
-# 在 pulse.sh 的 case 分支里加：
-  label)
-    : "${RAW_OUT:=out_pose}" ; : "${PORT:=8000}"
-    exec "$PY" label_server.py --out "$RAW_OUT" --port "$PORT" ;;
+# 大致逻辑（见 pulse.sh cmd_label）：
+  : "${PORT:=8000}" ; : "${HOST:=127.0.0.1}"
+  export OVERVIEW_REGEN="${OVERVIEW_REGEN:-1}"
+  exec "$PY" label_server.py --out "$RAW_OUT" --host "$HOST" --port "$PORT"
 ```
 
-用法：`PORT=8000 ./pulse.sh label`。RUNBOOK §A.5 的"填表"那步即可替换为本网页。
+用法：`PORT=8000 ./pulse.sh label`（`RAW_OUT` 默认 `out_pose`）。RUNBOOK §A.5 的"填表"那步即可替换为本网页。
 
 **可选：提前批量渲染手部帧（首开即秒进）**
 
 ```bash
-WORKERS=8 ./pulse.sh label-prewarm            # 渲染 out_pose/clips.csv 里全部录制
+WORKERS=8 ./pulse.sh label-prewarm            # 渲染 out_pose/clips.csv 里全部录制（默认 WORKERS=4）
 # 或子集：
 python prewarm_hands.py --out out_pose --workers 8 --limit 50
-python prewarm_hands.py --out out_pose --workers 8 --subject pgy-0226
+python prewarm_hands.py --out out_pose --workers 8 --subjects pgy-0226   # --subject 是已弃用的单值别名
 ```
 
-每条录制独立一个进程（matplotlib 进程内单线程），并行跨录制；幂等（已渲染的跳过）。落盘 `out_pose/hand_frames/`，与按需渲染同一缓存。约 ~30s/录制（单进程），8 进程 ~4s/录制。
+每条录制独立一个进程，并行跨录制；幂等（已渲染的跳过）。落盘 `out_pose/cache/mesh_cache_v3/{stem}/f*.json`（emg2pose 网格顶点，~12KB/帧），与按需渲染同一缓存。
 
 远程服务器场景：`ssh -L 8000:127.0.0.1:8000 user@host` 端口转发后本地浏览器访问，服务端仍 `--host 127.0.0.1` 不对外暴露。
 
@@ -927,16 +921,15 @@ python prewarm_hands.py --out out_pose --workers 8 --subject pgy-0226
 
 ```
 segment.py ──► clips.csv / recordings.csv / shards/*/overview.png
-export_clips.py ──► clips_export/{key}.npz + {key}.png        (6 帧参考)
-        │
+        │   (export_clips.py 仍可产出 clips_export/{key}.npz + .png，但打标 UI 不再读)
         ▼
-label_server.py（本工具）── 浏览器交互打标
-        │  POST /api/label → labels.csv（增量、可断点）
+label_server.py（本工具）── 浏览器交互打标（3D = emg2pose 网格）
+        │  POST /api/label → clip_labels.csv（增量、可断点）
         ▼  GET /api/export
-clips_labeled.csv  ＝ 真值集（替代 RUNBOOK §A.5 手填那份）
+clips_labeled/*.csv（按文件夹拆分）+ clips_labeled.csv（合并）＝ 真值集（替代 RUNBOOK §A.5 手填那份）
 ```
 
-`clips_labeled.csv` 列 = `clips.csv` 全列 + 填好的 `gesture_label` + `label_note`，下游用法与原约定一致（空标签丢弃、同名合并）。
+`clips_labeled.csv` 列 = `clips.csv` 全列 + 填好的 `gesture_label` + `label_note`，下游用法与原约定一致（空标签丢弃、同名合并；标为无效的整条录制被剔除）。
 
 ---
 
@@ -945,10 +938,10 @@ clips_labeled.csv  ＝ 真值集（替代 RUNBOOK §A.5 手填那份）
 | 项 | 处理 |
 |----|------|
 | clip 数很多（22 万+，5300 录制） | **按录制懒加载**（已实现）：`Store` 用 pandas groupby 建每条录制的汇总（无 22 万行 Python 循环，启动 ~2s）；`/api/recordings` 只发录制级汇总（~1.2MB）；某条录制的 clip 仅在 `/api/recording?stem=` 选中时从 df 切片构建。左侧列录制（带 `n_labeled/n_clips`、复核数、搜索/过滤），选中才载入其 clip（底部 s 段落条）。指向顶层 `out_pose2` 即可标全部，不卡。 |
-| 手部帧缓存大小 | 单帧 PNG ~13 KB → **单条录制 600 帧 ≈ 8 MB（磁盘 ~10 MB，含小文件块开销）**；落盘 `hand_frames/{stem}/f*.png`，**跨重启复用**，第二次打开秒进。100 条 ≈ 0.8 GB、1000 条 ≈ 8 GB、全量 ~9330 条 ≈ 73 GB（磁盘通常够，瓶颈是渲染时间）。 |
-| 首次打开慢（每条一次性） | 首帧 ~2.6s（`load_skeleton`）+ 后台逐帧渲染 ~50ms/帧；要"首开即秒进"用 `prewarm_hands.py` 提前批量渲染（见下）。 |
-| 源 npz 在慢 NFS | skeleton 只读 `manus_*_skeleton`+时间戳；缓存后不再读源 |
-| 无 torch | 自动走 skeleton 路径（raw 数据都有）；processed 数据无 skeleton 才需 torch 走 FK |
+| 手部网格缓存大小 | 每帧顶点 JSON ~12 KB；帧数 = `POSE_FPS`(默认 15)×时长、上限 `POSE_REC_MAX_FRAMES`(3000)。落盘 `cache/mesh_cache_v3/{stem}/f*.json`，**跨重启复用**，第二次打开秒进（磁盘通常够，瓶颈是蒙皮渲染时间）。 |
+| 首次打开慢（每条一次性） | 首帧需 load_npz + emg2pose 蒙皮（缓存 hand model 后 ~6ms/帧）+ 后台逐帧预载；要"首开即秒进"用 `prewarm_hands.py` 提前批量渲染（见 §8）。 |
+| 源 npz 在慢 NFS | 整条录制 load 一次（emg + joint_angles）算曲线 + 蒙皮；之后命中网格/几何缓存不再读源 |
+| 需要 torch + emg2pose | 手部网格走 emg2pose `skin_vertices_np`，**必须有 torch + emg2pose**（用其 python 跑即可，环境已具备）；不再有"无 torch 走 skeleton"的回退路径 |
 | 上游重跑改了 clips.csv | 标签按 `(source_file, clip_id)` 存，clip 数变了也能 re-join；重启服务重读 |
 | 并发写 | 单进程 + Lock + 原子替换；不建议多实例同写一个 `out_pose` |
 | 空标签语义 | 导出时空 `gesture_label` 原样保留（空=丢弃）；下游按约定过滤 |
@@ -957,47 +950,49 @@ clips_labeled.csv  ＝ 真值集（替代 RUNBOOK §A.5 手填那份）
 
 ## 11. 测试
 
-最小冒烟（沿用 `tests/` 风格，pytest）：
+> 注：`tests/test_label_server.py` **尚未实现**（仓库当前 98 个测试里没有它）。下面是建议的最小冒烟（aspirational，沿用 `tests/` 风格）：
 
 ```python
-# tests/test_label_server.py
+# tests/test_label_server.py  （未实现）
 def test_clip_key_matches_export():
-    from label_server import _clip_key
+    from label_server import _clip_key   # module-level helper, exists
     assert _clip_key("subj__sess__ts", 3) == "subj__sess__ts__c0003"
 
 def test_store_roundtrip(tmp_path):
-    # 造一个最小 clips.csv（含 source_path 指向一个含 skeleton 的小 npz），
-    # Store(tmp).set_label(key,'fist',...) 后断言 labels.csv 写出且 export() join 正确。
+    # 造一个最小 clips.csv（含 source_path 指向一个小 npz），
+    # Store(tmp).set_label(key,'fist',...) 后断言 clip_labels.csv 写出且 export() join 正确。
     ...
 ```
 
-手动验证清单：
+手动验证清单（按当前路由）：
 
-- [ ] `GET /api/clips` 行数 == `clips.csv` 行数，`review` 标记与 `matched_emg_seg_idx<0` 一致
-- [ ] 选中 clip → overview 显示、时间轴条位置正确、3D 可旋转、空格可播放
-- [ ] 回车保存 → `labels.csv` 立刻出现该行；刷新页面标签仍在（断点续标）
-- [ ] 导出 → `clips_labeled.csv` 行数 == clips.csv，`gesture_label` 已填
-- [ ] 无 torch 环境（raw 数据）3D 仍出图（skeleton 路径）
+- [ ] `GET /api/recordings` 录制数 == clips.csv 里不同 source_path 数；每条 `n_clips`/`n_review` 与切片一致
+- [ ] 选中录制 → overview 显示、playhead 对位正确、3D 网格可旋转、可播放、与进度条同步
+- [ ] 回车保存 → `clip_labels.csv` 立刻出现该行；刷新页面标签仍在（断点续标）
+- [ ] 标整条录制无效 → `invalid_recordings.csv` 出现该行；导出时被剔除
+- [ ] 导出 → `clips_labeled.csv` + `clips_labeled/*.csv` 出现，只含已标 clip，`gesture_label` 已填
 
 ---
 
 ## 12. 实施步骤清单
 
-1. `webui/` 放 `index.html` / `app.js`，下载 `plotly.min.js`（§6、§8）。
-2. 仓库根加 `label_server.py`（§5）。
-3. 确保 `out_pose/` 已有 `clips.csv` / `recordings.csv` / `shards/*/overview.png`（`./pulse.sh raw ...`），`clips_export/*.png` 可选。
-4. `$PY label_server.py --out out_pose` 起服务，浏览器自测（§11 清单）。
-5. `pulse.sh` 加 `label)` 子命令（§8）。
-6. 标完 `GET /api/export` → `clips_labeled.csv`，接回真值集流程。
-7. （可选）加 `test_label_server.py`、`pose_cache` 预热脚本、overview bbox 精确高亮。
+> 大部分已落地（见 §6.5/§8/§10）。当前实际形态：
+
+1. `webui/` 已有 `index.html` + `app.js`；`plotly.min.js` 未提交，本地放一份或靠 CDN 兜底（§6 头）。
+2. 仓库根的 `label_server.py`（import matplotlib + emg2pose；§6.5 为准，§5 是过时原型）。
+3. 确保 `out_pose/` 已有 `clips.csv` / `recordings.csv` / `shards/*/overview.png`（`./pulse.sh raw ...`）。
+4. `./pulse.sh label`（或 `$PY label_server.py --out out_pose`）起服务，浏览器自测（§11 清单）。
+5. `pulse.sh` 的 `label`/`label-prewarm` 子命令已实现（§8）。
+6. 标完 `GET /api/export` → `clips_labeled.csv` + `clips_labeled/*.csv`，接回真值集流程。
+7. （可选/待办）`prewarm_hands.py` 已有；`tests/test_label_server.py` 仍未实现。
 
 ---
 
 ## 13. 后续可选增强
 
 - **质检视图**：按 `gesture_label` 分组看同标签的 3D 缩略图墙，抓离群/错标。
-- **多人分工**：`/api/clips?assignee=` 按 labeler 切片；冲突检测（同 clip 多人标不一致时高亮）。
+- **多人分工**：按 labeler 切片录制/clip；冲突检测（同 clip 多人标不一致时高亮）。
 - **键盘流**：完全脱离鼠标（↑↓选段、数字键贴标签、回车跳下一个）。
 - **EMG/角度曲线**：在 3D 下方加该 clip 的 16 通道 EMG + 20 关节角小图（复用 `visualize_segment.py` 思路），辅助判断。
-- **撤销/历史**：`labels.csv` 已带时间戳，可加一个 `/api/undo` 回退上一次。
+- **撤销/历史**：`clip_labels.csv` 已带时间戳，可加一个 `/api/undo` 回退上一次。
 ```

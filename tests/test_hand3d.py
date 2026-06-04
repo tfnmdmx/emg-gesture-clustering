@@ -62,7 +62,9 @@ def test_mcp_flexion_shortens_index_tip_to_wrist():
 
 
 def test_side_changes_geometry():
-    """Left vs right should differ (emg2pose mirrors internally)."""
+    """Left vs right should differ: we run a left-hand FK and mirror X afterward
+    (emg2pose's internal right-hand init is avoided due to a shape-mismatch bug;
+    see hand3d._get_calculator), so right == left with X negated."""
     a = np.zeros(20, dtype=np.float32)
     a[5] = 0.6
     left = angles_to_landmarks(a, side="left")

@@ -108,22 +108,19 @@ def _render_keyframes_fk(out_path: str, ja_clip: np.ndarray,
                          side: str) -> None:
     """Render 6 keyframes via emg2pose FK from joint angles (requires torch)."""
     from emg_label.hand3d import angles_to_landmarks, draw_hand
+    from emg_label.skeleton import axis_limits
 
     lms = [angles_to_landmarks(ja_clip[i], side=side) for i in indices]
-    pts = np.concatenate(lms, axis=0)
-    mn, mx = pts.min(axis=0), pts.max(axis=0)
-    mid = (mn + mx) / 2.0
-    half = (mx - mn).max() / 2.0 * 1.05
-    lo, hi = mid - half, mid + half
+    lims = axis_limits(np.concatenate(lms, axis=0), margin_ratio=0.025)
     n = len(indices)
     fig = plt.figure(figsize=(2.4 * n, 2.6))
     for i, (lm, title) in enumerate(zip(lms, titles)):
         ax = fig.add_subplot(1, n, i + 1, projection="3d")
         draw_hand(ax, lm)
         ax.set_title(title, fontsize=8)
-        ax.set_xlim(lo[0], hi[0])
-        ax.set_ylim(lo[1], hi[1])
-        ax.set_zlim(lo[2], hi[2])
+        ax.set_xlim(*lims[0])
+        ax.set_ylim(*lims[1])
+        ax.set_zlim(*lims[2])
         ax.view_init(elev=25, azim=-60)
         try:
             ax.set_box_aspect((1, 1, 1))
@@ -174,8 +171,9 @@ def _write_index(path: str, entries_by_source: dict, fs: int) -> None:
             if e["png_rel"]:
                 img = f"<img src='{html.escape(e['png_rel'])}'>"
             else:
-                img = ("<em>no PNG &mdash; rerun with torch installed or use "
-                       f"<code>python visualize_segment.py {html.escape(e['npz_rel'])}</code></em>")
+                img = ("<em>no PNG &mdash; keyframe FK needs torch+emg2pose; "
+                       "install them and rerun. (visualize_segment.py also uses "
+                       "FK, so it needs torch too.)</em>")
             parts.append(f"<tr><td><div class=key>c{int(row['clip_id']):04d}</div></td>"
                          f"<td class=qc>{qc}</td><td>{img}</td></tr>")
         parts.append("</table>")
@@ -217,7 +215,9 @@ def main():
     png_disabled = args.no_png
     index_path = os.path.join(export_dir, "index.html")
 
-    fk_disabled = png_disabled  # FK fallback gets disabled separately on torch failure
+    # FK fallback is only reached inside the `if not png_disabled` render block,
+    # so it starts enabled and is disabled on the first torch ImportError.
+    fk_disabled = False
     for source_file, gdf in df.groupby("source_file"):
         # Resolve source path: prefer the absolute source_path column written
         # by segment.py; fall back to <input_dir>/<source_file> for older CSVs.

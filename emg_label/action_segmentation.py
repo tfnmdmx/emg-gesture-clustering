@@ -24,8 +24,10 @@ Two independent detectors, asymmetric fusion:
 One action = a motion run + its following REAL stable hold, right boundary at the
 next onset (segments tile seamlessly, no artificial pad, no hold cap).
 
-This module is standalone (imported by diag_seg.py for validation) and does NOT
-touch the production segment.py path until the diagnostic confirms the metrics.
+`segment_recording` is the production Stage-1 detector: segment.py calls it for
+every recording (the live `pulse.sh segment` / `raw-segment` path). diag_seg.py
+and tests/test_action_segmentation.py exercise the same entry point as validation
+harnesses.
 """
 
 import numpy as np
@@ -54,7 +56,7 @@ def _complement(runs, n):
 
 # ---------- NaN handling + absolute gate ------------------------------------
 
-def interpolate_short_nan_gaps(ja, fs, max_gap_s=0.20, min_finite_frac=0.5):
+def interpolate_short_nan_gaps(ja, fs, max_gap_s=0.20):
     """Per-channel linear-fill of internal NaN runs shorter than `max_gap_s`.
 
     Manus drops single/short frames during occlusion; if not filled BEFORE
@@ -242,7 +244,7 @@ def resolve_move_thresholds(spd, env, exit_e, cfg):
 
 # ---------- R7: back-to-back hold veto ---------------------------------------
 
-def _r7_splits(holds, bursts, env, enter, exit_e, spd, cfg, fs):
+def _r7_splits(holds, bursts, env, exit_e, spd, cfg, fs):
     """Normal-length pose-hold containing a clean EMG burst (>=min_action, with
     EMG-rest on both sides) actually spans two poses -> inject a cut at the
     muscle-relaxation minimum. R2 handles over-long runs; this catches the
@@ -284,7 +286,7 @@ def segment_recording(emg, ja, cfg):
     diagnostic plot.
     """
     fs = cfg.fs
-    ja = interpolate_short_nan_gaps(ja, fs, cfg.nan_max_gap_s, cfg.min_finite_frac)
+    ja = interpolate_short_nan_gaps(ja, fs, cfg.nan_max_gap_s)
     n = len(emg)
     spd = pose_speed(ja, fs, cfg.pose_smooth_ms)
     rest = np.nanmedian(ja, axis=0)
@@ -338,7 +340,7 @@ def segment_recording(emg, ja, cfg):
 
     # R7 back-to-back hold veto (off by default -- see Config.enable_r7)
     if cfg.enable_r7:
-        extra = _r7_splits(holds, bursts, env, enter, exit_e, spd, cfg, fs)
+        extra = _r7_splits(holds, bursts, env, exit_e, spd, cfg, fs)
         dbg["n_r7"] = len(extra)
         onsets += extra
 

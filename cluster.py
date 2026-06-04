@@ -65,48 +65,16 @@ def main():
 
     for group, gdf in seg_df.groupby("group"):
         feats, idxs, subs = [], [], []
-        # Per-source feature extraction. Prefer the cache that segment.py
-        # writes under out/features/{stem}.npz -- apex_pose_feature is a
-        # deterministic function of (joint_angles, start, hold_end, rest, fs),
-        # so cached and recomputed values are bit-identical.
+        # Per-source apex-feature extraction via the shared helper: it prefers the
+        # out/features/{stem}.npz cache segment.py writes (deterministic, bit-
+        # identical) and falls back to recompute with the same nan-aware rest.
         for fname, fdf in gdf.groupby("source_file"):
             subj = str(fname).split("__")[0]
             fdf = fdf.sort_values("start_sample")
-            stem = str(fname)
-            if stem.endswith(".npz"):
-                stem = stem[:-4]
-            cache_path = os.path.join(features_dir, stem + ".npz")
-            if os.path.isfile(cache_path):
-                d = np.load(cache_path)
-                feat_by_seg = {int(k): v
-                               for k, v in zip(d["seg_idx"], d["feature"])}
-                missing = [int(r["seg_idx"]) for _, r in fdf.iterrows()
-                           if int(r["seg_idx"]) not in feat_by_seg]
-                if missing:
-                    # Stale cache (e.g. params changed) -> recompute this file.
-                    print(f"features stale for {fname} "
-                          f"({len(missing)} seg_idx missing); recomputing")
-                    feat_by_seg = None
-                else:
-                    cache_hit += 1
-            else:
-                feat_by_seg = None
-
-            if feat_by_seg is None:
-                sp = (fdf["source_path"].iloc[0]
-                      if "source_path" in fdf.columns else None)
-                _, ja = io_utils.load_npz(
-                    io_utils.resolve_npz_path(fname, sp, args.input_dir))
-                rest = np.median(ja, axis=0)
-                feat_by_seg = {}
-                for _, row in fdf.iterrows():
-                    s = int(row["start_sample"])
-                    he = int(row["hold_end_sample"])
-                    feat_by_seg[int(row["seg_idx"])] = (
-                        features.apex_pose_feature(ja, s, he, rest, cfg.fs))
-                del ja
-                cache_miss += 1
-
+            feat_by_seg, hit = features.feature_by_seg(
+                fname, fdf, cfg.fs, features_dir, args.input_dir)
+            cache_hit += int(hit)
+            cache_miss += int(not hit)
             for ridx, row in fdf.iterrows():
                 feats.append(feat_by_seg[int(row["seg_idx"])])
                 idxs.append(ridx)
