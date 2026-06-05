@@ -2,6 +2,7 @@
 // loads its clips (the bottom s1..sN chips). Labelling acts on the current clip.
 let STATE = {
   recordings: [], recView: [], recIdx: 0,
+  folderPrefix: '',     // common path prefix stripped from folder labels
   expanded: new Set(),  // expanded folder keys in the left tree
   rec: null,            // loaded recording payload (segments=clips + frame grid)
   cur: null,            // currently selected clip (segment) = labelling target
@@ -14,8 +15,36 @@ let STATE = {
 
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
   .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-const folderShort = f => f.split('/').filter(Boolean).slice(-2).join('/') || f;
+// Folder label = path with the prefix shared by ALL recordings stripped, so the
+// common data root (e.g. .../processed_data, == DATA_ROOT) doesn't repeat on
+// every row. Computed once from the recordings list (STATE.folderPrefix); falls
+// back to the last path segment when nothing distinctive remains.
+function commonFolderPrefix(folders) {
+  const uniq = [...new Set(folders)].filter(Boolean);
+  if (uniq.length < 2) return '';            // one folder: nothing shared to strip
+  const segs = uniq.map(f => f.split('/'));
+  let i = 0;
+  while (segs.every(p => i < p.length - 1 && p[i] === segs[0][i])) i++;  // keep ≥1 tail seg
+  return segs[0].slice(0, i).join('/');
+}
+const folderShort = f => {
+  const pre = STATE.folderPrefix;
+  if (pre && f.startsWith(pre)) {
+    const s = f.slice(pre.length).replace(/^\/+/, '');
+    if (s) return s;
+  }
+  return f.split('/').filter(Boolean).slice(-2).join('/') || f;  // fallback: last 2 segs
+};
 const recShort = stem => { const p = stem.split('__'); return p.length > 1 ? p[p.length - 1] : stem; };
+// Source npz path trimmed to start at the data-root segment (e.g.
+// "processed_data/<batch>/<file>.npz"): strip everything ABOVE the shared
+// folder prefix's last segment, so the boring mount path doesn't show.
+function pathFromRoot(p) {
+  const pre = STATE.folderPrefix;            // e.g. /data/cl_data/ai-infra/processed_data
+  if (!pre) return p;
+  const parent = pre.slice(0, pre.lastIndexOf('/'));   // /data/cl_data/ai-infra
+  return (parent && p.startsWith(parent + '/')) ? p.slice(parent.length + 1) : p;
+}
 
 // Fallback overview data-axis edges (image fraction) when the server couldn't
 // detect them from the PNG; the per-recording ov_x0/ov_x1 are exact and preferred.
@@ -55,6 +84,7 @@ async function boot() {
   try {
     const d = await (await fetch('/api/recordings')).json();
     STATE.recordings = d.recordings || [];
+    STATE.folderPrefix = commonFolderPrefix(STATE.recordings.map(r => r.folder));
     STATE.labels_used = d.labels_used || [];
     STATE.total_clips = d.total_clips || 0;
     STATE.total_labeled = d.total_labeled || 0;
@@ -199,7 +229,34 @@ async function loadRecording(stem) {
   buildOverview(d);
   buildHand(d);
   renderChips();
+  renderOvInfo();
   updateRecInvalidBtn();
+}
+
+// Recording-level line above the overview. Line 1 = original npz path (from the
+// data root). Line 2 = this recording's segmentation QC / thresholds (lag, EMG &
+// pose-speed thresholds, seg_version) -- see docs/字段说明.md. All fields come
+// from the recordings-list entry (recordings table), so they're static per
+// recording; hover each chip for the raw column name + meaning.
+function renderOvInfo() {
+  const el = document.getElementById('ovinfo');
+  if (!el) return;
+  if (!STATE.rec) { el.innerHTML = ''; return; }
+  const d = STATE.rec;
+  const rec = STATE.recordings.find(r => r.stem === d.stem) || {};
+  const path = rec.source_path ? pathFromRoot(rec.source_path) : d.stem;
+  const num = (v, n) => (v == null ? '—' : (+v).toFixed(n));
+  const lag = rec.emg_pose_lag_s == null ? 'n/a' : num(rec.emg_pose_lag_s, 2) + 's';
+  const qc = [
+    `<span title="emg_pose_lag_s（lag_flag）：EMG包络与关节速度的互相关延迟（秒），正=EMG领先动作；本类准周期数据上 lag_flag 偏乐观，仅作诊断">延迟 ${lag}${rec.lag_flag ? `（${esc(rec.lag_flag)}）` : ''}</span>`,
+    `<span title="emg_pose_corr：上面延迟处的相关系数（越高越可信）">相关 ${num(rec.emg_pose_corr, 2)}</span>`,
+    `<span title="enter_thresh / exit_thresh：EMG包络的开 / 关阈值">EMG阈值 进/出 ${num(rec.enter_thresh, 1)}/${num(rec.exit_thresh, 1)}</span>`,
+    `<span title="pose_thresh / pose_exit_thresh：姿态速度的进入 / 退出阈值（rad/s）">姿态阈值 进/出 ${num(rec.pose_thresh, 2)}/${num(rec.pose_exit_thresh, 2)}</span>`,
+  ];
+  if (rec.seg_version) qc.push(`<span title="seg_version：切分参数版本（8位哈希）">切分版本 ${esc(rec.seg_version)}</span>`);
+  el.innerHTML =
+    `<div class=ovpath title="${esc(rec.source_path || '')}">${esc(path)}</div>` +
+    `<div class=ovbits>${qc.join(' · ')}</div>`;
 }
 
 // Version the URL by duration+frame count so a re-segmented/regenerated overview

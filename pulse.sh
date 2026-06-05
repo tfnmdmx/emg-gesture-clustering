@@ -159,15 +159,28 @@ cmd_label() {
   [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment <source>"
   # Regenerate overviews live by default: shard-baked static overview.png can be
   # stale after pose/plot fixes (units, axis caps). Set OVERVIEW_REGEN=0 to use
-  # the static ones (faster first open, but only correct right after segment).
+  # the static ones -- much faster first open (no per-open matplotlib re-render,
+  # ~10s on a loaded box), and correct as long as the shards were baked by the
+  # current segment.py. For large datasets, pre-warm the open-time caches first
+  # (with the SAME OVERVIEW_REGEN you serve with), then opens are instant:
+  #   OVERVIEW_REGEN=0 WORKERS=8 ./pulse.sh label-prewarm
   export OVERVIEW_REGEN="${OVERVIEW_REGEN:-1}"
   say "labelling UI: $OUT -> http://$HOST:$PORT (OVERVIEW_REGEN=$OVERVIEW_REGEN)"
+  local nwarm nrec
+  nwarm=$(ls "$OUT/cache/recording_cache" 2>/dev/null | wc -l)
+  nrec=$(ls "$OUT/shards" 2>/dev/null | wc -l)
+  if [ "$nrec" -gt 200 ] && [ "$nwarm" -lt "$((nrec / 2))" ]; then
+    warn "open-time caches are cold ($nwarm/$nrec warmed): first open of each"
+    warn "recording will be slow. Speed it up with OVERVIEW_REGEN=0 (serve the"
+    warn "baked overviews) and/or ./pulse.sh label-prewarm."
+  fi
   exec "$PY" label_server.py --out "$OUT" --host "$HOST" --port "$PORT"
 }
 
 cmd_label_prewarm() {
   : "${WORKERS:=4}"
-  say "prewarm hand-frame cache for $OUT (workers=$WORKERS)"
+  export OVERVIEW_REGEN="${OVERVIEW_REGEN:-1}"   # warm the same caches label serves
+  say "prewarm open-time + hand-frame caches for $OUT (workers=$WORKERS, OVERVIEW_REGEN=$OVERVIEW_REGEN)"
   exec "$PY" prewarm_hands.py --out "$OUT" --workers "$WORKERS" "$@"
 }
 

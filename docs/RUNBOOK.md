@@ -161,6 +161,8 @@ $PY segment.py --meta reference/sample_meta.csv --out out --allow-force
 
 `segment` 产物里 `recordings.csv`（每条录制一行）带一批 QC 列。这些列仍在 `recordings` 表里供临时查询；它们**不门控**任何下游步骤——切分把所有合格 clip 都写进 db，复核/排除靠 Web UI 的 invalid。
 
+> 每一列（recordings / clips / bursts / annotations 四张表）+ 打标网页面板字段的逐列释义见 [字段说明.md](字段说明.md)。
+
 | 列                                              | 怎么用                                                       |
 |-------------------------------------------------|--------------------------------------------------------------|
 | `lag_flag`                                      | 全局 EMG↔pose 互相关的诊断标签（`ok`/`early`/`late`/`nan`）。**已知在本类准周期数据上有偏**（持姿期 EMG 才达峰，互相关易把绝大多数判成 `ok`），只作诊断参考 |

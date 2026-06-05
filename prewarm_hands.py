@@ -1,14 +1,22 @@
 #!/usr/bin/env python
-"""Pre-render hand-frame PNGs for the labelling UI so first open is instant.
+"""Pre-warm the labelling-UI caches so opening a recording is instant.
 
-The label server skins each recording's hand frames on demand (emg2pose) and
-caches them as vertex JSON to ``<out>/cache/mesh_cache_v3/{stem}/f*.json``
-(~12 KB/frame; frame count scales with POSE_FPS and duration). That cache
-persists across restarts, so a recording is only slow the *first* time it's
-opened. This script warms that cache ahead of time for every recording in
-``<out>/clips.csv`` (or a subset), in parallel across recordings -- one process
-per recording keeps the renderer single-threaded inside each worker (it's not
-thread-safe) while still using all cores.
+Each recording open costs two things the server otherwise computes lazily:
+  1. Geometry + overview: pose-speed/EMG curves and the overview image (the
+     latter re-rendered via matplotlib when OVERVIEW_REGEN=1) -- several seconds
+     each, ~10s on a loaded box. Cached to ``<out>/cache/recording_cache`` and
+     ``<out>/cache/overview_cache``. This is the "white screen at open" cost.
+  2. 3D hand frames: emg2pose skins each frame on demand and caches the vertex
+     JSON to ``<out>/cache/mesh_cache_v3/{stem}/f*.json`` (~12 KB/frame; frame
+     count scales with POSE_FPS and duration) for jitter-free playback.
+
+Both caches persist across restarts, so a recording is only slow the *first*
+time it's opened. This script warms both ahead of time for every recording in
+``<out>`` (or a subset), in parallel across recordings -- one process per
+recording keeps the renderer single-threaded inside each worker (it's not
+thread-safe) while still using all cores. It honours OVERVIEW_REGEN, so warm
+with the SAME value you launch the server with (``OVERVIEW_REGEN=0`` reads the
+fast baked shard overviews; ``=1`` regenerates them).
 
 Usage:
     python prewarm_hands.py --out out_pose --workers 8
@@ -34,6 +42,16 @@ def _init(out_dir):
 
 def _do(stem):
     try:
+        # 1) Warm the recording geometry + overview cache so the *first open*
+        #    paints instantly. Without this the UI recomputes pose-speed/EMG
+        #    curves and (when OVERVIEW_REGEN=1) re-renders the overview via
+        #    matplotlib on every open -- several seconds each, ~10s on a loaded
+        #    box -- which is the real "white screen, spinner" at open time.
+        #    _recording_geometry honours OVERVIEW_REGEN: =1 regenerates+caches
+        #    the overview (correct after plot/unit fixes), =0 reads the baked
+        #    shard overview.png (fast), so warm whichever the server will serve.
+        _STORE.recording(stem)
+        # 2) Warm the per-frame 3D hand-mesh cache for jitter-free playback.
         _, _, nfr, _ = _STORE._mesh_prep(stem)
         new = 0
         for i in range(nfr):

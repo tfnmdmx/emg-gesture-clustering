@@ -145,6 +145,22 @@ def _clip_key(stem: str, clip_id) -> str:
     return f"{stem}__c{int(clip_id):04d}"
 
 
+def _jnum(x):
+    """JSON-safe number: finite float, else None (NaN / inf / '' / non-numeric)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
+def _jstr(x) -> str:
+    """JSON-safe string ('' for None / NaN)."""
+    if x is None or (isinstance(x, float) and not np.isfinite(x)):
+        return ""
+    return str(x)
+
+
 # ----------------------------------------------------------------------------
 # State: load clips.csv once, build key->row index, load existing labels.
 # A single lock guards label writes (server is the only writer).
@@ -190,9 +206,11 @@ class Store:
         df["source_file"] = df["source_file"].astype(str)
         self.df = df
 
-        # recording durations / pose threshold for timeline context (from db)
+        # recording durations / thresholds / lag QC / seg_version for the
+        # overview info line (from the recordings table).
         rec_dur, rec_pose_thr, rec_enter, rec_exit = {}, {}, {}, {}
         rec_pose_exit = {}
+        rec_lag, rec_corr, rec_lagflag, rec_segver = {}, {}, {}, {}
         r = pd.read_sql_query("SELECT * FROM recordings", self.conn)
         if not r.empty:
             sfk = r["source_file"].astype(str)
@@ -200,7 +218,11 @@ class Store:
             for col, dst in [("pose_thresh", rec_pose_thr),
                              ("pose_exit_thresh", rec_pose_exit),
                              ("enter_thresh", rec_enter),
-                             ("exit_thresh", rec_exit)]:
+                             ("exit_thresh", rec_exit),
+                             ("emg_pose_lag_s", rec_lag),
+                             ("emg_pose_corr", rec_corr),
+                             ("lag_flag", rec_lagflag),
+                             ("seg_version", rec_segver)]:
                 if col in r.columns:
                     dst.update(zip(sfk, r[col]))
 
@@ -232,6 +254,10 @@ class Store:
                 "pose_exit_thresh": float(rec_pose_exit.get(sf, float("nan"))),
                 "enter_thresh": float(rec_enter.get(sf, float("nan"))),
                 "exit_thresh": float(rec_exit.get(sf, float("nan"))),
+                "emg_pose_lag_s": rec_lag.get(sf),
+                "emg_pose_corr": rec_corr.get(sf),
+                "lag_flag": rec_lagflag.get(sf),
+                "seg_version": rec_segver.get(sf),
                 "row_idx": gidx[source_path],
                 "n_clips": int(a["n_clips"]), "n_review": int(a["n_review"]),
                 # expected hand-frame count (== len(fidx)) from duration alone,
@@ -310,6 +336,7 @@ class Store:
             cached = 2 if (nfr and cnt >= nfr) else (1 if cnt > 0 else 0)
             recs.append({
                 "stem": stem, "source_file": sf, "folder": st["folder"],
+                "source_path": st["source_path"],
                 "subject": st["subject"], "hand": st["hand"],
                 "group": st["group"], "n_clips": st["n_clips"],
                 "n_review": st["n_review"],
@@ -317,6 +344,15 @@ class Store:
                 "n_invalid": self.invalid_count.get(sf, 0),
                 "rec_invalid": sf in self.invalid_recordings,
                 "cached": cached,    # 0 none / 1 partial / 2 full 3D cache
+                # recording-level segmentation QC for the overview info line
+                "emg_pose_lag_s": _jnum(st.get("emg_pose_lag_s")),
+                "emg_pose_corr": _jnum(st.get("emg_pose_corr")),
+                "lag_flag": _jstr(st.get("lag_flag")),
+                "enter_thresh": _jnum(st.get("enter_thresh")),
+                "exit_thresh": _jnum(st.get("exit_thresh")),
+                "pose_thresh": _jnum(st.get("pose_thresh")),
+                "pose_exit_thresh": _jnum(st.get("pose_exit_thresh")),
+                "seg_version": _jstr(st.get("seg_version")),
             })
         return {"fs": FS, "labels_used": used, "recordings": recs,
                 "total_clips": int(len(self.df)),
@@ -973,12 +1009,39 @@ def make_handler(store: Store):
     return H
 
 
+def _ensure_plotly_vendored():
+    """Vendor webui/plotly.min.js from the installed plotly package if it's
+    missing. The frontend prefers this local copy and only falls back to the
+    CDN when it's absent -- but the CDN is 4.5MB and unreachable on offline /
+    locked-down boxes, leaving the 3D hand panel spinning forever. The plotly
+    pip package already ships the same minified bundle, so copy it once on
+    startup. Best-effort: a failure just leaves the existing CDN fallback."""
+    dst = os.path.join(WEBUI_DIR, "plotly.min.js")
+    if os.path.isfile(dst):
+        return
+    try:
+        import importlib.util
+        import shutil
+        spec = importlib.util.find_spec("plotly")
+        if spec is None or not spec.origin:
+            return
+        src = os.path.join(os.path.dirname(spec.origin),
+                           "package_data", "plotly.min.js")
+        if os.path.isfile(src):
+            shutil.copyfile(src, dst)
+            print(f"vendored plotly.min.js -> {dst}")
+    except Exception as ex:
+        print(f"note: could not vendor plotly.min.js ({ex}); "
+              "3D hand will fall back to the CDN")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="out_pose")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
+    _ensure_plotly_vendored()
     store = Store(args.out)
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(store))
     print(f"Labelling {len(store.df)} clips across {len(store.by_stem)} "

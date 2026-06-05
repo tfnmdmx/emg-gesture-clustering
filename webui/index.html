@@ -10,6 +10,9 @@
   body{font-family:-apple-system,Segoe UI,sans-serif;margin:0;color:#222;height:100vh;display:flex;flex-direction:column}
   #top{display:flex;gap:14px;align-items:center;padding:8px 14px;background:#f4f4f4;border-bottom:1px solid #ddd;font-size:13px;flex-wrap:wrap}
   #main{flex:1;display:flex;min-height:0}
+  /* right column holds center + the labelling bar, so the bar only spans the
+     center width and the left #list stretches full-height to the page bottom */
+  #right{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
   #list{width:320px;overflow:auto;border-right:1px solid #eee;font-size:12px}
   #list .folder{padding:5px 8px;background:#eef1f4;border-bottom:1px solid #e0e0e0;cursor:pointer;font-weight:600;position:sticky;top:0;word-break:break-all}
   #list .folder small{font-weight:400;color:#666}
@@ -26,7 +29,10 @@
   #list .row.review{border-left:4px solid #c62828}
   #list .row.todo{border-left:4px solid #ccc}
   #list .row.recinvalid{border-left:4px solid #444;text-decoration:line-through;opacity:.55}
-  #center{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}
+  #center{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0;min-height:0}
+  #ovinfo{font-size:12px;line-height:1.5;word-break:break-all}
+  #ovinfo .ovpath{font-family:ui-monospace,Menlo,Consolas,monospace;color:#1a73e8;font-size:11px}
+  #ovinfo .ovbits{color:#555}
   #viz{display:flex;gap:10px;align-items:flex-start}
   #ovwrap{position:relative;flex:1;min-width:0;cursor:pointer}
   #ovimg{width:100%;display:block;border:1px solid #ddd}
@@ -75,7 +81,9 @@
 </div>
 <div id=main>
   <div id=list></div>
+  <div id=right>
   <div id=center>
+    <div id=ovinfo></div>
     <div id=viz>
       <div id=ovwrap>
         <img id=ovimg alt="overview">
@@ -98,8 +106,7 @@
     </div>
     <div id=segchips></div>
   </div>
-</div>
-<div id=bottom>
+  <div id=bottom>
   <div id=meta class=qc></div>
   <div class=field><label>gesture_label</label>
     <input id=label list=labellist autocomplete=off><datalist id=labellist></datalist></div>
@@ -109,5 +116,7 @@
   <button class=btn id=recinvalid title="整条录制无效，不参与打标/聚类/导出 (Shift+X)">整条录制无效 (X)</button>
   <button class=btn id=droprec title="永久删除该录制（删 shard + 索引行，并 tombstone 防重切分复活；不可撤销）">删除录制</button>
   <div class=qc><div id=hotkeys>⏎ 保存并下一个 · x 标记无效段 · Shift+X 整条录制无效 · ↑↓ 切换段 · 空格 播放/暂停 · 1-9 套用常用标签</div><div id=common></div></div>
+  </div>
+  </div>
 </div>
 <script src="/app.js"></script>
