@@ -11,7 +11,7 @@ and whole-recording invalid marks are written to the db `annotations` table
 anchor (clip_start_sample, clip_end_sample, seg_version). /api/export writes
 clips_labeled.csv (clips JOIN annotations). /api/drop_recording permanently
 deletes a recording (rows + annotations + tombstone + shard). Uses matplotlib +
-emg2pose for server-side 3D, like export_clips.
+emg2pose for server-side 3D hand rendering.
 """
 from __future__ import annotations
 

@@ -42,6 +42,18 @@ def test_parse_file_info_accepts_real_processed_hand():
     assert info.group == "fgw-0917-left"
 
 
+def test_parse_file_info_extracts_date():
+    # processed: date in the session part
+    assert parse_file_info(
+        "/x/fgw-0917__20260502-left-7__20260502_115218.npz").date == "20260502"
+    # batch dir with bare-timestamp file: date from the timestamp
+    assert parse_file_info(
+        "/x/fgw0917_0502_left/20260502_115218.npz").date == "20260502"
+    # date prefix-matching used by --dates (day / month / year)
+    d = parse_file_info("/x/s__20260502-left__20260502_1.npz").date
+    assert d.startswith(("20260502", "202605", "2026"))
+
+
 def test_side_from_meta_prefers_explicit_hand():
     # explicit hand wins even when group has no side (GROUP_BY=all -> 'all').
     assert side_from_meta({"hand": "right", "group": "all"}) == "right"

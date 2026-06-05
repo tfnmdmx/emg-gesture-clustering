@@ -18,6 +18,21 @@ class FileInfo:
     hand: str | None
     group: str
     parsed: bool
+    date: str = ""          # recording date YYYYMMDD ('' if not parseable)
+
+
+# A recording date YYYYMMDD anywhere in a name (the session part or the
+# timestamp), e.g. 20260502. Used for --dates / --date-from / --date-to.
+_DATE_RE = re.compile(r"(20\d{6})")
+
+
+def _date_of(*texts) -> str:
+    """First YYYYMMDD found across the given strings (session part, timestamp)."""
+    for t in texts:
+        m = _DATE_RE.search(str(t))
+        if m:
+            return m.group(1)
+    return ""
 
 
 _SESSION_RE = re.compile(
@@ -82,7 +97,8 @@ def parse_file_info(path: str) -> FileInfo:
         elif hand_lower.startswith("both"):
             hand = "both"
         if hand is not None:
-            return FileInfo(path, stem, subject, hand, f"{subject}-{hand}", True)
+            return FileInfo(path, stem, subject, hand, f"{subject}-{hand}", True,
+                            date=_date_of(parts[1], parts[-1]))
 
     # --- Raw: hand lives in parent dir like 20260423-left[-batch] ---
     session_dir = p.parent.name
@@ -92,7 +108,8 @@ def parse_file_info(path: str) -> FileInfo:
         hand = m.group("hand").lower()
         subject = subject_dir
         synth = f"{subject}__{session_dir}__{stem}"
-        return FileInfo(path, synth, subject, hand, f"{subject}-{hand}", True)
+        return FileInfo(path, synth, subject, hand, f"{subject}-{hand}", True,
+                        date=m.group("date"))
 
     # --- Processed batch dir: subject in the dir name (no hyphen), bare ts file ---
     bm = _BATCH_RE.match(session_dir)
@@ -103,10 +120,12 @@ def parse_file_info(path: str) -> FileInfo:
         hand = next((h for h in rest if h in ("left", "right", "both")), None)
         synth = f"{subject}__{session_dir}__{stem}"
         group = f"{subject}-{hand}" if hand else subject
-        return FileInfo(path, synth, subject, hand, group, True)
+        # date from the bare-timestamp filename (full YYYYMMDD), else the dir.
+        return FileInfo(path, synth, subject, hand, group, True,
+                        date=_date_of(stem, session_dir))
 
     warnings.warn(f"Cannot parse filename, treating as own group: {stem}")
-    return FileInfo(path, stem, None, None, stem, False)
+    return FileInfo(path, stem, None, None, stem, False, date=_date_of(stem))
 
 
 def group_files(paths: list[str]) -> dict[str, list[FileInfo]]:
@@ -319,8 +338,9 @@ def load_skeleton(path: str, hand: str | None = None) -> np.ndarray | None:
     timestamp-aware interpolation as ``load_npz``, and returned so they can
     be indexed identically to the ``(emg, joint_angles)`` arrays.
 
-    Used by ``export_clips.py`` for keyframe rendering without depending on
-    torch / emg2pose FK: raw Manus data carries the skeleton directly.
+    Used by the skeleton renderers (e.g. cluster_traj.py medoid keyframe strips)
+    without depending on torch / emg2pose FK: raw Manus data carries the skeleton
+    directly.
     """
     p = Path(path)
     d = np.load(p, allow_pickle=True)
@@ -436,11 +456,15 @@ def parse_meta_csv(meta_path: str) -> list[FileInfo]:
             side = (row.get("side") or "").strip().lower()
             sample_id = (row.get("sample_id") or "").strip()
             stem = sample_id or Path(path).stem
+            # date for the --dates/--date-from/--date-to filter: prefer an
+            # explicit 'date' column, else dig a YYYYMMDD out of the id/path.
+            date = (row.get("date") or "").strip() or _date_of(stem, path)
             sides = (["left", "right"] if side == "both"
                      else [side] if side in ("left", "right")
                      else [None])
             for hand in sides:
                 group = (f"{subject}-{hand}" if subject and hand else
                          stem)
-                out.append(FileInfo(path, stem, subject, hand, group, True))
+                out.append(FileInfo(path, stem, subject, hand, group, True,
+                                    date=date))
     return out

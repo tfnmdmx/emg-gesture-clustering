@@ -56,7 +56,7 @@
 4. 对 20 列分别 `np.interp(emg_t, pose_t, ja[:, d])` → 返回 (T_e, 16)+(T_e, 20)，下游零改动。
 5. **单位归一到弧度**：Manus ergonomics 存的是**度**，`load_npz` 在加载时若检测到取值明显超过 `2π` 就整体乘 `π/180` 转弧度，使两种布局统一为弧度。**因此 `pose_speed`、`move_enter/move_exit` 等阈值的单位都是 rad/s（不是 deg/s）**，下游（apex 特征、emg2pose 蒙皮）一律按弧度处理。
 
-骨骼数据通过 `io_utils.load_skeleton(path, hand)` 单独加载，同样对齐到 EMG 轴；用于 `export_clips.py` 的关键帧渲染（无 torch 依赖）。
+骨骼数据通过 `io_utils.load_skeleton(path, hand)` 单独加载，同样对齐到 EMG 轴；用于 `cluster_traj.py` 的 medoid 关键帧条渲染（无 torch 依赖）。
 
 `fs=2000` 是 EMG 采样率，约定为整条流水线的统一时间网格。
 
@@ -69,7 +69,6 @@
 本项目**从 reference 借用**：
 
 - pose-speed 信号（§3.1）与鲁棒阈值 `robust_threshold`（§3.2）——live 检测器仍直接复用这两个函数
-- 6 帧关键帧渲染思路（§8）
 - 数据源约定：默认只用 `/mnt/pose_data/`，跳过 `/mnt/force_data/`（除非 `--allow-force`）
 
 本项目**额外有**：
@@ -451,6 +450,7 @@ for group, gdf in clips.groupby("group"):    # group = "subject-hand"
 
 - 手动 `--k 18`（覆盖 `--k-min`/`--k-max`），或不传走 silhouette 在 `[k_min, k_max]`（默认 `[12, 30]`）扫。
 - 固定 `--k` 若大于该组样本数会被 `clustering.select_k_and_cluster` 钳到 `n-1` 并打印告警。
+- **大规模子采样**：silhouette 建 O(n²) 距离矩阵，pooled run（`GROUP_BY=all`，可达几十万 clip）会 OOM/卡死；`select_k_and_cluster` 对 n>10000 自动 `sample_size=10000` 子采样评分（KMeans 仍用全量点聚，只有质量分用随机子样本估计，无偏），`evaluate.py` 的 pose-space silhouette 同理。`plot_cluster_features.py`（`qc`：逐样本 silhouette + t-SNE）**尚未**做大 N 适配，几十万 clip 的 pooled run 上慎用。
 - **K 宁大勿小**：过聚类（同一手势拆两簇）影响小——标签独立于簇，评估时两簇都映射到同一手势仍算正确；欠聚类（两手势并一簇）才真正损失信息、不可恢复。
 
 ### 7.4 打标驱动评估（`evaluate.py`，按 run）
@@ -463,14 +463,17 @@ for group, gdf in clips.groupby("group"):    # group = "subject-hand"
 
 ---
 
-## 8. 真值集构建工作流（推荐主路径）
+## 8. 真值集构建工作流
+
+整条流水线是**单一流程、单一输出目录 `OUT`**（默认 `out`）：`segment.py` 自动识别数据形态（处理后扁平 npz、原始 `{subject}/{date-hand}/{stamp}.npz` 目录树递归扫描、或一份 `sample_meta.csv`，见 §0），所以只有一个 `segment` 命令、一个 `OUT`，不再有「raw 浏览 vs processed 聚类」两条流程或两个输出目录之分。复核与打标统一走网页 UI（`label_server.py`），不再有静态关键帧画廊。
 
 ```
 segment.py ──► OUT/shards/{stem}/{recording,bursts,clips}.csv + overview.png
             └► OUT/index.db  (recordings / bursts / clips 表)  ← 权威索引
             └► 顶层便捷 OUT/{recordings,bursts,clips}.csv
 
-      ↓ ./pulse.sh label  (label_server.py 网页 UI，读 index.db 的 clips)
+      ↓ ./pulse.sh label  (label_server.py 网页 UI，读 OUT/index.db 的 clips；
+                            每条录制渲染一只可实时旋转的 3D 手)
 
 annotations 表  ← 每个 clip 的 gesture_label / invalid（带 seg_version anchor）
                   + 整条录制 invalid（软排除）/ drop（永久删 + tombstone）
@@ -483,16 +486,7 @@ OUT/labeled_overview/{stem}.png   (每录制已标 clip 的 overview)
 
 打标的真值活在 `annotations` 表，**不再**回填到 clips.csv 的 gesture_label 列（该列已移除）。`store.labeled_view` 把 clips 与标签 LEFT JOIN 成实时视图，并已剔除 invalid 录制/clip。
 
-> 旁路（flow A，raw 数据浏览）：`export_clips.py` 把每个 clip 导成 `clips_export/{stem}/c0000.npz` + 6 帧关键帧 PNG + `index.html` 总览（`clip_start → pre-motion → motion 1/3 → motion 2/3 → apex → clip_end`），用于无 UI 时的离线浏览（`./pulse.sh raw-export`）。**注意**：它读顶层 `clips.csv` 时仍按**旧列名**（`clip_start_sample` / `static_in_*` / `static_out_*` / `matched_emg_seg_idx`），这些列已在新 schema 中移除（§9.2），故该旁路目前与新 `clips.csv` 不兼容；统一打标 UI（`./pulse.sh label`）是推荐路径。
-
-### 8.1 6 帧渲染的两条路径
-
-[export_clips.py:_render_keyframes_*](../export_clips.py)：
-
-1. **skeleton 路径（首选，无 torch）**：raw npz 含 `manus_*_skeleton`（25 关节 XYZ+四元数），直接画 XYZ 连线。[emg_label/skeleton.py](../emg_label/skeleton.py) 提供连接表和 `draw_skeleton(ax, xyz)`。生产环境无 torch 也能出图。
-2. **emg2pose FK 路径（fallback）**：处理后数据无 skeleton，从 joint_angles 走 FK 渲染（需要 torch）。
-
-策略：每条录制优先 skeleton，缺则回 FK；FK 首次失败后整轮跑禁用 FK，不再无谓尝试。
+> 复核与打标只走网页 UI（`./pulse.sh label` → `label_server.py`），它直接读 `OUT/index.db` 的 clips，每条录制渲染一只**可实时旋转的 3D 手**逐帧浏览。早期那套离线静态画廊（`export_clips.py` 把每个 clip 导成 6 帧关键帧 PNG + `index.html` 到 `clips_export/`）已删除——3D 手网页 UI 是唯一的复核/打标入口。
 
 ---
 
@@ -568,17 +562,6 @@ OUT/labeled_overview/{stem}.png   (每录制已标 clip 的 overview)
 | `label, source_file, clip_id, start_sample, end_sample, fs, hand`                               | 标注与溯源（`hand` 显式写入，供下游可视化取镜像侧）  |
 
 （按手势归档；旧的"按簇 (group, cluster_id)→label 映射、导出到 `segments/<label>/`"流程已废除。）
-
-### 9.6 单 clip 导出 npz（`export_clips.py`，flow A 浏览旁路）
-
-| 键                                                                                                                              | 内容                                                   |
-|---------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------|
-| `emg, joint_angles`                                                                                                             | (clip_len, 16)+(clip_len, 20) 完整 clip 切片           |
-| `fs, clip_start, clip_end`                                                                                                      | 时间锚点                                               |
-| `static_in_start/end, motion_start/end, static_out_start/end, apex`                                                             | 子结构（绝对 sample 索引）                             |
-| `source_file, group, subject, hand, clip_id, matched_emg_seg_idx`                                                               | 溯源                                                   |
-
-兼容 `visualize_segment.py` 做单段深度可视化。
 
 ---
 

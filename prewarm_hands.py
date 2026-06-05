@@ -57,16 +57,26 @@ def main():
                          "selector as segment.py / pulse.sh SUBJECTS.")
     ap.add_argument("--subject", default=None,
                     help="(deprecated alias for a single --subjects id)")
+    ap.add_argument("--first-per-folder", action="store_true",
+                    help="only the FIRST recording of each folder (the left-tree "
+                         "grouping in the UI) -- one representative per folder so "
+                         "every folder opens instantly.")
     args = ap.parse_args()
 
     store = L.Store(args.out)
-    stems = list(store.by_stem)
+    stems = sorted(store.by_stem)         # deterministic order
     subjects = args.subjects or args.subject
     if subjects:
         want = {io_utils.normalize_subject(s)
                 for s in subjects.split(",") if s.strip()}
         stems = [s for s in stems
                  if io_utils.normalize_subject(s.split("__")[0]) in want]
+    if args.first_per_folder:
+        first = {}                        # folder -> first (sorted) stem
+        for s in stems:
+            first.setdefault(store.by_stem[s]["folder"], s)
+        stems = sorted(first.values())
+        print(f"first-per-folder: {len(stems)} folders")
     if args.limit:
         stems = stems[:args.limit]
     if not stems:

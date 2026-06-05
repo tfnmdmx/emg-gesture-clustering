@@ -7,11 +7,20 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
 
+# silhouette_score builds an O(n^2) pairwise-distance matrix; on pooled runs
+# (GROUP_BY=all) n can be 200k+, which would OOM/hang. Subsample the metric above
+# this size (the labels still come from KMeans over ALL points; only the quality
+# score is estimated on a random subsample, which is unbiased for this purpose).
+_SIL_MAX = 10000
+
+
 def select_k_and_cluster(X, k_min: int, k_max: int, random_state: int = 0):
     X = np.asarray(X, dtype=float)
     n = X.shape[0]
     if n < 2:
         return np.zeros(n, dtype=int), 1
+    sil_kw = ({} if n <= _SIL_MAX
+              else {"sample_size": _SIL_MAX, "random_state": random_state})
     hi = min(k_max, n - 1)
     lo = max(2, min(k_min, hi))
     # A fixed-k request (k_min == k_max) is silently clamped to n-1 for small
@@ -28,7 +37,7 @@ def select_k_and_cluster(X, k_min: int, k_max: int, random_state: int = 0):
         labels = km.fit_predict(X)
         if len(set(labels)) < 2:
             continue
-        score = silhouette_score(X, labels)
+        score = silhouette_score(X, labels, **sil_kw)
         if score > best_score:
             best_score = score
             best_k = k

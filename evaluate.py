@@ -202,7 +202,10 @@ def main():
     if len(X) == len(cw) and len(uniq) >= 2 and len(X) > len(uniq):
         Xc = features.apply_subject_norm(X, subs, args.subject_norm)
         Xz, _, _ = features.zscore(Xc)
-        sil = float(silhouette_score(Xz, cids))
+        # subsample the O(n^2) silhouette on large pooled runs (200k+ clips)
+        sil_kw = ({} if len(Xz) <= 10000
+                  else {"sample_size": 10000, "random_state": 0})
+        sil = float(silhouette_score(Xz, cids, **sil_kw))
         pose["pose_silhouette"] = round(sil, 4)
         print(f"\n[C] POSE-SPACE (apex probe)  silhouette={sil:.3f}")
         if n_subj >= 2:

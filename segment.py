@@ -409,6 +409,14 @@ def main():
                     help="(alias for a single --subjects id; kept for back-compat)")
     ap.add_argument("--only-hand", choices=["left", "right"], default=None,
                     help="process only recordings with this hand.")
+    ap.add_argument("--dates", default=None,
+                    help="keep only recordings whose date (YYYYMMDD) starts with "
+                         "any of these comma-separated prefixes: a full day "
+                         "'20260502', a month '202605', or a year '2026'.")
+    ap.add_argument("--date-from", default=None,
+                    help="keep recordings on/after this date (YYYYMMDD, inclusive).")
+    ap.add_argument("--date-to", default=None,
+                    help="keep recordings on/before this date (YYYYMMDD, inclusive).")
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel worker processes (one per recording). "
                          "Each recording is fully independent so this scales "
@@ -475,8 +483,20 @@ def main():
         print(f"--subjects {','.join(sel)}: kept {len(work)}/{before} recordings")
     if args.only_hand:
         work = [(p, i) for p, i in work if i.hand == args.only_hand]
+    # --- date selection (by time), mirroring --subjects / --only-hand ---
+    if args.dates:
+        pref = tuple(s.strip() for s in args.dates.split(",") if s.strip())
+        before = len(work)
+        work = [(p, i) for p, i in work if i.date and i.date.startswith(pref)]
+        print(f"--dates {args.dates}: kept {len(work)}/{before} recordings")
+    if args.date_from or args.date_to:
+        lo = args.date_from or "00000000"
+        hi = args.date_to or "99999999"
+        before = len(work)
+        work = [(p, i) for p, i in work if i.date and lo <= i.date <= hi]
+        print(f"--date-from/to [{lo},{hi}]: kept {len(work)}/{before} recordings")
     if not work:
-        print("No work after --only-* filters.")
+        print("No work after --only-* / --dates filters.")
         return
 
     # Skip tombstoned recordings (permanently dropped via the label UI) so a
