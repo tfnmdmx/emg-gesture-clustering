@@ -40,7 +40,7 @@ from sklearn.cluster import MiniBatchKMeans  # noqa: E402
 from sklearn.decomposition import PCA  # noqa: E402
 from sklearn.metrics import silhouette_score  # noqa: E402
 
-from emg_label import features, io_utils, store  # noqa: E402
+from emg_label import features, io_utils, select, store  # noqa: E402
 from emg_label.skeleton import (axis_limits, draw_skeleton,  # noqa: E402
                                 normalize_skeleton)
 
@@ -159,25 +159,45 @@ def cluster(Xp, k, k_min, k_max, sil_sample, seed=0):
 # ---------- per-cluster medoid keyframe gallery -----------------------------
 
 def render_medoid_strip(row, out_path, fs) -> bool:
-    """5-keyframe trajectory strip (start->1/3->apex->2/3->end) from raw Manus
-    skeleton XYZ. Returns False if the recording has no skeleton."""
-    skel = io_utils.load_skeleton(str(row["source_path"]),
-                                  hand=(str(row.get("hand") or "") or None))
-    if skel is None:
-        return False
+    """5-keyframe strip (start->1/3->apex->2/3->end).
+
+    Prefer raw Manus skeleton XYZ; fall back to emg2pose forward-kinematics on
+    joint_angles when the npz has no skeleton -- processed data carries only
+    ``emg`` + ``joint_angles`` (no ``manus_*_skeleton``), so the skeleton path
+    would otherwise leave every cluster as '(no skeleton in source npz)'. The FK
+    fallback is the same path the apex gallery / labelling UI use, so the hand
+    still renders. Returns False only if neither source is usable."""
+    src = str(row["source_path"])
+    hand = (str(row.get("hand") or "") or None)
     cs, ce = int(row["start_sample"]), int(row["end_sample"])
     ms, me = int(row["motion_start_sample"]), int(row["motion_end_sample"])
     ap = int(row["apex_sample"])
     md = max(1, me - ms)
     idx = [cs, ms + md // 3, ap, ms + 2 * md // 3, max(cs, ce - 1)]
-    idx = [min(max(0, i), len(skel) - 1) for i in idx]
     titles = ["start", "1/3", "apex", "2/3", "end"]
-    frames = normalize_skeleton(skel[idx])
+
+    skel = io_utils.load_skeleton(src, hand=hand)
+    if skel is not None:                                   # raw Manus XYZ
+        idx = [min(max(0, i), len(skel) - 1) for i in idx]
+        frames = normalize_skeleton(skel[idx])
+        draw = draw_skeleton
+    else:                                                  # FK from joint angles
+        try:
+            from emg_label.hand3d import angles_batch_to_landmarks, draw_hand
+        except Exception:
+            return False
+        _, ja = io_utils.load_npz(src, hand=hand)
+        if ja is None or len(ja) == 0:
+            return False
+        idx = [min(max(0, i), len(ja) - 1) for i in idx]
+        side = hand or io_utils.parse_file_info(src).hand or "left"
+        frames = angles_batch_to_landmarks(np.asarray(ja[idx], dtype=float), side=side)
+        draw = draw_hand
     limits = axis_limits(frames)
     fig = plt.figure(figsize=(2.2 * 5, 2.5))
     for i, (fr, t) in enumerate(zip(frames, titles)):
         ax = fig.add_subplot(1, 5, i + 1, projection="3d")
-        draw_skeleton(ax, fr)
+        draw(ax, fr)
         ax.set_title(t, fontsize=8)
         ax.set_xlim(*limits[0]); ax.set_ylim(*limits[1]); ax.set_zlim(*limits[2])
         ax.view_init(elev=18, azim=-72)
@@ -192,9 +212,70 @@ def render_medoid_strip(row, out_path, fs) -> bool:
     return True
 
 
-def cluster_gallery(clips_df, rows, labels, Xp, gdir, fs):
-    """One medoid strip per cluster + an index.html, sorted by size, into gdir."""
+def _clip_frames(row, n_frames):
+    """(frames[N,J,3], draw_fn) sampled uniformly across the medoid clip
+    [start,end) for animation -- skeleton XYZ if present, else emg2pose FK on
+    joint_angles. Returns (None, None) if neither source is usable."""
+    src = str(row["source_path"])
+    hand = (str(row.get("hand") or "") or None)
+    cs, ce = int(row["start_sample"]), int(row["end_sample"])
+    n = max(2, int(n_frames))
+    idx = np.linspace(cs, max(cs + 1, ce - 1), n).round().astype(int)
+    skel = io_utils.load_skeleton(src, hand=hand)
+    if skel is not None:
+        idx = np.clip(idx, 0, len(skel) - 1)
+        return normalize_skeleton(skel[idx]), draw_skeleton
+    try:
+        from emg_label.hand3d import angles_batch_to_landmarks, draw_hand
+    except Exception:
+        return None, None
+    _, ja = io_utils.load_npz(src, hand=hand)
+    if ja is None or len(ja) == 0:
+        return None, None
+    idx = np.clip(idx, 0, len(ja) - 1)
+    side = hand or io_utils.parse_file_info(src).hand or "left"
+    return angles_batch_to_landmarks(np.asarray(ja[idx], dtype=float), side=side), draw_hand
+
+
+def render_medoid_gif(row, out_path, fs, n_frames=24, fps=12) -> bool:
+    """Looping GIF of the medoid clip's whole motion (clearer than a 5-frame
+    strip). Fixed camera + shared axis limits across frames so only the hand
+    moves. Same skeleton-or-FK source as the strip. False if no usable source."""
+    frames, draw = _clip_frames(row, n_frames)
+    if frames is None:
+        return False
+    from PIL import Image
+    limits = axis_limits(frames)
+    fig = plt.figure(figsize=(3.2, 3.2))
+    ax = fig.add_subplot(111, projection="3d")
+    imgs = []
+    for fr in frames:                                  # reuse one axes (cla per frame)
+        ax.cla()
+        draw(ax, fr)
+        ax.set_xlim(*limits[0]); ax.set_ylim(*limits[1]); ax.set_zlim(*limits[2])
+        ax.view_init(elev=18, azim=-72)
+        try:
+            ax.set_box_aspect((1, 1, 1))
+        except Exception:
+            pass
+        ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+        fig.tight_layout(pad=0)
+        fig.canvas.draw()
+        imgs.append(Image.fromarray(
+            np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()))
+    plt.close(fig)
+    imgs[0].save(out_path, save_all=True, append_images=imgs[1:],
+                 duration=int(1000 / max(1, fps)), loop=0, optimize=True)
+    return True
+
+
+def cluster_gallery(clips_df, rows, labels, Xp, gdir, fs,
+                    anim=True, n_frames=24, fps=12):
+    """Per-cluster medoid view + index.html, sorted by size, into gdir. anim=True
+    -> a looping GIF of the medoid clip's motion (default; clearer than frames);
+    anim=False -> a static 5-keyframe strip."""
     os.makedirs(gdir, exist_ok=True)
+    ext = "gif" if anim else "png"
     entries = []
     for cid in sorted(set(int(x) for x in labels)):
         mask = labels == cid
@@ -202,28 +283,31 @@ def cluster_gallery(clips_df, rows, labels, Xp, gdir, fs):
         centroid = Xp[members].mean(axis=0)
         medoid = members[int(np.argmin(((Xp[members] - centroid) ** 2).sum(1)))]
         row = clips_df.loc[rows[medoid]]
-        png = f"cluster{cid:02d}_n{int(mask.sum())}.png"
-        ok = render_medoid_strip(row, os.path.join(gdir, png), fs)
+        fname = f"cluster{cid:02d}_n{int(mask.sum())}.{ext}"
+        ok = (render_medoid_gif(row, os.path.join(gdir, fname), fs, n_frames, fps)
+              if anim else render_medoid_strip(row, os.path.join(gdir, fname), fs))
         entries.append({"cid": cid, "size": int(mask.sum()),
-                        "png": png if ok else None, "row": row})
+                        "img": fname if ok else None, "row": row})
     entries.sort(key=lambda e: -e["size"])
+    head = (f"medoid-clip motion GIF per cluster ({n_frames} frames @ {fps}fps)"
+            if anim else "medoid keyframe strip per cluster "
+            "(start &rarr; 1/3 &rarr; apex &rarr; 2/3 &rarr; end)")
+    width = 360 if anim else 1000
     parts = ["<!doctype html><meta charset=utf-8><title>Trajectory clusters</title>",
              "<style>body{font-family:sans-serif;margin:16px}"
              "h2{font-size:14px;margin-top:18px} img{border:1px solid #ddd}"
              ".m{font-family:monospace;font-size:11px;color:#666}</style>",
-             f"<h1>{len(entries)} trajectory clusters &mdash; medoid keyframe "
-             f"strip per cluster (start &rarr; 1/3 &rarr; apex &rarr; 2/3 &rarr; "
-             f"end)</h1>"]
+             f"<h1>{len(entries)} trajectory clusters &mdash; {head}</h1>"]
     for e in entries:
         r = e["row"]
         parts.append(f"<h2>cluster {e['cid']} &mdash; {e['size']} clips</h2>")
         parts.append(f"<div class=m>medoid: {html.escape(str(r['source_file']))}"
                      f" clip {int(r['clip_id'])} &middot; motion "
                      f"{float(r['motion_duration_s']):.2f}s</div>")
-        if e["png"]:
-            parts.append(f"<img src='{e['png']}' width=1000>")
+        if e["img"]:
+            parts.append(f"<img src='{e['img']}' width={width}>")
         else:
-            parts.append("<div class=m>(no skeleton in source npz)</div>")
+            parts.append("<div class=m>(no usable pose in source npz)</div>")
     with open(os.path.join(gdir, "index.html"), "w") as f:
         f.write("\n".join(parts))
     return entries
@@ -249,6 +333,13 @@ def main():
     ap.add_argument("--joint-weights", default=None,
                     help="comma-separated 20 weights; columns scaled by sqrt(w)")
     ap.add_argument("--no-gallery", action="store_true")
+    ap.add_argument("--gallery-static", action="store_true",
+                    help="gallery as a 5-keyframe strip instead of the default "
+                         "looping motion GIF")
+    ap.add_argument("--gallery-frames", type=int, default=24,
+                    help="frames in each cluster's motion GIF")
+    ap.add_argument("--gallery-fps", type=int, default=12, help="GIF playback fps")
+    select.add_select_args(ap)        # --subjects/--sessions/--dates/... data subset
     args = ap.parse_args()
 
     conn = store.connect(args.out)
@@ -259,8 +350,19 @@ def main():
     if clips_df.empty:
         print(f"no clips in {store.db_path(args.out)}; run segment first")
         return
+    clips_df, scope = select.select_clips(clips_df, args)   # subset of the shared db
+    if clips_df.empty:
+        print("no clips match the data selection "
+              "(--subjects/--sessions/--dates/...); nothing to cluster")
+        return
+    # select_clips keeps the original (non-contiguous) index; build_features /
+    # the iloc[rows] assignment below are positional, so re-base the index.
+    clips_df = clips_df.reset_index(drop=True)
     clips_df["source_path"] = clips_df["source_file"].map(srcp)
-    print(f"{len(clips_df)} clips from {clips_df['source_file'].nunique()} recordings")
+    res = scope["resolved"]
+    print(f"{len(clips_df)} clips from {clips_df['source_file'].nunique()} recordings "
+          f"[scope: {res['n_subjects']} subj, {len(res['sessions'])} sessions, "
+          f"dates {res['date_min']}..{res['date_max']}, tag={select.scope_tag(scope)}]")
 
     X, rows = build_features(clips_df, args.out, args.L, args.repr)
 
@@ -292,8 +394,9 @@ def main():
     params = {"channel": "trajectory", "unit": "clip", "repr": args.repr,
               "L": args.L, "pca": int(n_comp), "k": best_k,
               "silhouette": round(float(sil), 4) if np.isfinite(sil) else None,
-              "n_clusters": int(len(set(int(x) for x in labels)))}
-    run_id, created_at = store.new_run_id("trajectory", params)
+              "n_clusters": int(len(set(int(x) for x in labels))), "scope": scope}
+    label = f"traj__{select.scope_tag(scope)}__k{best_k}__{args.repr}"
+    run_id, created_at = store.new_run_id("trajectory", params, label=label)
     rundir = store.save_run(args.out, run_id, "trajectory", params, assign, created_at)
     print(f"cluster sizes: "
           f"{sorted((int((labels==c).sum()) for c in set(labels)), reverse=True)}")
@@ -301,7 +404,9 @@ def main():
 
     if not args.no_gallery:
         cluster_gallery(clips_df, rows, labels, Xp,
-                        os.path.join(rundir, "gallery"), args.fs)
+                        os.path.join(rundir, "gallery"), args.fs,
+                        anim=not args.gallery_static,
+                        n_frames=args.gallery_frames, fps=args.gallery_fps)
         print(f"wrote {os.path.join(rundir, 'gallery', 'index.html')}")
 
 

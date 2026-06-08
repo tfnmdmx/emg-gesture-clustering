@@ -25,6 +25,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import sqlite3
 
 import pandas as pd
@@ -383,14 +384,56 @@ def write_cluster_run(out_dir: str, run_id: str, channel: str, params: dict,
         conn.close()
 
 
-def new_run_id(channel: str, params: dict) -> tuple:
-    """(run_id, created_at). run_id = '{YYYYMMDD-HHMMSS}__{paramhash8}' --
-    readable (timestamp) AND reproducible (params hash)."""
+def drop_run(out_dir: str, run_id: str, remove_dir: bool = True) -> bool:
+    """Delete a clustering run from the db (cluster_runs + cluster_assignments)
+    and, by default, its on-disk cluster_runs/{run_id}/ dir. Returns True if the
+    run had any db rows. Deleting only the directory leaves stale db rows, so use
+    this (or prune_runs) to keep the db and disk in sync."""
+    conn = connect(out_dir)
+    try:
+        had = conn.execute("SELECT 1 FROM cluster_runs WHERE run_id=?",
+                           (run_id,)).fetchone() is not None
+        with conn:
+            conn.execute("DELETE FROM cluster_assignments WHERE run_id=?", (run_id,))
+            conn.execute("DELETE FROM cluster_runs WHERE run_id=?", (run_id,))
+    finally:
+        conn.close()
+    if remove_dir:
+        import shutil
+        shutil.rmtree(os.path.join(out_dir, "cluster_runs", run_id),
+                      ignore_errors=True)
+    return had
+
+
+def prune_runs(out_dir: str) -> list:
+    """Drop db rows for runs whose cluster_runs/{run_id}/ dir no longer exists
+    (e.g. deleted by hand). Returns the list of pruned run_ids. Dir-less runs in
+    cluster_assignments-only (no cluster_runs row) are caught too."""
+    rundir = os.path.join(out_dir, "cluster_runs")
+    conn = connect(out_dir)
+    try:
+        ids = {r[0] for r in conn.execute("SELECT run_id FROM cluster_runs")}
+        ids |= {r[0] for r in conn.execute(
+            "SELECT DISTINCT run_id FROM cluster_assignments")}
+    finally:
+        conn.close()
+    orphans = sorted(rid for rid in ids
+                     if not os.path.isdir(os.path.join(rundir, rid)))
+    for rid in orphans:
+        drop_run(out_dir, rid, remove_dir=False)
+    return orphans
+
+
+def new_run_id(channel: str, params: dict, label: str = "") -> tuple:
+    """(run_id, created_at). run_id = '{YYYYMMDD-HHMMSS}[__{label}]__{paramhash8}'
+    -- readable (timestamp + a data/method label like 'apex__ghd1108_0501-left__k17')
+    AND reproducible (params hash, which includes the data scope)."""
     created_at = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     h = hashlib.sha1(
         json.dumps({"channel": channel, **params}, sort_keys=True,
                    default=str).encode()).hexdigest()[:8]
-    return f"{created_at}__{h}", created_at
+    safe = re.sub(r"[^A-Za-z0-9._+-]", "", label).strip("_")
+    return (f"{created_at}__{safe}__{h}" if safe else f"{created_at}__{h}"), created_at
 
 
 def save_run(out_dir: str, run_id: str, channel: str, params: dict,

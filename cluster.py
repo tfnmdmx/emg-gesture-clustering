@@ -17,7 +17,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from emg_label import clustering, features, store
+from emg_label import clustering, features, select, store
 from emg_label.config import Config
 
 
@@ -45,6 +45,7 @@ def main():
                     help="per-subject feature normalization for pooled runs.")
     ap.add_argument("--no-gallery", action="store_true",
                     help="skip the per-cluster 3D-hand gallery (needs torch FK).")
+    select.add_select_args(ap)        # --subjects/--sessions/--dates/... data subset
     args = ap.parse_args()
 
     k_min, k_max = (args.k, args.k) if args.k is not None else (args.k_min, args.k_max)
@@ -60,6 +61,14 @@ def main():
     conn.close()
     if clips.empty:
         raise SystemExit(f"no clips in {store.db_path(cfg.out_dir)}; run segment first")
+    clips, scope = select.select_clips(clips, args)   # subset of the shared db
+    if clips.empty:
+        raise SystemExit("no clips match the data selection "
+                         "(--subjects/--sessions/--dates/...); nothing to cluster")
+    res = scope["resolved"]
+    print(f"data scope: {res['n_clips']} clips / {res['n_recordings']} recordings / "
+          f"{res['n_subjects']} subject(s); sessions={len(res['sessions'])}; "
+          f"dates {res['date_min']}..{res['date_max']}  [{select.scope_tag(scope)}]")
     clips = _remap_group(clips, args.group_by)
 
     rows = []            # per-clip: source_file, clip_id, cluster_id (global)
@@ -113,8 +122,13 @@ def main():
     clusters_df = pd.DataFrame(rows, columns=["source_file", "clip_id", "cluster_id"])
     params = {"channel": "apex", "unit": "clip", "group_by": args.group_by,
               "subject_norm": args.subject_norm, "k": args.k,
-              "k_min": k_min, "k_max": k_max, "n_clusters": int(next_cid)}
-    run_id, created_at = store.new_run_id("apex", params)
+              "k_min": k_min, "k_max": k_max, "n_clusters": int(next_cid),
+              "scope": scope}
+    ktag = str(args.k) if args.k is not None else f"{k_min}-{k_max}"
+    label = f"apex__{select.scope_tag(scope)}__k{ktag}"
+    if args.group_by != "subject-hand":
+        label += f"__{args.group_by}"
+    run_id, created_at = store.new_run_id("apex", params, label=label)
     rundir = store.save_run(cfg.out_dir, run_id, "apex", params, clusters_df, created_at)
     print(f"features cache: {cache_hit} hit, {cache_miss} miss")
     print(f"apex run {run_id}: {len(clusters_df)} clips, {next_cid} clusters -> {rundir}")

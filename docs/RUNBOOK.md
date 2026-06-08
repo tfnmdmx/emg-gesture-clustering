@@ -32,14 +32,19 @@ WORKERS=8 ./pulse.sh segment reference/sample_meta.csv               # meta CSV 
 WORKERS=8 ./pulse.sh label-prewarm                                   # 预渲染全部录制的手部缓存，首开秒级
 WORKERS=8 ./pulse.sh label-prewarm --first-per-folder                # 只预热每个文件夹第一条（每个文件夹都能秒开）
 
-# 聚类（两条通道，各产一个 OUT/cluster_runs/{run_id}/）
-./pulse.sh cluster                                                   # apex 静态通道 (K=18, GROUP_BY=subject-hand)
+# 聚类（两条通道，各产一个 OUT/cluster_runs/{run_id}/）。切分/打标用整库，
+# 聚类可只选其中一个子集——同一套 segment 选择器 + SESSIONS=/RECORDINGS=
+./pulse.sh cluster                                                   # apex 静态通道 (K=18, GROUP_BY=subject-hand)，全库
+SUBJECTS=ghd-1108 SESSIONS=20260501-left ./pulse.sh cluster 17       # 只聚某人某 session（K=17）
 K=auto GROUP_BY=all SUBJECT_NORM=zscore ./pulse.sh cluster           # 跨被试合聚 + 归一化 + 自动 k
-REPR=centered ./pulse.sh cluster-traj                                # trajectory 时序通道
+SUBJECTS=ghd-1108 SESSIONS=20260501-left REPR=centered ./pulse.sh cluster-traj 17  # trajectory 时序通道，同子集
+
+# 看/对比所有 run（数据 + 方法 + 指标 一张表）
+./pulse.sh runs                                                      # -> 打印 + 写 OUT/cluster_runs/INDEX.csv
 
 # 评估（标签驱动；写 cluster_runs/<run>/metrics.json）/ 导出（按手势）
 ./pulse.sh eval                                                      # 评估最新 run（ARI/NMI/purity + 被试污染 + pose 探针）
-RUN=20260605-120000__abcd1234 ./pulse.sh eval                        # 指定某个 run
+RUN=20260608-111819__apex__ghd1108_20260501-left__k17__06f66b4f ./pulse.sh eval   # 指定某个 run
 ./pulse.sh export                                                    # 已打标 clip -> OUT/gestures/<手势>/
 
 # 辅助
@@ -239,6 +244,7 @@ WORKERS=8 ./pulse.sh segment reference/sample_meta.csv
 ./pulse.sh label-prewarm        预渲染手部帧缓存（WORKERS=N）
 ./pulse.sh cluster      [K]     阶段 2 apex 聚类（K 默认 18；"auto" = silhouette 选 k）-> cluster_runs/
 ./pulse.sh cluster-traj [K]     阶段 2 trajectory（时序）聚类 -> cluster_runs/（REPR= 选表征）
+./pulse.sh runs                 列出/对比所有 run（数据+方法+ARI/NMI/purity）-> cluster_runs/INDEX.csv
 ./pulse.sh eval                 标签驱动评估 + 被试无关性（RUN= 或最新）-> cluster_runs/<run>/metrics.json
 ./pulse.sh export               阶段 3 按手势导出标注 clip -> OUT/gestures/<label>/
 ./pulse.sh qc                   某 run 特征图（+ 已导出则带动画画廊）
@@ -248,6 +254,25 @@ WORKERS=8 ./pulse.sh segment reference/sample_meta.csv
 ./pulse.sh status               查看进度（index.db / cluster_runs / gestures）
 ./pulse.sh help
 ```
+
+### 3.2b 只对一部分数据聚类（多实验对比）
+
+切分、打标始终用**整库**（一个共享 `OUT/index.db`）；聚类可以只取其中一个**子集**反复做实验，无需重切分/重打标。选择器词汇和 `segment` 完全一致，额外加 `SESSIONS=`（session token，前缀匹配，如 `20260501-left` 也命中 `20260501-left-3`）和 `RECORDINGS=`（精确 source_file，可省 `.npz`），apex / trajectory 通用：
+
+```bash
+# 同一个人、同一个 session：apex vs trajectory 对比
+SUBJECTS=ghd-1108 SESSIONS=20260501-left ./pulse.sh cluster 17
+SUBJECTS=ghd-1108 SESSIONS=20260501-left REPR=centered ./pulse.sh cluster-traj 17
+./pulse.sh eval                 # 评最新 run；想评全部就对每个 RUN= 跑一次
+./pulse.sh runs                 # 一张表看清每个 run 用了哪份数据 + 哪种方法 + 指标
+```
+
+每个 run 都**自带数据范围**：
+- **run 目录名**可读，如 `20260608-111900__traj__ghd1108_20260501-left__k17__centered__<hash>`；
+- `params.json` 里有完整 `scope`（筛选条件 + 实际命中的 clips/录制/被试/session/日期范围）；
+- `./pulse.sh runs` 把所有 run 汇成 `cluster_runs/INDEX.csv`：`run_id / channel / data / n_clips / n_rec / n_subj / k / method / ARI / NMI / purity`。
+
+选择器（聚类时）：`SUBJECTS=`（归一化匹配）、`ONLY_HAND=`、`DATES=`（前缀）、`DATE_FROM=`/`DATE_TO=`、`SESSIONS=`（前缀）、`RECORDINGS=`（精确）。留空 = 全库（tag=`all`）。
 
 ### 3.3 典型场景
 

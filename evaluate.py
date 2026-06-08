@@ -37,7 +37,7 @@ from sklearn.metrics import (adjusted_rand_score, normalized_mutual_info_score,
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
 
-from emg_label import features, store
+from emg_label import features, select, store
 
 
 def _pose_features(out_dir, cw, fs):
@@ -165,6 +165,11 @@ def main():
     meta = conn.execute("SELECT channel, params_json FROM cluster_runs WHERE run_id=?",
                         (run,)).fetchone()
     channel = meta["channel"] if meta else "?"
+    run_params = json.loads(meta["params_json"]) if (meta and meta["params_json"]) else {}
+    scope = run_params.get("scope")
+    method = {k: run_params.get(k) for k in
+              ("channel", "repr", "group_by", "subject_norm", "k", "L", "pca")
+              if run_params.get(k) is not None}
     cw = store.clusters_with_labels(conn, run)
     conn.close()
     if cw.empty:
@@ -173,7 +178,9 @@ def main():
     cids = cw["cluster_id"].to_numpy()
     subs = cw["subject"].to_numpy()
     uniq = sorted(set(int(c) for c in cids))
-    print(f"{'='*72}\nRUN {run}  channel={channel}  N={len(cw)}  k={len(uniq)}")
+    tag = select.scope_tag(scope) if scope else "all"
+    print(f"{'='*72}\nRUN {run}  channel={channel}  N={len(cw)}  k={len(uniq)}  "
+          f"data={tag}")
 
     # --- A. label-driven (the point: 用打标评估聚类) -----------------------
     lab = _label_metrics(cw)
@@ -223,7 +230,8 @@ def main():
         print("\n[C] POSE-SPACE: skipped (insufficient/aligned features)")
 
     metrics = {"run_id": run, "channel": channel, "n_clips": int(len(cw)),
-               "k": len(uniq), "label_driven": lab,
+               "k": len(uniq), "scope": scope, "method": method,
+               "label_driven": lab,
                "subject_contamination": contam, "pose_space": pose}
     run_dir = os.path.join(args.out, "cluster_runs", run)
     os.makedirs(run_dir, exist_ok=True)

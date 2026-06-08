@@ -13,6 +13,11 @@
 #   ./pulse.sh label-prewarm               pre-render the 3D hand-frame cache (WORKERS=N)
 #   ./pulse.sh cluster      [K]            apex (static formed-pose) clustering -> OUT/cluster_runs/{run_id}/
 #   ./pulse.sh cluster-traj [K]            trajectory (time-series) clustering  -> OUT/cluster_runs/{run_id}/ (REPR=)
+#                                          pick the DATA subset (segment/label stay whole-library) with
+#                                          SUBJECTS=/ONLY_HAND=/DATES=/DATE_FROM=/DATE_TO=/SESSIONS=/RECORDINGS=
+#                                          e.g. SUBJECTS=ghd-1108 SESSIONS=20260501-left REPR=centered ./pulse.sh cluster-traj 17
+#   ./pulse.sh runs [prune|rm <id>...]     list/compare runs (data+method+ARI/NMI/purity) -> cluster_runs/INDEX.csv;
+#                                          'prune' drops db rows of hand-deleted runs; 'rm' deletes specific runs (db+dir)
 #   ./pulse.sh eval                        label-driven metrics for a run (RUN= or latest) -> metrics.json
 #   ./pulse.sh export                      export hand-labelled clips by gesture -> OUT/gestures/<label>/
 #   ./pulse.sh qc                          feature maps for a run (+ animation gallery if exported)
@@ -42,6 +47,8 @@ cd "$HERE"
 : "${DATES:=}"             # by time: comma-sep date prefixes (20260502 day | 202605 month | 2026 year)
 : "${DATE_FROM:=}"         # by time: keep recordings on/after YYYYMMDD (inclusive)
 : "${DATE_TO:=}"           # by time: keep recordings on/before YYYYMMDD (inclusive)
+: "${SESSIONS:=}"          # CLUSTER ONLY: comma-sep session tokens, prefix match (e.g. 20260501-left)
+: "${RECORDINGS:=}"        # CLUSTER ONLY: comma-sep source_file names (exact; .npz optional)
 : "${NO_OVERVIEW:=0}"      # set 1 to skip overview.png (CSV-only, ~3-5x faster / no torch)
 # KMeans over-subscribes threads on this box without these caps.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
@@ -93,23 +100,53 @@ cmd_segment() {
   fi
 }
 
+# Data subset for clustering ONLY (segment/label always use the whole library).
+# Same selector vocabulary as segment, plus SESSIONS / RECORDINGS. Empty = all.
+_clu_select() {
+  local extra=""
+  [ -n "$SUBJECTS" ]   && extra="$extra --subjects $SUBJECTS"
+  [ -n "$ONLY_HAND" ]  && extra="$extra --only-hand $ONLY_HAND"
+  [ -n "$DATES" ]      && extra="$extra --dates $DATES"
+  [ -n "$DATE_FROM" ]  && extra="$extra --date-from $DATE_FROM"
+  [ -n "$DATE_TO" ]    && extra="$extra --date-to $DATE_TO"
+  [ -n "$SESSIONS" ]   && extra="$extra --sessions $SESSIONS"
+  [ -n "$RECORDINGS" ] && extra="$extra --recordings $RECORDINGS"
+  echo "$extra"
+}
+
 cmd_cluster() {
   [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment <source>"
   local k="${1:-$K}"
   local kflag=""; [ "$k" != "auto" ] && kflag="--k $k"
-  say "apex clustering (k=$k, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM) -> $OUT/cluster_runs/"
+  local sel; sel=$(_clu_select)
+  say "apex clustering (k=$k, group-by=$GROUP_BY, subject-norm=$SUBJECT_NORM, data=${SUBJECTS:-all}${SESSIONS:+/$SESSIONS}) -> $OUT/cluster_runs/"
   # shellcheck disable=SC2086
   "$PY" cluster.py --out "$OUT" --group-by "$GROUP_BY" \
-    --subject-norm "$SUBJECT_NORM" $kflag
+    --subject-norm "$SUBJECT_NORM" $kflag $sel
 }
 
 cmd_cluster_traj() {
   [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment <source>"
   local k="${1:-$K}"
   local kflag=""; [ "$k" != "auto" ] && kflag="--k $k"
-  say "trajectory (time-series) clustering (k=$k, repr=$REPR) -> $OUT/cluster_runs/"
+  local sel; sel=$(_clu_select)
+  # gallery is a looping motion GIF per cluster by default; tune/disable via env:
+  #   GALLERY_STATIC=1 (5-frame strip)  GALLERY_FRAMES=N  GALLERY_FPS=N
+  local gopt=""
+  [ "${GALLERY_STATIC:-0}" = "1" ] && gopt="$gopt --gallery-static"
+  [ -n "${GALLERY_FRAMES:-}" ]     && gopt="$gopt --gallery-frames $GALLERY_FRAMES"
+  [ -n "${GALLERY_FPS:-}" ]        && gopt="$gopt --gallery-fps $GALLERY_FPS"
+  say "trajectory (time-series) clustering (k=$k, repr=$REPR, data=${SUBJECTS:-all}${SESSIONS:+/$SESSIONS}) -> $OUT/cluster_runs/"
   # shellcheck disable=SC2086
-  "$PY" cluster_traj.py --out "$OUT" --repr "$REPR" $kflag
+  "$PY" cluster_traj.py --out "$OUT" --repr "$REPR" $kflag $sel $gopt
+}
+
+cmd_runs() {
+  # ./pulse.sh runs                 list/compare runs (+ writes cluster_runs/INDEX.csv)
+  # ./pulse.sh runs prune           drop db rows of runs whose dir was deleted by hand
+  # ./pulse.sh runs rm <run_id>...  delete specific runs (db rows + dir)
+  [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment <source>"
+  "$PY" runs.py --out "$OUT" "$@"
 }
 
 cmd_eval() {
@@ -216,6 +253,7 @@ case "$sub" in
   label-prewarm) cmd_label_prewarm "$@";;
   cluster)      cmd_cluster "$@";;
   cluster-traj) cmd_cluster_traj "$@";;
+  runs)         cmd_runs "$@";;
   eval)         cmd_eval "$@";;
   export)       cmd_export "$@";;
   qc)           cmd_qc "$@";;
