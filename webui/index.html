@@ -59,6 +59,15 @@
   #label{width:220px} #note{width:200px}
   .btn{padding:7px 12px;cursor:pointer}
   .chip{display:inline-block;background:#eee;border-radius:10px;padding:1px 8px;margin:1px;font-size:11px}
+  /* curated quick-set palette */
+  #common{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:4px}
+  #common .clab{color:#555;font-size:11px}
+  .commonchip{display:inline-flex;align-items:center;gap:2px;background:#1a73e8;color:#fff;border-radius:11px;padding:2px 9px;font-size:12px;cursor:pointer;user-select:none}
+  .commonchip:hover{background:#1558c0}
+  .commonchip b{font-size:10px;opacity:.85;font-weight:700}
+  .commonchip .cx{cursor:pointer;opacity:.55;font-size:13px;line-height:1;padding-left:3px}
+  .commonchip .cx:hover{opacity:1}
+  .btn.addcommon{padding:2px 9px;font-size:12px}
   .warn{color:#c62828;font-weight:600}
   .qc{color:#555;font-size:12px;line-height:1.5}
 </style>
@@ -115,7 +124,7 @@
   <button class=btn id=invalid>标记此段无效 (x)</button>
   <button class=btn id=recinvalid title="整条录制无效，不参与打标/聚类/导出 (Shift+X)">整条录制无效 (X)</button>
   <button class=btn id=droprec title="永久删除该录制（删 shard + 索引行，并 tombstone 防重切分复活；不可撤销）">删除录制</button>
-  <div class=qc><div id=hotkeys>⏎ 保存并下一个 · x 标记无效段 · Shift+X 整条录制无效 · ↑↓ 切换段 · 空格 播放/暂停 · 1-9 套用常用标签</div><div id=common></div></div>
+  <div class=qc><div id=hotkeys>⏎ 保存并下一个 · x 标记无效段 · Shift+X 整条录制无效 · ↑↓ 切换段 · 空格 播放/暂停 · 1-9 或点击 套用常用标签</div><div id=common></div></div>
   </div>
   </div>
 </div>

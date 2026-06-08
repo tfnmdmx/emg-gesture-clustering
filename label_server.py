@@ -161,6 +161,13 @@ def _jstr(x) -> str:
     return str(x)
 
 
+# Curated "common labels" palette shown as clickable quick-set chips in the UI
+# (and bound to number keys 1-9). Shared across all labelers via a small JSON
+# file in the output dir; capped so the palette stays a quick palette.
+COMMON_MAX = 20
+COMMON_LABELS_FILE = "common_labels.json"
+
+
 # ----------------------------------------------------------------------------
 # State: load clips.csv once, build key->row index, load existing labels.
 # A single lock guards label writes (server is the only writer).
@@ -279,6 +286,11 @@ class Store:
         self.invalid_count: dict = {}    # source_file -> clips marked invalid
         self._load_labels()
 
+        # Curated quick-set palette (max COMMON_MAX), persisted + shared. Loaded
+        # after labels so an absent file can seed from the most-used labels.
+        self.common_labels_path = os.path.join(out_dir, COMMON_LABELS_FILE)
+        self.common_labels: list = self._load_common_labels()
+
         # Whole-recording invalidation: source_file -> {labeler, marked_at, note}.
         # Such recordings drop out of labelling, export, clustering and eval.
         # Stored as scope='recording', kind='invalid' annotations in the db.
@@ -319,6 +331,55 @@ class Store:
             if rec["invalid"]:
                 self.invalid_count[sf] = self.invalid_count.get(sf, 0) + 1
 
+    # --- common-labels palette (curated quick-set chips) --------------------
+    @staticmethod
+    def _clean_common(labels) -> list:
+        """Sanitize an incoming palette: strings only, trimmed, de-duplicated in
+        order, capped at COMMON_MAX."""
+        out: list = []
+        for l in labels or []:
+            if not isinstance(l, str):
+                continue
+            s = l.strip()
+            if s and s not in out:
+                out.append(s)
+            if len(out) >= COMMON_MAX:
+                break
+        return out
+
+    def _label_frequencies(self) -> dict:
+        freq: dict = {}
+        for rec in self.labels.values():
+            gl = rec.get("gesture_label")
+            if gl:
+                freq[gl] = freq.get(gl, 0) + 1
+        return freq
+
+    def _load_common_labels(self) -> list:
+        """Load the persisted palette; if the file is absent/unreadable, seed it
+        from the most-frequently-used existing labels (top COMMON_MAX) so the
+        quick-set bar isn't empty on first run -- the user then curates it."""
+        if os.path.isfile(self.common_labels_path):
+            try:
+                with open(self.common_labels_path) as f:
+                    data = json.load(f)
+                labels = data.get("labels") if isinstance(data, dict) else data
+                return self._clean_common(labels if isinstance(labels, list) else [])
+            except (OSError, ValueError):
+                pass
+        freq = self._label_frequencies()
+        return sorted(freq, key=lambda l: (-freq[l], l))[:COMMON_MAX]
+
+    def set_common_labels(self, labels) -> dict:
+        """Replace the palette (whole-list upsert) and persist atomically."""
+        with self.lock:
+            self.common_labels = self._clean_common(labels)
+            tmp = self.common_labels_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"labels": self.common_labels}, f, ensure_ascii=False)
+            os.replace(tmp, self.common_labels_path)
+        return {"common_labels": self.common_labels}
+
     def _hand_count(self, stem: str) -> int:
         d = os.path.join(self.hand_dir, stem)
         return (len([f for f in os.listdir(d) if f.endswith(".json")])
@@ -354,7 +415,8 @@ class Store:
                 "pose_exit_thresh": _jnum(st.get("pose_exit_thresh")),
                 "seg_version": _jstr(st.get("seg_version")),
             })
-        return {"fs": FS, "labels_used": used, "recordings": recs,
+        return {"fs": FS, "labels_used": used, "common_labels": self.common_labels,
+                "recordings": recs,
                 "total_clips": int(len(self.df)),
                 "total_labeled": sum(self.labeled_count.values()),
                 "total_invalid": sum(self.invalid_count.values()),
@@ -987,12 +1049,14 @@ def make_handler(store: Store):
         def do_POST(self):
             u = urlparse(self.path)
             if u.path not in ("/api/label", "/api/invalid_recording",
-                              "/api/drop_recording"):
+                              "/api/drop_recording", "/api/common_labels"):
                 return self._send(404, {"error": "no route"})
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
             try:
-                if u.path == "/api/drop_recording":
+                if u.path == "/api/common_labels":
+                    res = store.set_common_labels(data.get("labels", []))
+                elif u.path == "/api/drop_recording":
                     res = store.drop_recording(data["stem"])
                 elif u.path == "/api/invalid_recording":
                     res = store.set_recording_invalid(

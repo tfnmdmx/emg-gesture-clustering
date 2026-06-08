@@ -6,7 +6,8 @@ let STATE = {
   expanded: new Set(),  // expanded folder keys in the left tree
   rec: null,            // loaded recording payload (segments=clips + frame grid)
   cur: null,            // currently selected clip (segment) = labelling target
-  labels_used: [], total_clips: 0, total_labeled: 0, total_invalid: 0, total_invalid_rec: 0,
+  labels_used: [], common_labels: [],   // labels_used = autocomplete; common_labels = curated quick-set palette
+  total_clips: 0, total_labeled: 0, total_invalid: 0, total_invalid_rec: 0,
   t: 0, playing: false, raf: null,
   curHandFrame: -1, handPoll: null, handEpoch: 0,
   faces: null, wantFrame: 0, meshReady: false,   // 3D hand mesh state
@@ -86,11 +87,14 @@ async function boot() {
     STATE.recordings = d.recordings || [];
     STATE.folderPrefix = commonFolderPrefix(STATE.recordings.map(r => r.folder));
     STATE.labels_used = d.labels_used || [];
+    STATE.common_labels = d.common_labels || [];
     STATE.total_clips = d.total_clips || 0;
     STATE.total_labeled = d.total_labeled || 0;
     STATE.total_invalid = d.total_invalid || 0;
     STATE.total_invalid_rec = d.total_invalid_rec || 0;
     refreshDatalist();
+    renderCommon();
+    on('common', 'onclick', onCommonClick);
     on('filter', 'onchange', applyRecFilter);
     on('sort', 'onchange', applyRecFilter);
     on('search', 'oninput', applyRecFilter);
@@ -206,12 +210,64 @@ async function selectRecordingIdx(i) {
   if (seg) selectClip(seg);
 }
 
+// labels_used drives the <datalist> autocomplete on the gesture_label input.
 function refreshDatalist() {
   document.getElementById('labellist').innerHTML =
-    STATE.labels_used.map(l => `<option value="${l}">`).join('');
+    STATE.labels_used.map(l => `<option value="${esc(l)}">`).join('');
+}
+
+// common_labels = the curated quick-set palette: clickable chips (click =
+// apply+save+next, same as the 1-9 number keys for the first nine). Each chip
+// has an × to drop it; "★加入常用" adds the current gesture_label input.
+function renderCommon() {
+  const chips = STATE.common_labels.map((l, i) => {
+    const num = i < 9 ? `<b>${i + 1}</b> ` : '';   // first nine double as hotkeys
+    return `<span class=commonchip data-label="${esc(l)}" title="点击套用并保存">`
+      + `${num}${esc(l)}<span class=cx data-rm="${esc(l)}" title="移出常用">×</span></span>`;
+  }).join('');
+  const n = STATE.common_labels.length, full = n >= 20;
   document.getElementById('common').innerHTML =
-    '常用: ' + STATE.labels_used.slice(0, 9)
-      .map((l, i) => `<span class=chip>${i + 1}:${l}</span>`).join('');
+    `<span class=clab>常用 (${n}/20):</span> `
+    + (chips || '<span class=qc>（空，输入标签后点"加入常用"）</span> ')
+    + `<button type=button class="btn addcommon" id=addcommon ${full ? 'disabled' : ''}`
+    + ` title="把当前 gesture_label 输入框的标签加入常用">★ 加入常用</button>`;
+}
+
+function applyCommonLabel(l) {
+  if (!l) return;
+  setLabelInput(l);
+  saveLabel(true);          // apply + save + advance, like the number keys
+}
+
+async function saveCommon(labels) {
+  const res = await (await fetch('/api/common_labels', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ labels })
+  })).json();
+  STATE.common_labels = res.common_labels || [];
+  renderCommon();
+}
+
+function addCommon(l) {
+  l = (l || '').trim();
+  const msg = document.getElementById('msg');
+  if (!l) { msg.textContent = '先在 gesture_label 输入框填入要加入的标签'; return; }
+  if (STATE.common_labels.includes(l)) { msg.textContent = `"${l}" 已在常用`; return; }
+  if (STATE.common_labels.length >= 20) { msg.textContent = '常用已满 20 个，先移出一些'; return; }
+  saveCommon([...STATE.common_labels, l]);
+}
+
+function removeCommon(l) { saveCommon(STATE.common_labels.filter(x => x !== l)); }
+
+// One delegated handler survives the innerHTML re-render in renderCommon().
+function onCommonClick(e) {
+  const rm = e.target.closest('.cx');
+  if (rm) { e.stopPropagation(); return removeCommon(rm.dataset.rm); }
+  if (e.target.closest('#addcommon')) {
+    return addCommon(document.getElementById('label').value);
+  }
+  const chip = e.target.closest('.commonchip');
+  if (chip) return applyCommonLabel(chip.dataset.label);
 }
 
 function renderProgress() {
@@ -606,8 +662,7 @@ function onKey(e) {
     e.preventDefault(); markInvalid();                 // x: this clip
   }
   else if (/^[1-9]$/.test(e.key) && e.target.id !== 'note' && document.activeElement.id !== 'label') {
-    const l = STATE.labels_used[+e.key - 1];
-    if (l) { setLabelInput(l); saveLabel(true); }
+    applyCommonLabel(STATE.common_labels[+e.key - 1]);   // 1-9 = first nine common labels
   }
 }
 
