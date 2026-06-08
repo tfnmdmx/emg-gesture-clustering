@@ -269,20 +269,19 @@ def render_medoid_gif(row, out_path, fs, n_frames=24, fps=12) -> bool:
     return True
 
 
-def cluster_gallery(clips_df, rows, labels, Xp, gdir, fs,
+def cluster_gallery(clips_df, rows, labels, medoid_idx, gdir, fs,
                     anim=True, n_frames=24, fps=12):
     """Per-cluster medoid view + index.html, sorted by size, into gdir. anim=True
     -> a looping GIF of the medoid clip's motion (default; clearer than frames);
-    anim=False -> a static 5-keyframe strip."""
+    anim=False -> a static 5-keyframe strip. medoid_idx maps each global cluster
+    id to a positional index into `rows` (precomputed per group, since each
+    group is clustered in its own PCA space)."""
     os.makedirs(gdir, exist_ok=True)
     ext = "gif" if anim else "png"
     entries = []
-    for cid in sorted(set(int(x) for x in labels)):
+    for cid in sorted(c for c in set(int(x) for x in labels) if c >= 0):
         mask = labels == cid
-        members = np.where(mask)[0]
-        centroid = Xp[members].mean(axis=0)
-        medoid = members[int(np.argmin(((Xp[members] - centroid) ** 2).sum(1)))]
-        row = clips_df.loc[rows[medoid]]
+        row = clips_df.loc[rows[medoid_idx[cid]]]
         fname = f"cluster{cid:02d}_n{int(mask.sum())}.{ext}"
         ok = (render_medoid_gif(row, os.path.join(gdir, fname), fs, n_frames, fps)
               if anim else render_medoid_strip(row, os.path.join(gdir, fname), fs))
@@ -313,6 +312,18 @@ def cluster_gallery(clips_df, rows, labels, Xp, gdir, fs,
     return entries
 
 
+# ---------- grouping (mirrors cluster.py) -----------------------------------
+
+def _remap_group(clips: pd.DataFrame, group_by: str) -> pd.DataFrame:
+    """Rewrite the 'group' column to the requested granularity. subject-hand
+    (default) keeps the per-recording '{subject}-{hand}' group as-is."""
+    if group_by == "hand":
+        clips["group"] = clips["group"].map(lambda g: str(g).rsplit("-", 1)[-1])
+    elif group_by == "all":
+        clips["group"] = "all"
+    return clips
+
+
 # ---------- main ------------------------------------------------------------
 
 def main():
@@ -323,6 +334,11 @@ def main():
     ap.add_argument("--L", type=int, default=32, help="resampled trajectory length")
     ap.add_argument("--repr", default="centered",
                     choices=["centered", "velocity", "raw"])
+    ap.add_argument("--group-by", choices=["subject-hand", "hand", "all"],
+                    default="subject-hand",
+                    help="clustering granularity, same semantics as cluster.py: "
+                         "subject-hand = cluster each person independently "
+                         "(default); all = one pooled cross-subject clustering.")
     ap.add_argument("--pca", type=int, default=30, help="PCA components")
     ap.add_argument("--k", type=int, default=None,
                     help="fixed cluster count; omit to scan k-min..k-max by silhouette")
@@ -364,6 +380,7 @@ def main():
           f"[scope: {res['n_subjects']} subj, {len(res['sessions'])} sessions, "
           f"dates {res['date_min']}..{res['date_max']}, tag={select.scope_tag(scope)}]")
 
+    clips_df = _remap_group(clips_df, args.group_by)
     X, rows = build_features(clips_df, args.out, args.L, args.repr)
 
     if args.joint_weights:
@@ -375,35 +392,67 @@ def main():
         else:
             print(f"WARN joint-weights size {njoint} doesn't divide feature dim {D}; ignored")
 
-    Xz, _mean, _std = features.zscore(X)
-    n_comp = min(args.pca, Xz.shape[1], Xz.shape[0] - 1)
-    Xp = PCA(n_components=n_comp, random_state=0).fit_transform(Xz)
+    # Cluster each group independently (default subject-hand), mirroring
+    # cluster.py: zscore->PCA->kmeans is run per group so one subject's pose
+    # scale never biases another's, and a global cluster-id offset keeps ids
+    # unique across groups (pooled clusters.csv has non-colliding ids). Use
+    # --group-by all for a single pooled cross-subject clustering.
+    row_groups = clips_df.iloc[rows]["group"].to_numpy()
+    labels = np.full(len(rows), -1, dtype=int)     # -1 = group too small, dropped
+    medoid_idx = {}                                # global cid -> position into rows
+    n_comp_seen = []
+    next_cid = 0
+    for g in pd.unique(row_groups):
+        sel = np.where(row_groups == g)[0]
+        if len(sel) < 2:
+            print(f"group {g}: <2 clips, skipped")
+            continue
+        Xz, _m, _s = features.zscore(X[sel])
+        n_comp = min(args.pca, Xz.shape[1], Xz.shape[0] - 1)
+        n_comp_seen.append(n_comp)
+        Xp = PCA(n_components=n_comp, random_state=0).fit_transform(Xz)
+        lbl, _km, best_k, _scores = cluster(
+            Xp, args.k, args.k_min, args.k_max, args.sil_sample)
+        local_ids = sorted(set(int(x) for x in lbl))
+        remap = {c: next_cid + i for i, c in enumerate(local_ids)}  # -> global
+        for c in local_ids:
+            m = lbl == c
+            members = sel[m]
+            centroid = Xp[m].mean(axis=0)
+            medoid_idx[remap[c]] = int(
+                members[int(np.argmin(((Xp[m] - centroid) ** 2).sum(1)))])
+        labels[sel] = np.array([remap[int(x)] for x in lbl])
+        next_cid += len(local_ids)
+        sil_g = silhouette_score(Xp, lbl) if len(local_ids) > 1 else float("nan")
+        print(f"group {g}: {len(sel)} clips -> k={best_k}"
+              + (f"  silhouette={sil_g:.3f}" if np.isfinite(sil_g) else ""))
 
-    labels, _km, best_k, scores = cluster(
-        Xp, args.k, args.k_min, args.k_max, args.sil_sample)
-    sil = silhouette_score(Xp, labels) if len(set(labels)) > 1 else float("nan")
-    if scores:
-        print("silhouette by k:",
-              {k: round(v, 3) for k, v in sorted(scores.items())})
-    print(f"k={best_k}  silhouette={sil:.3f}  "
-          f"(repr={args.repr}, L={args.L}, pca={n_comp})")
+    valid = labels >= 0
+    if not valid.any():
+        print("no group had >=2 clips; nothing clustered")
+        return
 
     # Register the run: cluster_runs/{run_id}/ (params.json + clusters.csv) + db.
-    assign = clips_df.iloc[rows][["source_file", "clip_id"]].copy()
-    assign["cluster_id"] = labels.astype(int)
+    assign = clips_df.iloc[rows[valid]][["source_file", "clip_id"]].copy()
+    assign["cluster_id"] = labels[valid].astype(int)
     params = {"channel": "trajectory", "unit": "clip", "repr": args.repr,
-              "L": args.L, "pca": int(n_comp), "k": best_k,
-              "silhouette": round(float(sil), 4) if np.isfinite(sil) else None,
-              "n_clusters": int(len(set(int(x) for x in labels))), "scope": scope}
-    label = f"traj__{select.scope_tag(scope)}__k{best_k}__{args.repr}"
+              "L": args.L, "group_by": args.group_by,
+              "pca": int(max(n_comp_seen)) if n_comp_seen else 0,
+              "k": args.k, "k_min": args.k_min, "k_max": args.k_max,
+              "n_clusters": int(next_cid), "scope": scope}
+    ktag = str(args.k) if args.k is not None else f"{args.k_min}-{args.k_max}"
+    label = f"traj__{select.scope_tag(scope)}__k{ktag}__{args.repr}"
+    if args.group_by != "subject-hand":
+        label += f"__{args.group_by}"
     run_id, created_at = store.new_run_id("trajectory", params, label=label)
     rundir = store.save_run(args.out, run_id, "trajectory", params, assign, created_at)
-    print(f"cluster sizes: "
-          f"{sorted((int((labels==c).sum()) for c in set(labels)), reverse=True)}")
-    print(f"trajectory run {run_id}: {len(assign)} clips -> {rundir}")
+    sizes = sorted((int((labels[valid] == c).sum())
+                    for c in set(labels[valid])), reverse=True)
+    print(f"cluster sizes: {sizes}")
+    print(f"trajectory run {run_id}: {len(assign)} clips, {next_cid} clusters -> {rundir}")
 
     if not args.no_gallery:
-        cluster_gallery(clips_df, rows, labels, Xp,
+        cluster_gallery(clips_df, rows, labels, medoid_idx,
                         os.path.join(rundir, "gallery"), args.fs,
                         anim=not args.gallery_static,
                         n_frames=args.gallery_frames, fps=args.gallery_fps)

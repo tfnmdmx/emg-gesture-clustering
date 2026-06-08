@@ -136,9 +136,9 @@ cmd_cluster_traj() {
   [ "${GALLERY_STATIC:-0}" = "1" ] && gopt="$gopt --gallery-static"
   [ -n "${GALLERY_FRAMES:-}" ]     && gopt="$gopt --gallery-frames $GALLERY_FRAMES"
   [ -n "${GALLERY_FPS:-}" ]        && gopt="$gopt --gallery-fps $GALLERY_FPS"
-  say "trajectory (time-series) clustering (k=$k, repr=$REPR, data=${SUBJECTS:-all}${SESSIONS:+/$SESSIONS}) -> $OUT/cluster_runs/"
+  say "trajectory (time-series) clustering (k=$k, repr=$REPR, group-by=$GROUP_BY, data=${SUBJECTS:-all}${SESSIONS:+/$SESSIONS}) -> $OUT/cluster_runs/"
   # shellcheck disable=SC2086
-  "$PY" cluster_traj.py --out "$OUT" --repr "$REPR" $kflag $sel $gopt
+  "$PY" cluster_traj.py --out "$OUT" --repr "$REPR" --group-by "$GROUP_BY" $kflag $sel $gopt
 }
 
 cmd_runs() {
