@@ -192,7 +192,9 @@ cmd_export() {
 }
 
 cmd_label() {
-  : "${PORT:=8000}" ; : "${HOST:=127.0.0.1}"
+  # 0.0.0.0 = reachable from other machines on the LAN (no auth -- trusted net
+  # only). Override with HOST=127.0.0.1 ./pulse.sh label for localhost-only.
+  : "${PORT:=8000}" ; : "${HOST:=0.0.0.0}"
   [ -f "$OUT/index.db" ] || die "no $OUT/index.db. run: ./pulse.sh segment <source>"
   # Regenerate overviews live by default: shard-baked static overview.png can be
   # stale after pose/plot fixes (units, axis caps). Set OVERVIEW_REGEN=0 to use

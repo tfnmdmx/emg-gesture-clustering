@@ -1035,18 +1035,76 @@ def _ensure_plotly_vendored():
               "3D hand will fall back to the CDN")
 
 
+def _local_ipv4s() -> list:
+    """Best-effort list of this host's non-loopback IPv4 addresses, so startup
+    can print the URLs LAN/Tailscale peers should actually use."""
+    import socket
+    import subprocess
+    ips = []
+
+    def _add(ip):
+        if ip and not ip.startswith("127.") and ip not in ips:
+            ips.append(ip)
+
+    # Primary: enumerate every interface via iproute2 (catches LAN + Tailscale +
+    # docker bridges; gethostname() typically resolves to only one of them).
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            # "<n>: <ifc> inet <ip>/<prefix> ..."
+            if "inet" in parts:
+                _add(parts[parts.index("inet") + 1].split("/")[0])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+
+    # Fallbacks if `ip` is unavailable: hostname resolution + outbound-route probe
+    # (no packet is actually sent by connect() on a UDP socket).
+    if not ips:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None,
+                                           family=socket.AF_INET):
+                _add(info[4][0])
+        except OSError:
+            pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                _add(s.getsockname()[0])
+            finally:
+                s.close()
+        except OSError:
+            pass
+    return ips
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="out_pose")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--host", default="127.0.0.1")
+    # 0.0.0.0 = listen on every interface so other machines on the LAN can reach
+    # it (not just localhost). NOTE: the server has no auth and is the only label
+    # writer -- only bind this on a trusted network (LAN/Tailscale), never expose
+    # the public interface without a reverse proxy + auth in front.
+    ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
     _ensure_plotly_vendored()
     store = Store(args.out)
     srv = ThreadingHTTPServer((args.host, args.port), make_handler(store))
     print(f"Labelling {len(store.df)} clips across {len(store.by_stem)} "
-          f"recordings from {args.out}")
-    print(f"Open http://{args.host}:{args.port}")
+          f"recordings from {args.out}", flush=True)
+    if args.host in ("0.0.0.0", "::"):
+        # Help the user hand the right URL to LAN/Tailscale peers: list the
+        # machine's non-loopback IPv4 addresses instead of the meaningless 0.0.0.0.
+        print(f"Listening on all interfaces (port {args.port}). Reachable at:")
+        print(f"  http://127.0.0.1:{args.port}        (this machine)")
+        for ip in _local_ipv4s():
+            print(f"  http://{ip}:{args.port}")
+        print("(no auth -- trusted LAN/Tailscale only)", flush=True)
+    else:
+        print(f"Open http://{args.host}:{args.port}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
