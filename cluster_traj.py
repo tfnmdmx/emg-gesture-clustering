@@ -22,8 +22,9 @@ Feature representations (--repr):
 Per-joint weighting hook: --joint-weights w0,..,w19 scales each joint's columns
 by sqrt(w) so the L2 distance respects which joints matter for the gestures.
 
-sklearn is in both the emg2pose env and base conda; run with either:
-  /home/chenglin/anaconda3/envs/emg2pose/bin/python cluster_traj.py --out out
+sklearn is in both the emg2pose env and base conda; activate your env (or set
+PY=) and run:
+  python cluster_traj.py --out out
 """
 
 import argparse

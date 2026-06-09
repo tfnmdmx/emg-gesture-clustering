@@ -19,8 +19,8 @@ from __future__ import annotations
   欠切 = 每个新段含几个 EMG burst（目标≈1，旧 hold2hold 在连续数据会 >1）
   hold 捕获 = 新段真实 hold 时长中位数（旧仅 50ms pad）
 
-用法：
-  ENV=/home/chenglin/anaconda3/envs/emg2pose/bin/python
+用法：（先激活带 sklearn/torch 的环境，或用 ENV=/path/to/python 覆盖）
+  ENV=${ENV:-python}
   $ENV diag_seg.py --out out_pose2 --stems jm-0503__20260430-left-2__20260430_164846
   $ENV diag_seg.py --out out_pose2 --stems hzy-1217__20260501-left-6__20260501_172246
 输出：out_diag_s0/{stem}.png + 终端量化表

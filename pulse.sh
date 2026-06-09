@@ -33,8 +33,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-: "${PY:=/home/chenglin/anaconda3/envs/emg2pose/bin/python}"
-: "${DATA_ROOT:=/data/cl_data/ai-infra/processed_data}"   # root for `segment processed`
+# Python from the ACTIVE environment (respects `conda activate`/venv on PATH) --
+# no hardcoded personal env. The pipeline needs the emg2pose env's deps (numpy,
+# sklearn, torch FK), so activate it first or pass PY=/path/to/python explicitly.
+: "${PY:=$(command -v python3 || command -v python || echo python3)}"
+: "${DATA_ROOT:=/mnt/ai-infra/processed_data}"   # root for `segment`
 : "${OUT:=out}"            # the single output dir (index.db + shards + cluster_runs + gestures)
 : "${K:=18}"               # cluster count ('auto' = silhouette sweep)
 : "${GROUP_BY:=subject-hand}"   # apex clustering granularity: subject-hand | hand | all

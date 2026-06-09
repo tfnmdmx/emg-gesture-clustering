@@ -884,7 +884,7 @@ boot();
 ## 8. 部署与运行
 
 ```bash
-PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
+PY=python   # 先 conda activate <你的环境>（需含 numpy/sklearn/torch），或指向具体解释器
 
 # 1) 准备前端 plotly（二选一）
 #    a. 下载 vendored：

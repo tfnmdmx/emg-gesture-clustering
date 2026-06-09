@@ -29,13 +29,38 @@ PALM_CONNECTIONS = [
     [20, 5], [20, 8], [20, 11], [20, 14], [20, 17], [20, 7],
 ]
 
-# Location of the user's emg2pose checkout (where calculate_hand_error.py lives).
-# Override with $EMG2POSE_VIS_DIR if installed elsewhere.
-_DEFAULT_EMG2POSE_VIS_DIR = (
-    "/home/chenglin/anuo_emg2pose/emg2pose/scripts/visualize_3d"
-)
-
 _CALC_CACHE: dict[str, object] = {}
+
+
+def _resolve_vis_dir() -> str:
+    """Directory containing emg2pose's calculate_hand_error.py -- NO hardcoded
+    personal path. Resolution order:
+      1. $EMG2POSE_VIS_DIR (explicit override, for a custom/newer version);
+      2. the copy vendored in this repo (emg_label/_emg2pose_vis) -- the
+         self-contained default, so no external checkout is needed;
+      3. emg2pose's own scripts/visualize_3d, relative to the importable package.
+    The script still needs the emg2pose package + torch importable (it does
+    `import emg2pose.kinematics/...`); this only removes the loose-path lookup.
+    Raises ImportError with guidance if none yields the file."""
+    cands = []
+    env = os.environ.get("EMG2POSE_VIS_DIR")
+    if env:
+        cands.append(Path(env))
+    cands.append(Path(__file__).resolve().parent / "_emg2pose_vis")
+    try:
+        import emg2pose
+        pkg = Path(emg2pose.__file__).resolve().parent
+        cands += [pkg / "scripts" / "visualize_3d",
+                  pkg.parent / "scripts" / "visualize_3d"]
+    except Exception:
+        pass
+    for c in cands:
+        if (c / "calculate_hand_error.py").is_file():
+            return str(c.resolve())
+    raise ImportError(
+        "emg2pose visualize_3d not found (calculate_hand_error.py). Set "
+        "$EMG2POSE_VIS_DIR to the directory that contains it "
+        "(e.g. <emg2pose-checkout>/scripts/visualize_3d).")
 
 
 def _get_calculator(side: str):
@@ -49,8 +74,7 @@ def _get_calculator(side: str):
         side = "left"
     if "left" in _CALC_CACHE:
         return _CALC_CACHE["left"]
-    vis_dir = os.environ.get("EMG2POSE_VIS_DIR", _DEFAULT_EMG2POSE_VIS_DIR)
-    vis_dir = str(Path(vis_dir).resolve())
+    vis_dir = _resolve_vis_dir()
     if vis_dir not in sys.path:
         sys.path.insert(0, vis_dir)
     from calculate_hand_error import HandPositionErrorCalculator  # type: ignore

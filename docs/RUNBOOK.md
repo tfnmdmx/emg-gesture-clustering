@@ -367,7 +367,7 @@ OUT=out_zscore  GROUP_BY=all SUBJECT_NORM=zscore ./pulse.sh cluster
 所有阶段都通过 `--out`（即 `index.db`）串联；聚类/评估/导出**不吃位置参数**，它们从 db 的 `source_path` 找 npz。
 
 ```bash
-PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
+PY=python   # 先 conda activate <你的环境>（需含 numpy/sklearn/torch），或指向具体解释器
 cd /data/cl_data/action-clustering-compact
 
 $PY segment.py --meta reference/sample_meta.csv --out out         # 建 out/index.db + 便利 CSV（或 dir + --recursive）
@@ -389,7 +389,7 @@ $PY build_anim_gallery.py --out-root out --n 3 --clean            # 动画画廊
 `export` 产出的每个 clip npz（`OUT/gestures/<label>/...clip0000.npz`）可直接喂可视化工具：
 
 ```bash
-PY=/home/chenglin/anaconda3/envs/emg2pose/bin/python
+PY=python   # 先 conda activate <你的环境>（需含 numpy/sklearn/torch），或指向具体解释器
 
 # 静态四面板（16 通道 EMG / 包络 / 20 关节角 / 3D 手 start-apex-end）
 $PY visualize_segment.py out/gestures/<label>/<...>clip0000.npz -o /tmp/x.png
